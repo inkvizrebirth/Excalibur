@@ -14,12 +14,13 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TOOLS_DIR = ROOT / "tools"
 DEFAULT_LOGS_DIR = ROOT / "logs"
 ENVLOG_PATH = ROOT / "sandbox" / "envlog.luau"
+HOOKS_PATH = ROOT / "sandbox" / "hooks.luau"
 CAPTURE_PATH = DEFAULT_LOGS_DIR / "captured_payload.luau"
 
 
@@ -44,24 +45,38 @@ class SandboxResult:
     captures: tuple[CapturedPayload, ...]
     captured_path: Path | None
     run_log_path: Path
+    trace_token: str | None
 
 
 class _PipeDrainer(threading.Thread):
-    def __init__(self, stream: BinaryIO, destination: Path, byte_limit: int):
+    MAX_CALLBACK_LINE_BYTES = 16 * 1024
+
+    def __init__(
+        self,
+        stream: BinaryIO,
+        destination: Path,
+        byte_limit: int,
+        line_callback: Callable[[bytes], None] | None = None,
+    ):
         super().__init__(name="protez-luau-output", daemon=True)
         self._stream = stream
         self._destination = destination
         self._byte_limit = byte_limit
+        self._line_callback = line_callback
+        self._line_buffer = bytearray()
+        self._discarding_line = False
         self.limit_hit = threading.Event()
         self.total_bytes = 0
         self.saved_bytes = 0
         self.error: OSError | None = None
+        self.callback_error: Exception | None = None
 
     def run(self) -> None:
         try:
+            reader = getattr(self._stream, "read1", self._stream.read)
             with self._destination.open("wb") as output:
                 while True:
-                    chunk = self._stream.read(64 * 1024)
+                    chunk = reader(64 * 1024)
                     if not chunk:
                         break
                     self.total_bytes += len(chunk)
@@ -70,10 +85,46 @@ class _PipeDrainer(threading.Thread):
                         saved = chunk[:remaining]
                         output.write(saved)
                         self.saved_bytes += len(saved)
+                        self._consume_lines(saved)
                     if self.total_bytes > self._byte_limit:
                         self.limit_hit.set()
+            if self._line_buffer and not self._discarding_line:
+                self._call_line_callback(bytes(self._line_buffer))
         except (OSError, ValueError) as exc:
             self.error = OSError(str(exc))
+
+    def _consume_lines(self, chunk: bytes) -> None:
+        if self._line_callback is None:
+            return
+        if self._discarding_line:
+            newline = chunk.find(b"\n")
+            if newline < 0:
+                return
+            chunk = chunk[newline + 1 :]
+            self._discarding_line = False
+        if chunk:
+            self._line_buffer.extend(chunk)
+
+        while True:
+            newline = self._line_buffer.find(b"\n")
+            if newline < 0:
+                if len(self._line_buffer) > self.MAX_CALLBACK_LINE_BYTES:
+                    self._line_buffer.clear()
+                    self._discarding_line = True
+                return
+            line = bytes(self._line_buffer[: newline + 1])
+            del self._line_buffer[: newline + 1]
+            if len(line) <= self.MAX_CALLBACK_LINE_BYTES:
+                self._call_line_callback(line)
+
+    def _call_line_callback(self, line: bytes) -> None:
+        if self._line_callback is None:
+            return
+        try:
+            self._line_callback(line)
+        except Exception as exc:
+            self.callback_error = exc
+            self._line_callback = None
 
 
 class _CaptureParser:
@@ -248,6 +299,7 @@ class Sandbox:
         tools_dir: Path | str = DEFAULT_TOOLS_DIR,
         logs_dir: Path | str = DEFAULT_LOGS_DIR,
         envlog_path: Path | str = ENVLOG_PATH,
+        hooks_path: Path | str = HOOKS_PATH,
         luau_path: Path | str | None = None,
         timeout_seconds: float = 5.0,
         max_input_bytes: int = 16 * 1024 * 1024,
@@ -261,6 +313,7 @@ class Sandbox:
         self.tools_dir = Path(tools_dir).expanduser().resolve()
         self.logs_dir = Path(logs_dir).expanduser().resolve()
         self.envlog_path = Path(envlog_path).expanduser().resolve()
+        self.hooks_path = Path(hooks_path).expanduser().resolve()
         self.capture_path = self.logs_dir / CAPTURE_PATH.name
         self.luau_path = (
             Path(luau_path).expanduser().resolve() if luau_path is not None else None
@@ -271,7 +324,15 @@ class Sandbox:
         self.logger = logger or logging.getLogger("protez")
         self._run_lock = threading.Lock()
 
-    def run(self, source: str, *, source_name: str = "input") -> SandboxResult:
+    def run(
+        self,
+        source: str,
+        *,
+        source_name: str = "input",
+        trace: bool = False,
+        trace_token: str | None = None,
+        output_line_callback: Callable[[bytes], None] | None = None,
+    ) -> SandboxResult:
         if not isinstance(source, str):
             raise TypeError("source must be text")
         source_bytes = source.encode("utf-8")
@@ -281,11 +342,29 @@ class Sandbox:
             )
         if not source.strip():
             raise SandboxError("Input is empty")
+        if not trace and (trace_token is not None or output_line_callback is not None):
+            raise ValueError("trace_token and output_line_callback require trace=True")
 
         with self._run_lock:
-            return self._run_once(source, source_name, len(source_bytes))
+            return self._run_once(
+                source,
+                source_name,
+                len(source_bytes),
+                trace=trace,
+                trace_token=trace_token,
+                output_line_callback=output_line_callback,
+            )
 
-    def _run_once(self, source: str, source_name: str, source_size: int) -> SandboxResult:
+    def _run_once(
+        self,
+        source: str,
+        source_name: str,
+        source_size: int,
+        *,
+        trace: bool,
+        trace_token: str | None,
+        output_line_callback: Callable[[bytes], None] | None,
+    ) -> SandboxResult:
         binary = self._resolve_luau_binary()
         try:
             envlog = self.envlog_path.read_text(encoding="utf-8")
@@ -294,13 +373,34 @@ class Sandbox:
         if "__PROTEZ_CAPTURE_TOKEN__" not in envlog:
             raise SandboxError("Sandbox environment is missing its capture-token placeholder")
 
+        hooks_text: str | None = None
+        if trace:
+            try:
+                hooks_text = self.hooks_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise SandboxError(f"Could not read tracer hooks {self.hooks_path}: {exc}") from exc
+            if "__PROTEZ_TRACE_TOKEN__" not in hooks_text:
+                raise SandboxError("Tracer hooks are missing their trace-token placeholder")
+            if trace_token is None:
+                trace_token = secrets.token_hex(16)
+            elif len(trace_token) != 32 or any(
+                character not in "0123456789abcdef" for character in trace_token
+            ):
+                raise SandboxError("Trace token must be 32 lowercase hexadecimal characters")
+
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.capture_path.parent.mkdir(parents=True, exist_ok=True)
         self.capture_path.unlink(missing_ok=True)
         for previous_capture in self.logs_dir.glob("captured_payload_[0-9]*.luau"):
             previous_capture.unlink(missing_ok=True)
         token = secrets.token_hex(16)
-        runner_text = self._build_runner(envlog, token, source)
+        runner_text = self._build_runner(
+            envlog,
+            token,
+            source,
+            hooks_text=hooks_text,
+            trace_token=trace_token,
+        )
         run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_log_path = self.logs_dir / f"sandbox_{run_stamp}_{token[:8]}.log"
         timeout = self.timeout_seconds
@@ -347,7 +447,14 @@ class Sandbox:
 
             self.logger.info("Sandbox spawned (Luau CLI process)")
             self.logger.info("Hooking loadstring, load, require, game, Instance")
-            drainer = _PipeDrainer(process.stdout, run_log_path, self.max_output_bytes)
+            if trace:
+                self.logger.info("Trace hooks loaded; requesting mode=crl, count=1000")
+            drainer = _PipeDrainer(
+                process.stdout,
+                run_log_path,
+                self.max_output_bytes,
+                line_callback=output_line_callback,
+            )
             drainer.start()
             timed_out = False
             output_limited = False
@@ -380,6 +487,8 @@ class Sandbox:
                 drainer.join(timeout=1.0)
             if drainer.error:
                 raise SandboxError(f"Could not save Luau process output: {drainer.error}")
+            if drainer.callback_error:
+                self.logger.error("Trace line callback stopped: %s", drainer.callback_error)
             if drainer.limit_hit.is_set():
                 output_limited = True
 
@@ -429,6 +538,7 @@ class Sandbox:
             captures=captures,
             captured_path=captured_path,
             run_log_path=run_log_path,
+            trace_token=trace_token,
         )
 
     def _resolve_luau_binary(self) -> Path:
@@ -453,10 +563,22 @@ class Sandbox:
         )
 
     @staticmethod
-    def _build_runner(envlog: str, token: str, source: str) -> str:
+    def _build_runner(
+        envlog: str,
+        token: str,
+        source: str,
+        *,
+        hooks_text: str | None = None,
+        trace_token: str | None = None,
+    ) -> str:
         prelude = envlog.replace("__PROTEZ_CAPTURE_TOKEN__", token)
         if prelude == envlog:
             raise SandboxError("Could not set the sandbox capture token")
+        if hooks_text is not None:
+            if trace_token is None or "__PROTEZ_TRACE_TOKEN__" not in hooks_text:
+                raise SandboxError("Could not configure tracer token")
+            hooks = hooks_text.replace("__PROTEZ_TRACE_TOKEN__", trace_token)
+            prelude += "\n" + hooks
         return (
             prelude
             + "\nlocal function __PROTEZ_INPUT(...)\n"

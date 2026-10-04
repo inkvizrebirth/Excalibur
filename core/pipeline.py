@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 from core.sandbox import Sandbox, SandboxResult
+from core.tracer import Tracer
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = ROOT / "output"
@@ -20,6 +21,10 @@ DEFAULT_TOOLS_DIR = ROOT / "tools"
 
 
 class PipelineError(RuntimeError):
+    pass
+
+
+class InvalidLuauPayload(PipelineError):
     pass
 
 
@@ -69,7 +74,7 @@ class _LuauCompiler:
 
         if returncode != 0:
             message = detail or f"compiler exited with code {returncode}"
-            raise PipelineError(f"Captured payload is not valid Luau: {message}")
+            raise InvalidLuauPayload(f"Captured payload is not valid Luau: {message}")
         self.logger.info("Luau syntax verification passed in %.2f seconds", time.monotonic() - started)
 
     def _resolve_binary(self) -> Path:
@@ -191,7 +196,30 @@ class DeobfuscationPipeline:
             timeout_seconds=self.compiler_timeout_seconds,
             logger=self.logger,
         )
-        compiler.verify(payload_path)
+        try:
+            compiler.verify(payload_path)
+        except InvalidLuauPayload as invalid_payload:
+            self.logger.warning("Captured payload is not source Luau; starting trace fallback")
+            self._progress(20, "TRACE")
+            try:
+                trace_result = Tracer(
+                    logger=self.logger,
+                    progress_callback=self.progress_callback,
+                ).trace(source, source_name=source_name)
+            except Exception as trace_error:
+                raise PipelineError(
+                    f"Payload validation failed ({invalid_payload}); tracing failed: {trace_error}"
+                ) from trace_error
+            if trace_result.native_hooks_available:
+                raise PipelineError(
+                    f"Trace saved to {trace_result.trace_files[0] if trace_result.trace_files else 'logs/trace.jsonl'}; "
+                    "VM lifting is not implemented yet"
+                )
+            trace_path = trace_result.trace_files[0] if trace_result.trace_files else "logs/trace.jsonl"
+            raise PipelineError(
+                f"Trace was recorded at {trace_path}, but stock Luau exposes no debug.sethook; "
+                "only mock/API events are available and VM register tracing is unavailable"
+            )
         self.logger.info("Valid Luau payload detected; trace and lifting stages skipped")
         self._progress(90, "CODEGEN")
 

@@ -4,4 +4,6 @@
 - The GUI sends work to `core.pipeline` on a worker thread; log and progress events return through queues.
 - `core.sandbox` runs the official Luau CLI in a separate process with a timeout and bounded output. `sandbox/envlog.luau` supplies mock Roblox globals and captures `loadstring`/`load` payloads through stdout markers.
 - HTTP, filesystem APIs and scheduled tasks are disabled in the mock. A subprocess is not an OS security boundary; use a disposable account or VM for untrusted input.
-- The MVP fast path verifies captured source with `luau-compile` and copies valid Luau to `output/`. VM tracing, lifting and structured code generation are not implemented yet.
+- The MVP fast path verifies captured source with `luau-compile` and copies valid Luau to `output/`.
+- `core.tracer` streams structured sandbox/mock events into rotating JSONL files. Stock Luau has no `debug.sethook` (see `https://luau.org/performance/`); bytecode PCs, VM opcodes and registers require a custom instrumented host and are not inferred.
+- CFG lifting and structured code generation are not implemented yet.

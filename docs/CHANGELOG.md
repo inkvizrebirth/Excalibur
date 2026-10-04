@@ -5,3 +5,4 @@
 - Added repository scaffold, prerequisite installer and desktop GUI shell.
 - Added a Luau subprocess mock environment with payload capture and timeout/output limits.
 - Added the valid-Luau fast path: compile-check captured source and write it to `output/`.
+- Added streaming trace-event transport, 100 MB JSONL rotation, and native-hook capability detection; stock Luau currently yields sandbox/API events only.

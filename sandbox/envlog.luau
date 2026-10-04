@@ -15,6 +15,17 @@ local __protez_byte = string.byte
 local __protez_floor = math.floor
 local __protez_rawset = rawset
 local __protez_setmetatable = setmetatable
+local __protez_native_debug = debug
+local __protez_native_sethook = nil
+local __protez_native_debug_info = nil
+local __protez_native_clock = nil
+if __protez_type(__protez_native_debug) == "table" then
+    __protez_native_sethook = __protez_native_debug.sethook
+    __protez_native_debug_info = __protez_native_debug.info
+end
+if __protez_type(os) == "table" then
+    __protez_native_clock = os.clock
+end
 local __protez_capture_nonce = "__PROTEZ_CAPTURE_TOKEN__"
 local __protez_marker = "__PROTEZ_CAPTURE_" .. __protez_capture_nonce .. "|"
 local __protez_capture_count = 0
@@ -22,6 +33,10 @@ local __protez_clock_value = 0
 
 local function __protez_log(level, message)
     __protez_raw_print("[PROTEZ:" .. level .. "] " .. __protez_tostring(message))
+    local emitter = _G and _G.__PROTEZ_TRACE_EVENT
+    if __protez_type(emitter) == "function" then
+        emitter("MOCK", level, "", 0, __protez_tostring(message))
+    end
 end
 
 local function __protez_base64(source)
