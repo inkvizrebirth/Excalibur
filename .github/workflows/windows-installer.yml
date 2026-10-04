@@ -50,10 +50,22 @@ jobs:
       - name: Build pinned Luau native host
         shell: pwsh
         run: |
-          cmake -S native -B build/native -A x64 -DCMAKE_BUILD_TYPE=Release
-          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
-          cmake --build build/native --config Release --target protez-native-host --parallel 4
-          if ($LASTEXITCODE -ne 0) { throw "Native host build failed" }
+          $configureOutput = & cmake -G "Visual Studio 17 2022" -S native -B build/native -A x64 -DCMAKE_BUILD_TYPE=Release 2>&1
+          $configureExit = $LASTEXITCODE
+          $configureOutput | ForEach-Object { Write-Host $_ }
+          if ($configureExit -ne 0) {
+            $diagnostic = ($configureOutput | Select-Object -Last 24) -join " | "
+            Write-Output "::error title=CMake configure failed::$diagnostic"
+            throw "CMake configure failed with exit code $configureExit"
+          }
+          $buildOutput = & cmake --build build/native --config Release --target protez-native-host --parallel 4 2>&1
+          $buildExit = $LASTEXITCODE
+          $buildOutput | ForEach-Object { Write-Host $_ }
+          if ($buildExit -ne 0) {
+            $diagnostic = ($buildOutput | Select-Object -Last 24) -join " | "
+            Write-Output "::error title=Native host build failed::$diagnostic"
+            throw "Native host build failed with exit code $buildExit"
+          }
           $native = Join-Path $PWD "build/native/host-bin/protez-native-host.exe"
           if (-not (Test-Path $native)) { throw "Native host output is missing: $native" }
           & $native --version
