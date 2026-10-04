@@ -304,12 +304,13 @@ class Sandbox:
         timeout_seconds: float = 5.0,
         max_input_bytes: int = 16 * 1024 * 1024,
         max_output_bytes: int = 32 * 1024 * 1024,
+        max_trace_events: int = 25_000,
         logger: logging.Logger | None = None,
     ):
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
-        if max_input_bytes <= 0 or max_output_bytes <= 0:
-            raise ValueError("input and output limits must be positive")
+        if max_input_bytes <= 0 or max_output_bytes <= 0 or max_trace_events <= 0:
+            raise ValueError("input, output and trace-event limits must be positive")
         self.tools_dir = Path(tools_dir).expanduser().resolve()
         self.logs_dir = Path(logs_dir).expanduser().resolve()
         self.envlog_path = Path(envlog_path).expanduser().resolve()
@@ -321,6 +322,7 @@ class Sandbox:
         self.timeout_seconds = float(timeout_seconds)
         self.max_input_bytes = int(max_input_bytes)
         self.max_output_bytes = int(max_output_bytes)
+        self.max_trace_events = int(max_trace_events)
         self.logger = logger or logging.getLogger("protez")
         self._run_lock = threading.Lock()
 
@@ -365,7 +367,8 @@ class Sandbox:
         trace_token: str | None,
         output_line_callback: Callable[[bytes], None] | None,
     ) -> SandboxResult:
-        binary = self._resolve_luau_binary()
+        native_host = None if self.luau_path is not None else self._resolve_native_host()
+        binary = native_host or self._resolve_luau_binary()
         try:
             envlog = self.envlog_path.read_text(encoding="utf-8")
         except OSError as exc:
@@ -426,9 +429,24 @@ class Sandbox:
             else:
                 popen_options["start_new_session"] = True
 
+            command = [str(binary)]
+            if native_host is not None:
+                command.extend(["--source", str(runner_path)])
+                if trace and trace_token is not None:
+                    command.extend(
+                        [
+                            "--trace-token",
+                            trace_token,
+                            "--max-trace-events",
+                            str(self.max_trace_events),
+                        ]
+                    )
+            else:
+                command.append(str(runner_path))
+
             try:
                 process = subprocess.Popen(
-                    [str(binary), str(runner_path)],
+                    command,
                     cwd=temp_dir,
                     env=self._minimal_environment(),
                     stdin=subprocess.DEVNULL,
@@ -445,10 +463,17 @@ class Sandbox:
                 self._kill_process(process)
                 raise SandboxError("Luau process did not expose an output stream")
 
-            self.logger.info("Sandbox spawned (Luau CLI process)")
+            backend_name = "instrumented Luau native host" if native_host else "official Luau CLI"
+            self.logger.info("Sandbox spawned (%s)", backend_name)
             self.logger.info("Hooking loadstring, load, require, game, Instance")
             if trace:
-                self.logger.info("Trace hooks loaded; requesting mode=crl, count=1000")
+                if native_host:
+                    self.logger.info(
+                        "Native instruction-step tracing enabled (limit: %s events)",
+                        f"{self.max_trace_events:,}",
+                    )
+                else:
+                    self.logger.info("Lua trace bridge loaded; native VM stepping is unavailable")
             drainer = _PipeDrainer(
                 process.stdout,
                 run_log_path,
@@ -541,6 +566,24 @@ class Sandbox:
             trace_token=trace_token,
         )
 
+    def _resolve_native_host(self) -> Path | None:
+        names = (
+            ("protez-native-host.exe", "protez-native-host")
+            if os.name == "nt"
+            else ("protez-native-host", "protez-native-host.exe")
+        )
+        candidates = [self.tools_dir / name for name in names]
+        path_from_env = shutil.which("protez-native-host")
+        if path_from_env:
+            candidates.append(Path(path_from_env))
+        for candidate in candidates:
+            try:
+                if candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK)):
+                    return candidate.resolve()
+            except OSError:
+                continue
+        return None
+
     def _resolve_luau_binary(self) -> Path:
         if self.luau_path is not None:
             candidates = [self.luau_path]
@@ -579,9 +622,16 @@ class Sandbox:
                 raise SandboxError("Could not configure tracer token")
             hooks = hooks_text.replace("__PROTEZ_TRACE_TOKEN__", trace_token)
             prelude += "\n" + hooks
+        trace_start = (
+            "if __PROTEZ_NATIVE_TRACE_BEGIN then __PROTEZ_NATIVE_TRACE_BEGIN() end\n"
+            if trace_token is not None
+            else ""
+        )
         return (
             prelude
-            + "\nlocal function __PROTEZ_INPUT(...)\n"
+            + "\n"
+            + trace_start
+            + "local function __PROTEZ_INPUT(...)\n"
             + source
             + "\nend\n"
             + "local __protez_run_ok, __protez_run_error = "

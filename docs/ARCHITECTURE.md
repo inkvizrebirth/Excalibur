@@ -1,9 +1,10 @@
 # Internal architecture
 
-- `main.py` checks/install prerequisites before loading the CustomTkinter GUI.
-- The GUI sends work to `core.pipeline` on a worker thread; log and progress events return through queues.
-- `core.sandbox` runs the official Luau CLI in a separate process with a timeout and bounded output. `sandbox/envlog.luau` supplies mock Roblox globals and captures `loadstring`/`load` payloads through stdout markers.
-- HTTP, filesystem APIs and scheduled tasks are disabled in the mock. A subprocess is not an OS security boundary; use a disposable account or VM for untrusted input.
-- The MVP fast path verifies captured source with `luau-compile` and copies valid Luau to `output/`.
-- `core.tracer` streams structured sandbox/mock events into rotating JSONL files. Stock Luau has no `debug.sethook` (see `https://luau.org/performance/`); bytecode PCs, VM opcodes and registers require a custom instrumented host and are not inferred.
-- CFG lifting and structured code generation are not implemented yet.
+- `main.py` checks prerequisites before opening the CustomTkinter GUI. The compact black-and-white interface uses pixel fonts, a custom frameless title bar, and its own move, resize, minimize, maximize, and close controls.
+- The GUI sends work to `core.pipeline` on a worker thread. Log and progress records return through queues so worker threads never update Tk widgets directly.
+- `core.sandbox` runs a generated Luau runner in a bounded child process, captures locally produced `loadstring`/`load` payloads, and applies input, output, VM-memory, trace-event, and time limits. `sandbox/envlog.luau` provides the Roblox-shaped mock API; network and host filesystem/process access are not part of that mock.
+- When `tools/protez-native-host` (or `.exe`) is available, `core.sandbox` prefers it. `native/host.cpp` embeds the pinned official Luau 0.740 VM and compiler. The optional installer build requires CMake and a C++17 toolchain; if it cannot be built, the official Luau CLI remains the fallback.
+- The native host registers Luau's C API `debugstep` callback and enables `lua_singlestep` while the captured input runs. It compiles with `optimizationLevel=0` and `debugLevel=2` for granular instruction traces and local/upvalue names. It combines callback metadata with version-pinned VM internals (`CallInfo.savedpc` and the active `Proto`) to record proto-relative PCs, opcode IDs/names, instruction words/operands, source/function metadata, frame depth, proto/bytecode IDs, and sampled primitive locals. The full register file is not captured; its trace field remains `null`. This private-internals adapter must be rechecked whenever the pinned Luau tag changes.
+- The native VM is still only a subprocess with resource limits, not an OS security boundary. Do not treat the Roblox mock as a safe substitute for a disposable account, OS sandbox, or VM when handling hostile input.
+- The current pipeline compile-checks a captured payload with `luau-compile` and copies valid Luau unchanged. Invalid/virtualized payloads can produce an instruction/API trace, but CFG lifting, VM-handler recovery, and source reconstruction are not implemented.
+- `core.tracer` streams validated trace events to rotating JSONL files rather than retaining them in memory. Stock Luau CLI runs provide mock/API events only; the optional native host adds per-instruction debugstep records.

@@ -176,7 +176,10 @@ class DeobfuscationPipeline:
 
     def run(self, source: str, *, source_name: str = "input") -> PipelineResult:
         self._progress(0, "SANDBOX")
-        sandbox_result = Sandbox(logger=self.logger).run(source, source_name=source_name)
+        sandbox_result = Sandbox(tools_dir=self.tools_dir, logger=self.logger).run(
+            source,
+            source_name=source_name,
+        )
         self._progress(20, "SANDBOX")
 
         if sandbox_result.timed_out:
@@ -205,6 +208,7 @@ class DeobfuscationPipeline:
                 trace_result = Tracer(
                     logger=self.logger,
                     progress_callback=self.progress_callback,
+                    tools_dir=self.tools_dir,
                 ).trace(source, source_name=source_name)
             except Exception as trace_error:
                 raise PipelineError(
@@ -212,8 +216,8 @@ class DeobfuscationPipeline:
                 ) from trace_error
             if trace_result.native_hooks_available:
                 raise PipelineError(
-                    f"Trace saved to {trace_result.trace_files[0] if trace_result.trace_files else 'logs/trace.jsonl'}; "
-                    "VM lifting is not implemented yet"
+                    f"Native VM-step trace saved to {trace_result.trace_files[0] if trace_result.trace_files else 'logs/trace.jsonl'}; "
+                    "control-flow lifting, register recovery and source reconstruction are not implemented yet"
                 )
             trace_path = trace_result.trace_files[0] if trace_result.trace_files else "logs/trace.jsonl"
             raise PipelineError(

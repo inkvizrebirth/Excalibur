@@ -1,0 +1,666 @@
+#include "lua.h"
+#include "lualib.h"
+#include "luacode.h"
+#include "lbytecode.h"
+#include "lstate.h"
+#include "Luau/BytecodeDump.h"
+
+#include <algorithm>
+#include <chrono>
+#include <clocale>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <exception>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <locale>
+#include <sstream>
+#include <string>
+#include <string_view>
+
+namespace
+{
+constexpr size_t kMaxSourceBytes = 64 * 1024 * 1024;
+constexpr size_t kMaxVmBytes = 256 * 1024 * 1024;
+constexpr size_t kMaxTraceStringBytes = 128;
+constexpr size_t kMaxLocalsPerSnapshot = 16;
+constexpr uint64_t kLocalSnapshotStride = 64;
+
+struct MemoryBudget
+{
+    size_t used = 0;
+    size_t limit = kMaxVmBytes;
+};
+
+void* boundedAllocator(void* userdata, void* pointer, size_t oldSize, size_t newSize)
+{
+    auto* budget = static_cast<MemoryBudget*>(userdata);
+    if (newSize == 0)
+    {
+        std::free(pointer);
+        if (pointer)
+            budget->used -= std::min(budget->used, oldSize);
+        return nullptr;
+    }
+
+    const size_t current = pointer ? budget->used - std::min(budget->used, oldSize) : budget->used;
+    if (newSize > budget->limit - std::min(budget->limit, current))
+        return nullptr;
+
+    void* replacement = std::realloc(pointer, newSize);
+    if (replacement)
+        budget->used = current + newSize;
+    return replacement;
+}
+
+struct TraceContext
+{
+    std::string prefix;
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    uint64_t sequence = 0;
+    uint64_t stepCount = 0;
+    uint64_t maxSteps = 25000;
+    bool active = false;
+    bool hookReady = false;
+    bool traceStopped = false;
+    bool limitReported = false;
+    bool outputFailed = false;
+};
+
+std::string base64(std::string_view input)
+{
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string output;
+    output.reserve(((input.size() + 2) / 3) * 4);
+
+    for (size_t i = 0; i < input.size(); i += 3)
+    {
+        const auto first = static_cast<unsigned char>(input[i]);
+        const auto second = i + 1 < input.size() ? static_cast<unsigned char>(input[i + 1]) : 0;
+        const auto third = i + 2 < input.size() ? static_cast<unsigned char>(input[i + 2]) : 0;
+        const uint32_t packed = (static_cast<uint32_t>(first) << 16) |
+                                (static_cast<uint32_t>(second) << 8) |
+                                static_cast<uint32_t>(third);
+        output.push_back(alphabet[(packed >> 18) & 0x3f]);
+        output.push_back(alphabet[(packed >> 12) & 0x3f]);
+        output.push_back(i + 1 < input.size() ? alphabet[(packed >> 6) & 0x3f] : '=');
+        output.push_back(i + 2 < input.size() ? alphabet[packed & 0x3f] : '=');
+    }
+    return output;
+}
+
+std::string jsonQuote(std::string_view input)
+{
+    std::string output;
+    output.reserve(input.size() + 2);
+    output.push_back('"');
+    for (unsigned char character : input)
+    {
+        switch (character)
+        {
+        case '"':
+            output += "\\\"";
+            break;
+        case '\\':
+            output += "\\\\";
+            break;
+        case '\b':
+            output += "\\b";
+            break;
+        case '\f':
+            output += "\\f";
+            break;
+        case '\n':
+            output += "\\n";
+            break;
+        case '\r':
+            output += "\\r";
+            break;
+        case '\t':
+            output += "\\t";
+            break;
+        default:
+            if (character < 0x20)
+            {
+                static constexpr char hex[] = "0123456789abcdef";
+                output += "\\u00";
+                output.push_back(hex[(character >> 4) & 0x0f]);
+                output.push_back(hex[character & 0x0f]);
+            }
+            else
+            {
+                output.push_back(static_cast<char>(character));
+            }
+        }
+    }
+    output.push_back('"');
+    return output;
+}
+
+std::string clipped(std::string_view value, size_t limit)
+{
+    if (value.size() <= limit)
+        return std::string(value);
+    return std::string(value.substr(0, limit)) + "...";
+}
+
+void emitTrace(
+    TraceContext& context,
+    std::string_view operation,
+    std::string_view name,
+    std::string_view source,
+    int line,
+    std::string_view detail)
+{
+    if (context.prefix.empty() || context.outputFailed)
+        return;
+
+    const double elapsed = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - context.started)
+                               .count();
+    std::ostringstream record;
+    record.imbue(std::locale::classic());
+    record << context.prefix << ++context.sequence << '|' << operation << '|'
+           << std::fixed << std::setprecision(6) << elapsed << '|' << std::max(0, line) << '|'
+           << base64(clipped(name, 128)) << '|' << base64(clipped(source, 256)) << '|'
+           << base64(detail) << '\n';
+    const std::string bytes = record.str();
+    if (std::fwrite(bytes.data(), 1, bytes.size(), stdout) != bytes.size())
+    {
+        context.outputFailed = true;
+        context.traceStopped = true;
+        return;
+    }
+    std::fflush(stdout);
+}
+
+std::string valueSummary(lua_State* state, int index)
+{
+    switch (lua_type(state, index))
+    {
+    case LUA_TNIL:
+        return "nil";
+    case LUA_TBOOLEAN:
+        return lua_toboolean(state, index) ? "true" : "false";
+    case LUA_TNUMBER:
+    {
+        const double value = lua_tonumber(state, index);
+        if (!std::isfinite(value))
+            return "number(non-finite)";
+        std::ostringstream stream;
+        stream.imbue(std::locale::classic());
+        stream << std::setprecision(12) << value;
+        return stream.str();
+    }
+    case LUA_TINTEGER:
+    {
+        int isInteger = 0;
+        const int64_t value = lua_tointeger64(state, index, &isInteger);
+        return isInteger ? std::to_string(value) : "integer";
+    }
+    case LUA_TSTRING:
+    {
+        size_t length = 0;
+        const char* value = lua_tolstring(state, index, &length);
+        if (!value)
+            return "<string>";
+        std::string result(value, std::min(length, kMaxTraceStringBytes));
+        if (length > kMaxTraceStringBytes)
+            result += "...";
+        return result;
+    }
+    case LUA_TTABLE:
+        return "<table>";
+    case LUA_TFUNCTION:
+        return lua_iscfunction(state, index) ? "<c-function>" : "<function>";
+    case LUA_TUSERDATA:
+        return "<userdata>";
+    case LUA_TLIGHTUSERDATA:
+        return "<lightuserdata>";
+    case LUA_TTHREAD:
+        return "<thread>";
+    case LUA_TBUFFER:
+        return "<buffer>";
+    case LUA_TVECTOR:
+        return "<vector>";
+    default:
+        return "<value>";
+    }
+}
+
+struct LuaStackGuard
+{
+    lua_State* state;
+    int top;
+
+    explicit LuaStackGuard(lua_State* value)
+        : state(value)
+        , top(lua_gettop(value))
+    {
+    }
+
+    ~LuaStackGuard()
+    {
+        lua_settop(state, top);
+    }
+};
+
+std::string snapshotLocals(lua_State* state)
+{
+    if (!lua_checkstack(state, static_cast<int>(kMaxLocalsPerSnapshot + 2)))
+        return "null";
+
+    LuaStackGuard stackGuard(state);
+    std::string output = "[";
+    bool first = true;
+    for (int index = 1; index <= static_cast<int>(kMaxLocalsPerSnapshot); ++index)
+    {
+        const char* name = lua_getlocal(state, 0, index);
+        if (!name)
+            break;
+
+        const int valueType = lua_type(state, -1);
+        const char* typeName = lua_typename(state, valueType);
+        const std::string value = valueSummary(state, -1);
+        lua_pop(state, 1);
+        if (!first)
+            output.push_back(',');
+        first = false;
+        output += "{\"name\":";
+        output += jsonQuote(name);
+        output += ",\"type\":";
+        output += jsonQuote(typeName ? typeName : "unknown");
+        output += ",\"value\":";
+        output += jsonQuote(value);
+        output.push_back('}');
+    }
+    output.push_back(']');
+    return output;
+}
+
+void onUserThread(lua_State* parent, lua_State* thread)
+{
+    if (!parent || !thread)
+        return;
+    auto* context = static_cast<TraceContext*>(lua_callbacks(parent)->userdata);
+    if (context && !context->prefix.empty())
+        lua_singlestep(thread, context->traceStopped ? 0 : 1);
+}
+
+void debugStep(lua_State* state, lua_Debug* info)
+{
+    auto* context = static_cast<TraceContext*>(lua_callbacks(state)->userdata);
+    if (!context || context->prefix.empty())
+        return;
+    if (context->traceStopped || context->outputFailed)
+    {
+        lua_singlestep(state, 0);
+        lua_callbacks(state)->debugstep = nullptr;
+        return;
+    }
+    if (!context->active)
+        return;
+
+    if (context->stepCount >= context->maxSteps)
+    {
+        lua_singlestep(state, 0);
+        context->active = false;
+        context->traceStopped = true;
+        if (!context->limitReported)
+        {
+            context->limitReported = true;
+            emitTrace(
+                *context,
+                "VM_STEP_LIMIT",
+                "",
+                "",
+                0,
+                "{\"max_steps\":" + std::to_string(context->maxSteps) + "}");
+        }
+        lua_callbacks(state)->debugstep = nullptr;
+        return;
+    }
+
+    ++context->stepCount;
+    try
+    {
+        const bool includeLocals = context->stepCount == 1 || context->stepCount % kLocalSnapshotStride == 0;
+        const int frameDepth = lua_stackdepth(state);
+        const int line = info ? info->currentline : 0;
+        const std::string name = info && info->name ? info->name : "";
+        const std::string source = info && info->source ? info->source : "";
+
+        int pc = -1;
+        int opcodeId = -1;
+        uint32_t rawInstruction = 0;
+        uint32_t auxiliary = 0;
+        std::string opcodeName;
+        if (state->ci && state->ci->p && state->ci->savedpc && state->ci->p->code)
+        {
+            const Proto* proto = state->ci->p;
+            const std::ptrdiff_t offset = state->ci->savedpc - proto->code;
+            if (offset >= 0 && offset < proto->sizecode)
+            {
+                pc = static_cast<int>(offset);
+                rawInstruction = static_cast<uint32_t>(*state->ci->savedpc);
+                opcodeId = static_cast<int>(LUAU_INSN_OP(rawInstruction));
+                if (opcodeId >= 0 && opcodeId < LOP__COUNT)
+                {
+                    const LuauOpcode opcode = static_cast<LuauOpcode>(opcodeId);
+                    if (opcode == LOP_NOP)
+                    {
+                        opcodeName = "NOP";
+                    }
+                    else if (opcode == LOP_NATIVECALL)
+                    {
+                        opcodeName = "NATIVECALL";
+                    }
+                    else
+                    {
+                        const char* nameFromBytecode = Luau::Bytecode::getLuauOpcodeName(opcode);
+                        opcodeName = nameFromBytecode ? nameFromBytecode : "unknown";
+                    }
+                    if (Luau::getOpLength(opcode) == 2 && offset + 1 < proto->sizecode)
+                        auxiliary = static_cast<uint32_t>(state->ci->savedpc[1]);
+                }
+            }
+        }
+
+        std::string detail = "{\"step\":" + std::to_string(context->stepCount) +
+                             ",\"frame_depth\":" + std::to_string(std::max(0, frameDepth));
+        if (info)
+        {
+            detail += ",\"proto_id\":" + std::to_string(info->protoid);
+            detail += ",\"bytecode_id\":" + std::to_string(info->bytecodeid);
+        }
+        else
+        {
+            detail += ",\"proto_id\":null,\"bytecode_id\":null";
+        }
+        detail += ",\"pc\":" + (pc >= 0 ? std::to_string(pc) : "null");
+        detail += ",\"opcode\":" + (opcodeId >= 0 ? jsonQuote(opcodeName) : "null");
+        detail += ",\"opcode_id\":" + (opcodeId >= 0 ? std::to_string(opcodeId) : "null");
+        detail += ",\"instruction_word\":" + (pc >= 0 ? std::to_string(rawInstruction) : "null");
+        if (pc >= 0)
+        {
+            detail += ",\"a\":" + std::to_string(LUAU_INSN_A(rawInstruction));
+            detail += ",\"b\":" + std::to_string(LUAU_INSN_B(rawInstruction));
+            detail += ",\"c\":" + std::to_string(LUAU_INSN_C(rawInstruction));
+            detail += ",\"d\":" + std::to_string(LUAU_INSN_D(rawInstruction));
+            detail += ",\"aux\":";
+            detail += opcodeId < LOP__COUNT &&
+                              Luau::getOpLength(static_cast<LuauOpcode>(opcodeId)) == 2
+                          ? std::to_string(auxiliary)
+                          : "null";
+        }
+        else
+        {
+            detail += ",\"a\":null,\"b\":null,\"c\":null,\"d\":null,\"aux\":null";
+        }
+        detail += ",\"registers\":null";
+        if (includeLocals)
+            detail += ",\"locals\":" + snapshotLocals(state);
+        else
+            detail += ",\"locals\":null";
+        detail.push_back('}');
+
+        emitTrace(*context, "VM_STEP", name, source, line, detail);
+        if (context->traceStopped || context->outputFailed)
+        {
+            context->active = false;
+            lua_singlestep(state, 0);
+            lua_callbacks(state)->debugstep = nullptr;
+        }
+    }
+    catch (...)
+    {
+        context->active = false;
+        context->traceStopped = true;
+        lua_singlestep(state, 0);
+        lua_callbacks(state)->debugstep = nullptr;
+    }
+}
+
+int beginTrace(lua_State* state)
+{
+    auto* context = static_cast<TraceContext*>(lua_callbacks(state)->userdata);
+    if (!context || context->prefix.empty() || context->hookReady)
+        return 0;
+
+    context->hookReady = true;
+    context->active = true;
+    context->started = std::chrono::steady_clock::now();
+    lua_singlestep(state, 1);
+    emitTrace(
+        *context,
+        "HOOK_READY",
+        "lua_singlestep",
+        "",
+        0,
+        "{\"mode\":\"instruction-step\",\"pc_available\":true,\"opcode_available\":true,\"registers_available\":false}");
+    if (context->traceStopped || context->outputFailed)
+    {
+        context->active = false;
+        lua_singlestep(state, 0);
+        lua_callbacks(state)->debugstep = nullptr;
+    }
+    return 0;
+}
+
+bool readSourceFile(const std::string& path, std::string& source, std::string& error)
+{
+    std::ifstream input(path, std::ios::binary);
+    if (!input)
+    {
+        error = "cannot open source file: " + path;
+        return false;
+    }
+
+    input.seekg(0, std::ios::end);
+    const std::streamoff size = input.tellg();
+    if (size < 0 || static_cast<uint64_t>(size) > kMaxSourceBytes)
+    {
+        error = "source file is larger than the 64 MiB host limit";
+        return false;
+    }
+    input.seekg(0, std::ios::beg);
+    source.resize(static_cast<size_t>(size));
+    if (!source.empty() && !input.read(source.data(), static_cast<std::streamsize>(source.size())))
+    {
+        error = "could not read source file: " + path;
+        return false;
+    }
+    return true;
+}
+
+void setGlobalNil(lua_State* state, const char* name)
+{
+    lua_pushnil(state);
+    lua_setglobal(state, name);
+}
+
+bool isTraceToken(const std::string& token)
+{
+    if (token.size() != 32)
+        return false;
+    return std::all_of(token.begin(), token.end(), [](unsigned char character) {
+        return (character >= '0' && character <= '9') ||
+               (character >= 'a' && character <= 'f');
+    });
+}
+
+bool parsePositiveInteger(const char* text, uint64_t& value)
+{
+    if (!text || !*text)
+        return false;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(text, &end, 10);
+    if (*end != '\0' || parsed == 0 || parsed > 10000000ULL)
+        return false;
+    value = static_cast<uint64_t>(parsed);
+    return true;
+}
+
+void printUsage(const char* executable)
+{
+    std::fprintf(
+        stderr,
+        "Usage: %s --source <runner.luau> [--trace-token <32-hex>] [--max-trace-events <count>]\n",
+        executable);
+}
+} // namespace
+
+int main(int argc, char** argv)
+{
+    std::setlocale(LC_ALL, "C");
+    std::setbuf(stdout, nullptr);
+
+    std::string sourcePath;
+    std::string traceToken;
+    uint64_t maxTraceEvents = 25000;
+
+    for (int index = 1; index < argc; ++index)
+    {
+        const std::string argument = argv[index];
+        if (argument == "--version")
+        {
+            std::puts("Protez native Luau host 0.1 (Luau 0.740)");
+            return 0;
+        }
+        if ((argument == "--source" || argument == "--trace-token" ||
+             argument == "--max-trace-events") && index + 1 >= argc)
+        {
+            printUsage(argv[0]);
+            return 64;
+        }
+        if (argument == "--source")
+        {
+            sourcePath = argv[++index];
+        }
+        else if (argument == "--trace-token")
+        {
+            traceToken = argv[++index];
+        }
+        else if (argument == "--max-trace-events")
+        {
+            if (!parsePositiveInteger(argv[++index], maxTraceEvents))
+            {
+                std::fprintf(stderr, "Invalid --max-trace-events value (expected 1..10000000)\n");
+                return 64;
+            }
+        }
+        else
+        {
+            std::fprintf(stderr, "Unknown option: %s\n", argument.c_str());
+            printUsage(argv[0]);
+            return 64;
+        }
+    }
+
+    if (sourcePath.empty())
+    {
+        printUsage(argv[0]);
+        return 64;
+    }
+    if (!traceToken.empty() && !isTraceToken(traceToken))
+    {
+        std::fprintf(stderr, "Invalid trace token\n");
+        return 64;
+    }
+
+    std::string source;
+    std::string readError;
+    if (!readSourceFile(sourcePath, source, readError))
+    {
+        std::fprintf(stderr, "Protez host error: %s\n", readError.c_str());
+        return 66;
+    }
+
+    MemoryBudget memoryBudget;
+    lua_State* state = lua_newstate(boundedAllocator, &memoryBudget);
+    if (!state)
+    {
+        std::fprintf(stderr, "Protez host error: could not allocate a Luau VM state\n");
+        return 71;
+    }
+
+    luaL_openlibs(state);
+    // The mock environment is installed at the start of the runner. Keep host-level
+    // filesystem, process, package and debug facilities unavailable even if setup fails.
+    for (const char* name : {"io", "os", "package", "dofile", "loadfile"})
+        setGlobalNil(state, name);
+
+    TraceContext trace;
+    trace.maxSteps = maxTraceEvents;
+    if (!traceToken.empty())
+    {
+        trace.prefix = "__PROTEZ_TRACE_" + traceToken + "|";
+        lua_Callbacks* callbacks = lua_callbacks(state);
+        callbacks->userdata = &trace;
+        callbacks->debugstep = debugStep;
+        callbacks->userthread = onUserThread;
+        lua_pushcfunction(state, beginTrace, "__PROTEZ_NATIVE_TRACE_BEGIN");
+        lua_setglobal(state, "__PROTEZ_NATIVE_TRACE_BEGIN");
+    }
+
+    lua_CompileOptions options{};
+    options.optimizationLevel = 0; // Keep VM instruction traces granular.
+    options.debugLevel = 2; // Include local and upvalue names for snapshots.
+    options.typeInfoLevel = 0;
+    options.coverageLevel = 0;
+
+    size_t bytecodeSize = 0;
+    char* bytecode = nullptr;
+    try
+    {
+        bytecode = luau_compile(source.data(), source.size(), &options, &bytecodeSize);
+    }
+    catch (const std::exception& exception)
+    {
+        std::fprintf(stderr, "Protez host error: Luau compiler failed: %s\n", exception.what());
+        lua_close(state);
+        return 70;
+    }
+    catch (...)
+    {
+        std::fprintf(stderr, "Protez host error: Luau compiler failed\n");
+        lua_close(state);
+        return 70;
+    }
+
+    if (!bytecode || bytecodeSize == 0)
+    {
+        std::fprintf(stderr, "Protez host error: Luau compiler returned no bytecode\n");
+        std::free(bytecode);
+        lua_close(state);
+        return 70;
+    }
+
+    const std::string chunkName = "@" + std::string(sourcePath);
+    const int loadStatus = luau_load(state, chunkName.c_str(), bytecode, bytecodeSize, 0);
+    std::free(bytecode);
+    if (loadStatus != 0)
+    {
+        const char* message = lua_tostring(state, -1);
+        std::fprintf(stderr, "Luau load failed: %s\n", message ? message : "unknown error");
+        lua_close(state);
+        return 65;
+    }
+
+    const int status = lua_pcall(state, 0, 0, 0);
+    if (status != LUA_OK)
+    {
+        const char* message = lua_tostring(state, -1);
+        std::fprintf(stderr, "Luau runtime error: %s\n", message ? message : "unknown error");
+        lua_close(state);
+        return 1;
+    }
+
+    lua_close(state);
+    return 0;
+}

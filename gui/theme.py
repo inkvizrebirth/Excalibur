@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import customtkinter as ctk
 
-BG = "#0a0a0a"
-PANEL = "#111111"
-INPUT_BG = "#050706"
-BORDER = "#26312b"
-NEON = "#00ff88"
-ACID = "#39ff14"
-TEXT = "#d4e7dc"
-MUTED = "#78857d"
-WARN = "#ffd166"
-ERROR = "#ff3355"
-RED_BG = "#330000"
+# Monochrome terminal palette; legacy names are kept for existing widgets.
+BG = "#000000"
+PANEL = "#0a0a0a"
+INPUT_BG = "#030303"
+BORDER = "#454545"
+NEON = "#f5f5f5"
+ACID = "#ffffff"
+TEXT = "#e8e8e8"
+MUTED = "#858585"
+WARN = "#bcbcbc"
+ERROR = "#ffffff"
+RED_BG = "#171717"
 
 
 class TerminalButton(ctk.CTkButton):

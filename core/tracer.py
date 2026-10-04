@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from core.sandbox import Sandbox, SandboxResult
+from core.sandbox import DEFAULT_TOOLS_DIR, Sandbox, SandboxResult
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOGS_DIR = ROOT / "logs"
@@ -92,8 +92,8 @@ class Tracer:
     """Collect structured hook/API events without retaining a trace in RAM.
 
     Stock Luau does not implement debug.sethook, so a normal Luau CLI run can
-    only provide the mock/API events emitted by the sandbox. A custom host may
-    expose native hooks, which this bridge records when available.
+    only provide mock/API events. The optional pinned native host additionally
+    emits instruction-step events from Luau's C API debugstep callback.
     """
 
     def __init__(
@@ -102,6 +102,7 @@ class Tracer:
         logger: logging.Logger | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
         logs_dir: Path | str = DEFAULT_LOGS_DIR,
+        tools_dir: Path | str = DEFAULT_TOOLS_DIR,
         trace_path: Path | str | None = None,
         max_trace_bytes: int = TRACE_ROTATION_BYTES,
         timeout_seconds: float = TRACE_TIMEOUT_SECONDS,
@@ -113,6 +114,7 @@ class Tracer:
         self.logger = logger or logging.getLogger("protez")
         self.progress_callback = progress_callback
         self.logs_dir = Path(logs_dir).expanduser().resolve()
+        self.tools_dir = Path(tools_dir).expanduser().resolve()
         self.trace_path = (
             Path(trace_path).expanduser().resolve()
             if trace_path is not None
@@ -122,6 +124,7 @@ class Tracer:
         self.timeout_seconds = timeout_seconds
         self.max_process_output_bytes = max_process_output_bytes
         self.sandbox = sandbox or Sandbox(
+            tools_dir=self.tools_dir,
             logs_dir=self.logs_dir,
             timeout_seconds=timeout_seconds,
             max_output_bytes=max_process_output_bytes,
@@ -136,9 +139,9 @@ class Tracer:
     def _trace_once(self, source: str, source_name: str) -> TraceResult:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)
-        self.logger.info("Tracing started: mode=call+return+line, count=1000")
+        self.logger.info("Tracing started: mock/API events plus native VM steps when available")
         self.logger.warning(
-            "Stock Luau has no debug.sethook; probing for native hook support and recording mock API events"
+            "Instruction stepping requires the optional native host; stock Luau CLI records mock/API events only"
         )
         self._progress(20, "TRACE")
 
@@ -153,6 +156,7 @@ class Tracer:
             record = self._decode_record(line.rstrip(b"\r\n"), prefix)
             if record is None:
                 return
+            record["seq"] = state["event_count"] + 1
             try:
                 writer.write(record)
             except Exception as exc:
@@ -160,10 +164,8 @@ class Tracer:
                 return
 
             state["event_count"] += 1
-            if record["op"] == "HOOK_READY":
+            if record["op"] == "HOOK_READY" and record["backend"] == "luau-native-debugstep":
                 state["hooks_available"] = True
-            elif record["op"] == "HOOK_UNAVAILABLE":
-                state["hooks_available"] = False
 
             count = state["event_count"]
             if count % 100_000 == 0:
@@ -190,10 +192,12 @@ class Tracer:
         if sandbox_result.output_limited:
             self.logger.warning("Trace run reached its process-output limit")
         if state["hooks_available"]:
-            self.logger.info("Native Luau debug hooks active")
+            self.logger.info(
+                "Native trace records include proto-relative PCs and opcode headers; the full register file is not captured"
+            )
         else:
             self.logger.warning(
-                "Trace contains mock/API events only; bytecode PCs, VM opcodes and registers are unavailable"
+                "Trace contains mock/API events only; build the optional native host for instruction-step events"
             )
         event_count = state["event_count"]
         self.logger.info("Trace recorded: %s events", f"{event_count:,}".replace(",", " "))
@@ -227,7 +231,7 @@ class Tracer:
         except (ValueError, UnicodeDecodeError, binascii.Error):
             return None
 
-        return {
+        record = {
             "t": max(0.0, elapsed),
             "pc": None,
             "op": op,
@@ -237,11 +241,27 @@ class Tracer:
             "source": source or None,
             "detail": detail or None,
             "backend": (
-                "luau-hook"
+                "luau-native-debugstep"
+                if op in {"VM_STEP", "VM_STEP_LIMIT"}
+                else "luau-hook"
                 if op in {"CALL", "RETURN", "LINE", "COUNT", "TAIL_RETURN", "HOOK_READY", "HOOK_UNAVAILABLE"}
                 else "mock-api"
             ),
         }
+        if op in {"VM_STEP", "VM_STEP_LIMIT", "HOOK_READY"}:
+            try:
+                metadata = json.loads(detail)
+            except (TypeError, json.JSONDecodeError):
+                metadata = None
+            if isinstance(metadata, dict) and (
+                op in {"VM_STEP", "VM_STEP_LIMIT"}
+                or metadata.get("mode") == "instruction-step"
+            ):
+                record.update(metadata)
+                record["detail"] = None
+                if op == "HOOK_READY":
+                    record["backend"] = "luau-native-debugstep"
+        return record
 
     def _progress(self, percent: float, stage: str) -> None:
         if self.progress_callback is not None:

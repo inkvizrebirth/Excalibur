@@ -15,7 +15,7 @@ from core.pipeline import DeobfuscationPipeline, PipelineError
 from gui.controls import Controls
 from gui.input_panel import InputPanel
 from gui.log_panel import LogPanel, QueueLogHandler
-from gui.theme import BG, BORDER, MUTED, NEON, PANEL
+from gui.theme import BG, BORDER, MUTED, TEXT, TerminalButton
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -41,10 +41,17 @@ class ProtezApp(ctk.CTk):
         self._closed = False
 
         self.title("PROTEZ // Luau Deobfuscator")
-        self.geometry("1220x860")
-        self.minsize(1000, 720)
+        self.overrideredirect(True)
+        self.geometry("900x650")
+        self.minsize(760, 610)
         self.configure(fg_color=BG)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._maximized = False
+        self._normal_geometry = "900x650"
+        self._drag_offset: tuple[int, int] | None = None
+        self._resize_anchor: tuple[int, int, int, int] | None = None
+        self._restore_chrome_after_map = False
+        self.bind("<Map>", self._on_map, add="+")
 
         self.logger.info("Protez v1.0 initialized")
         self.logger.info("Loading fonts...")
@@ -131,22 +138,97 @@ class ProtezApp(ctk.CTk):
 
     def _build_layout(self) -> None:
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(0, weight=4, minsize=210)
-        self.grid_rowconfigure(1, weight=4, minsize=290)
-        self.grid_rowconfigure(2, weight=2, minsize=150)
+        self.grid_rowconfigure(1, weight=1)
 
-        self.log_panel = LogPanel(self, self.log_records, self.body_font)
-        self.log_panel.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 5))
+        title_bar = ctk.CTkFrame(
+            self,
+            fg_color=BG,
+            corner_radius=0,
+            border_width=1,
+            border_color=BORDER,
+            height=34,
+        )
+        title_bar.grid(row=0, column=0, sticky="ew")
+        title_bar.grid_propagate(False)
+        title_bar.grid_columnconfigure(0, weight=1)
+
+        heading = ctk.CTkFrame(title_bar, fg_color=BG, corner_radius=0)
+        heading.grid(row=0, column=0, sticky="nsew", padx=(10, 4))
+        heading.grid_columnconfigure(1, weight=1)
+        self.title_text = ctk.CTkLabel(
+            heading,
+            text="PROTEZ",
+            text_color=TEXT,
+            font=ctk.CTkFont(family=self.display_family, size=8),
+            anchor="w",
+        )
+        self.title_text.grid(row=0, column=0, sticky="w", padx=(0, 10))
+        self.subtitle_text = ctk.CTkLabel(
+            heading,
+            text="LUAU / DEOBFUSCATOR",
+            text_color=MUTED,
+            font=ctk.CTkFont(family=self.body_family, size=15),
+            anchor="w",
+        )
+        self.subtitle_text.grid(row=0, column=1, sticky="w")
+
+        window_buttons = ctk.CTkFrame(title_bar, fg_color=BG, corner_radius=0)
+        window_buttons.grid(row=0, column=1, sticky="e", padx=(4, 5), pady=3)
+        button_font = ctk.CTkFont(family=self.body_family, size=17)
+        button_style = {
+            "accent": TEXT,
+            "base_bg": BG,
+            "base_text": TEXT,
+            "width": 31,
+            "height": 25,
+            "font": button_font,
+        }
+        self.minimize_button = TerminalButton(
+            window_buttons,
+            text="_",
+            command=self._minimize_window,
+            **button_style,
+        )
+        self.minimize_button.grid(row=0, column=0, padx=(0, 3))
+        self.maximize_button = TerminalButton(
+            window_buttons,
+            text="[]",
+            command=self._toggle_maximize,
+            **button_style,
+        )
+        self.maximize_button.grid(row=0, column=1, padx=3)
+        self.close_button = TerminalButton(
+            window_buttons,
+            text="X",
+            command=self._on_close,
+            **button_style,
+        )
+        self.close_button.grid(row=0, column=2, padx=(3, 0))
+
+        for widget in (title_bar, heading, self.title_text, self.subtitle_text):
+            widget.bind("<ButtonPress-1>", self._begin_window_drag, add="+")
+            widget.bind("<B1-Motion>", self._drag_window, add="+")
+            widget.bind("<Double-Button-1>", self._toggle_maximize, add="+")
+
+        content = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        content.grid(row=1, column=0, sticky="nsew", padx=1, pady=(0, 1))
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_rowconfigure(0, weight=4, minsize=175)
+        content.grid_rowconfigure(1, weight=4, minsize=210)
+        content.grid_rowconfigure(2, weight=2, minsize=145)
+
+        self.log_panel = LogPanel(content, self.log_records, self.body_font)
+        self.log_panel.grid(row=0, column=0, sticky="nsew", padx=10, pady=(8, 4))
 
         self.input_panel = InputPanel(
-            self,
+            content,
             title_font=self.title_font,
             body_font=self.code_font,
         )
-        self.input_panel.grid(row=1, column=0, sticky="nsew", padx=12, pady=5)
+        self.input_panel.grid(row=1, column=0, sticky="nsew", padx=10, pady=4)
 
         self.controls = Controls(
-            self,
+            content,
             title_font=self.title_font,
             body_font=self.body_font,
             on_destroy=self._start_deobfuscation,
@@ -154,7 +236,92 @@ class ProtezApp(ctk.CTk):
             on_open_output=self._open_output,
             on_copy_result=self._copy_result,
         )
-        self.controls.grid(row=2, column=0, sticky="nsew", padx=12, pady=(5, 12))
+        self.controls.grid(row=2, column=0, sticky="nsew", padx=10, pady=(4, 9))
+
+        self.resize_grip = ctk.CTkLabel(
+            self,
+            text="◢",
+            width=14,
+            height=14,
+            text_color=MUTED,
+            fg_color=BG,
+            font=ctk.CTkFont(family=self.body_family, size=12),
+        )
+        self.resize_grip.place(relx=1, rely=1, anchor="se")
+        self.resize_grip.bind("<ButtonPress-1>", self._begin_resize)
+        self.resize_grip.bind("<B1-Motion>", self._resize_window)
+
+    def _begin_window_drag(self, event) -> None:
+        if self._maximized:
+            self._drag_offset = None
+            return
+        self._drag_offset = (event.x_root - self.winfo_x(), event.y_root - self.winfo_y())
+
+    def _drag_window(self, event) -> None:
+        if self._drag_offset is None or self._maximized:
+            return
+        x = event.x_root - self._drag_offset[0]
+        y = event.y_root - self._drag_offset[1]
+        self.geometry(f"+{x}+{y}")
+
+    def _begin_resize(self, event) -> None:
+        if self._maximized:
+            self._resize_anchor = None
+            return
+        self._resize_anchor = (
+            event.x_root,
+            event.y_root,
+            self.winfo_width(),
+            self.winfo_height(),
+        )
+
+    def _resize_window(self, event) -> None:
+        if self._resize_anchor is None:
+            return
+        start_x, start_y, start_width, start_height = self._resize_anchor
+        width = max(760, start_width + event.x_root - start_x)
+        height = max(610, start_height + event.y_root - start_y)
+        self.geometry(f"{width}x{height}+{self.winfo_x()}+{self.winfo_y()}")
+
+    def _toggle_maximize(self, _event=None):
+        if self._maximized:
+            self.geometry(self._normal_geometry)
+            self.maximize_button.configure(text="[]")
+            self._maximized = False
+            return "break"
+
+        self._normal_geometry = self.geometry()
+        self._maximized = True
+        try:
+            x = self.winfo_vrootx()
+            y = self.winfo_vrooty()
+            width = self.winfo_vrootwidth()
+            height = self.winfo_vrootheight()
+        except Exception:
+            x = y = 0
+            width = height = 0
+        if width <= 1 or height <= 1:
+            x = y = 0
+            width = self.winfo_screenwidth()
+            height = self.winfo_screenheight()
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.maximize_button.configure(text="][")
+        return "break"
+
+    def _minimize_window(self) -> None:
+        try:
+            self._restore_chrome_after_map = True
+            self.overrideredirect(False)
+            self.iconify()
+        except Exception:
+            self._restore_chrome_after_map = False
+            self.overrideredirect(True)
+            self.logger.warning("Window manager does not support minimizing this window")
+
+    def _on_map(self, _event=None) -> None:
+        if self._restore_chrome_after_map and self.state() == "normal":
+            self._restore_chrome_after_map = False
+            self.after_idle(lambda: self.overrideredirect(True))
 
     def _enable_drag_and_drop(self) -> None:
         if TkinterDnD is None or DND_FILES is None:

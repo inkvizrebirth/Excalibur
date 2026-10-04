@@ -22,8 +22,9 @@ from typing import Any, BinaryIO
 ROOT = Path(__file__).resolve().parent
 REQUIREMENTS_FILE = ROOT / "requirements.txt"
 MARKER_FILE = ROOT / ".installed"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MIN_PYTHON = (3, 10)
+NATIVE_HOST_LUAU_TAG = "0.740"
 MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024
 DOWNLOAD_TIMEOUT_SECONDS = 45
 
@@ -109,6 +110,26 @@ def _requirements_digest() -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _native_host_binary_path() -> Path:
+    suffix = ".exe" if platform.system().lower() == "windows" else ""
+    return ROOT / "tools" / f"protez-native-host{suffix}"
+
+
+def _native_host_source_digest() -> str:
+    digest = hashlib.sha256(f"Luau:{NATIVE_HOST_LUAU_TAG}\n".encode("utf-8"))
+    for relative_path in ("native/CMakeLists.txt", "native/host.cpp"):
+        path = ROOT / relative_path
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise InstallationError(f"Cannot read native host source {path}: {exc}") from exc
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(content)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _dependencies_available() -> bool:
     for distribution in DISTRIBUTIONS:
         try:
@@ -124,9 +145,13 @@ def _marker_is_current() -> bool:
     except (OSError, json.JSONDecodeError):
         return False
 
+    native_host_available = marker.get("native_host_available") is True
     return (
         marker.get("schema") == SCHEMA_VERSION
         and marker.get("requirements_sha256") == _requirements_digest()
+        and marker.get("native_host_source_sha256") == _native_host_source_digest()
+        and isinstance(marker.get("native_host_available"), bool)
+        and (not native_host_available or _native_host_binary_path().is_file())
         and marker.get("dependencies_installed") is True
         and _dependencies_available()
     )
@@ -431,11 +456,96 @@ def download_luau_tools() -> tuple[list[str], list[str]]:
     return sorted(available), missing
 
 
+def build_native_host() -> bool:
+    tools_dir = ROOT / "tools"
+    destination = _native_host_binary_path()
+    cmake = shutil.which("cmake")
+    if cmake is None:
+        if destination.is_file():
+            LOGGER.warning("CMake is unavailable; keeping the existing native host")
+            return True
+        LOGGER.warning(
+            "CMake was not found; using the official Luau CLI fallback. "
+            "Install CMake and a C++17 compiler, then rerun installer.py --force to enable VM tracing."
+        )
+        return False
+
+    build_dir = tools_dir / "native-host-build"
+    configure = [
+        cmake,
+        "-S",
+        str(ROOT / "native"),
+        "-B",
+        str(build_dir),
+        "-DCMAKE_BUILD_TYPE=Release",
+    ]
+    parallel_jobs = max(1, min(os.cpu_count() or 2, 4))
+    build = [
+        cmake,
+        "--build",
+        str(build_dir),
+        "--config",
+        "Release",
+        "--target",
+        "protez-native-host",
+        "--parallel",
+        str(parallel_jobs),
+    ]
+
+    for label, command in (("configure", configure), ("build", build)):
+        try:
+            result = subprocess.run(
+                command,
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+                timeout=1200,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            LOGGER.warning("Native host %s did not complete: %s", label, exc)
+            return destination.is_file()
+        if result.returncode != 0:
+            output = (result.stdout or "").strip()
+            detail = "\n".join(output.splitlines()[-24:])
+            LOGGER.warning(
+                "Native host %s failed (exit code %s); retaining CLI fallback%s",
+                label,
+                result.returncode,
+                f":\n{detail}" if detail else "",
+            )
+            return destination.is_file()
+
+    built_binary = build_dir / "host-bin" / destination.name
+    if not built_binary.is_file():
+        LOGGER.warning(
+            "Native host build completed without producing %s; retaining CLI fallback",
+            built_binary,
+        )
+        return destination.is_file()
+
+    temporary_binary = destination.with_name(destination.name + ".tmp")
+    try:
+        shutil.copy2(built_binary, temporary_binary)
+        if platform.system().lower() != "windows":
+            temporary_binary.chmod(0o755)
+        os.replace(temporary_binary, destination)
+    except OSError as exc:
+        temporary_binary.unlink(missing_ok=True)
+        LOGGER.warning("Could not install native host: %s", exc)
+        return destination.is_file()
+
+    LOGGER.info("Instrumented Luau native host ready: %s", destination.name)
+    return True
+
+
 def _write_marker(
     available_fonts: list[str],
     missing_fonts: list[str],
     available_tools: list[str],
     missing_tools: list[str],
+    native_host_available: bool,
 ) -> None:
     marker = {
         "schema": SCHEMA_VERSION,
@@ -446,6 +556,9 @@ def _write_marker(
         "fonts_missing": missing_fonts,
         "luau_tools_available": available_tools,
         "luau_tools_missing": missing_tools,
+        "native_host_available": native_host_available,
+        "native_host_luau_tag": NATIVE_HOST_LUAU_TAG,
+        "native_host_source_sha256": _native_host_source_digest(),
     }
     temporary_marker = MARKER_FILE.with_name(MARKER_FILE.name + ".tmp")
     temporary_marker.write_text(
@@ -466,7 +579,14 @@ def ensure_installed(*, force: bool = False) -> None:
     install_dependencies()
     available_fonts, missing_fonts = download_fonts()
     available_tools, missing_tools = download_luau_tools()
-    _write_marker(available_fonts, missing_fonts, available_tools, missing_tools)
+    native_host_available = build_native_host()
+    _write_marker(
+        available_fonts,
+        missing_fonts,
+        available_tools,
+        missing_tools,
+        native_host_available,
+    )
     LOGGER.info("Protez prerequisites checked")
 
 
