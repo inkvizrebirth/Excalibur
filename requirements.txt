@@ -1,0 +1,5 @@
+customtkinter>=5.2.2
+lupa>=2.0
+requests>=2.31.0
+Pygments>=2.17.2
+Pillow>=10.2.0

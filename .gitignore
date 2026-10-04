@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.installed
+.installed.tmp
+
+# Runtime output and downloaded tools are machine-local.
+output/*
+!output/.gitkeep
+logs/*
+!logs/.gitkeep
+tools/*
+!tools/.gitkeep
+assets/fonts/*
+!assets/fonts/.gitkeep
+assets/icons/*
+!assets/icons/.gitkeep
