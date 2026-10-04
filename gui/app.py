@@ -175,26 +175,35 @@ class ProtezApp(ctk.CTk):
             self.logger.warning("No input provided")
             return
 
+        source_path = self.input_panel.file_path
+        source_name = source_path.name if source_path else "pasted input"
         self.logger.info("Deobfuscation started")
         self.controls.set_busy(True)
-        self.controls.set_progress(0, "STARTING")
+        self.controls.set_progress(0, "SANDBOX")
         self._worker = threading.Thread(
             target=self._run_pipeline,
-            args=(source,),
+            args=(source, source_name),
             name="protez-deobfuscation",
             daemon=True,
         )
         self._worker.start()
 
-    def _run_pipeline(self, source: str) -> None:
+    def _run_pipeline(self, source: str, source_name: str) -> None:
         try:
-            # The core pipeline is added in later implementation milestones.
-            self.logger.warning(
-                "Deobfuscation core is not available yet; input was not executed"
-            )
-            self.ui_events.put(("progress", 0, "NOT READY"))
+            from core.sandbox import Sandbox
+
+            self.ui_events.put(("progress", 5, "SANDBOX"))
+            result = Sandbox(logger=self.logger).run(source, source_name=source_name)
+            self.ui_events.put(("progress", 20, "SANDBOX"))
+            if result.captured_path is None:
+                self.logger.warning("Sandbox finished without a captured payload")
+            else:
+                self.logger.info(
+                    "Captured source is ready for the next pipeline stage: %s",
+                    result.captured_path.name,
+                )
         except Exception:
-            self.logger.exception("Deobfuscation worker failed")
+            self.logger.exception("Sandbox stage failed")
         finally:
             self.ui_events.put(("finished",))
 
