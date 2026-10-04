@@ -11,6 +11,7 @@ from pathlib import Path
 import customtkinter as ctk
 from tkinter import font as tkfont
 
+from core.pipeline import DeobfuscationPipeline, PipelineError
 from gui.controls import Controls
 from gui.input_panel import InputPanel
 from gui.log_panel import LogPanel, QueueLogHandler
@@ -190,20 +191,18 @@ class ProtezApp(ctk.CTk):
 
     def _run_pipeline(self, source: str, source_name: str) -> None:
         try:
-            from core.sandbox import Sandbox
-
-            self.ui_events.put(("progress", 5, "SANDBOX"))
-            result = Sandbox(logger=self.logger).run(source, source_name=source_name)
-            self.ui_events.put(("progress", 20, "SANDBOX"))
-            if result.captured_path is None:
-                self.logger.warning("Sandbox finished without a captured payload")
-            else:
-                self.logger.info(
-                    "Captured source is ready for the next pipeline stage: %s",
-                    result.captured_path.name,
-                )
+            pipeline = DeobfuscationPipeline(
+                logger=self.logger,
+                progress_callback=lambda percent, stage: self.ui_events.put(
+                    ("progress", percent, stage)
+                ),
+            )
+            result = pipeline.run(source, source_name=source_name)
+            self.ui_events.put(("output", str(result.output_path)))
+        except PipelineError as exc:
+            self.logger.error("Pipeline stopped: %s", exc)
         except Exception:
-            self.logger.exception("Sandbox stage failed")
+            self.logger.exception("Deobfuscation pipeline failed")
         finally:
             self.ui_events.put(("finished",))
 
@@ -218,6 +217,8 @@ class ProtezApp(ctk.CTk):
             try:
                 if event[0] == "progress":
                     self.controls.set_progress(event[1], event[2])
+                elif event[0] == "output":
+                    self._open_output()
                 elif event[0] == "finished":
                     self.controls.set_busy(False)
             except Exception:
