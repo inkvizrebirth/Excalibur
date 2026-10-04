@@ -1,0 +1,127 @@
+from __future__ import annotations
+
+import logging
+import queue
+from datetime import datetime
+
+import customtkinter as ctk
+
+from gui.theme import BG, BORDER, ERROR, MUTED, NEON, PANEL, WARN
+
+
+class QueueLogHandler(logging.Handler):
+    """Forwards log records to the UI without touching Tk from worker threads."""
+
+    def __init__(self, records: queue.Queue[logging.LogRecord]):
+        super().__init__()
+        self.records = records
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.records.put_nowait(record)
+        except Exception:
+            self.handleError(record)
+
+
+class LogPanel(ctk.CTkFrame):
+    MAX_LINES = 4000
+
+    def __init__(self, master, records: queue.Queue[logging.LogRecord], font):
+        super().__init__(
+            master,
+            corner_radius=0,
+            border_width=1,
+            border_color=BORDER,
+            fg_color=PANEL,
+        )
+        self._records = records
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        header = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=30)
+        header.grid(row=0, column=0, sticky="ew", padx=10, pady=(4, 2))
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            header,
+            text="LOGS",
+            text_color=NEON,
+            font=font,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            header,
+            text="LIVE / LOCAL",
+            text_color=MUTED,
+            font=ctk.CTkFont(family=font.cget("family"), size=12),
+            anchor="e",
+        ).grid(row=0, column=1, sticky="e")
+
+        self.textbox = ctk.CTkTextbox(
+            self,
+            corner_radius=0,
+            border_width=0,
+            fg_color=BG,
+            text_color=NEON,
+            font=font,
+            wrap="none",
+            activate_scrollbars=True,
+        )
+        self.textbox.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        self._text = self.textbox._textbox
+        self._text.tag_configure("INFO", foreground=NEON)
+        self._text.tag_configure("WARNING", foreground=WARN)
+        self._text.tag_configure("ERROR", foreground=ERROR)
+        self._text.tag_configure("DEBUG", foreground=MUTED)
+        self.textbox.configure(state="disabled")
+        self.after(50, self._drain_records)
+
+    def _tag_for(self, levelno: int) -> str:
+        if levelno >= logging.ERROR:
+            return "ERROR"
+        if levelno >= logging.WARNING:
+            return "WARNING"
+        if levelno <= logging.DEBUG:
+            return "DEBUG"
+        return "INFO"
+
+    def _render_record(self, record: logging.LogRecord) -> None:
+        timestamp = datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
+        message = record.getMessage()
+        if record.exc_info:
+            message = f"{message}\n{logging.Formatter().formatException(record.exc_info)}"
+        tag = self._tag_for(record.levelno)
+
+        self.textbox.configure(state="normal")
+        for line in message.splitlines() or [""]:
+            self._text.insert("end", f"[{timestamp}] {line}\n", tag)
+        line_count = int(self._text.index("end-1c").split(".", maxsplit=1)[0])
+        if line_count > self.MAX_LINES + 1:
+            self._text.delete("1.0", f"{line_count - self.MAX_LINES}.0")
+        self._text.see("end")
+        self.textbox.configure(state="disabled")
+
+    def _drain_records(self) -> None:
+        for _ in range(500):
+            try:
+                record = self._records.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self._render_record(record)
+            except Exception:
+                # A malformed record must not stop future UI updates.
+                continue
+        try:
+            self.after(50, self._drain_records)
+        except Exception:
+            pass
+
+    def clear(self) -> None:
+        while True:
+            try:
+                self._records.get_nowait()
+            except queue.Empty:
+                break
+        self.textbox.configure(state="normal")
+        self.textbox.delete("1.0", "end")
+        self.textbox.configure(state="disabled")

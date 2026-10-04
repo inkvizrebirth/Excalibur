@@ -35,7 +35,14 @@ DIRECTORIES = (
     "logs",
 )
 
-DISTRIBUTIONS = ("customtkinter", "lupa", "requests", "Pygments", "Pillow")
+DISTRIBUTIONS = (
+    "customtkinter",
+    "tkinterdnd2",
+    "lupa",
+    "requests",
+    "Pygments",
+    "Pillow",
+)
 
 FONT_URLS = {
     "PressStart2P-Regular.ttf": (
