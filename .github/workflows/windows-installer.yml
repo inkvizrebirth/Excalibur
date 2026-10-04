@@ -1,0 +1,137 @@
+name: Windows installer
+
+on:
+  push:
+    branches:
+      - main
+      - "arena/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Set up CMake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: "3.30.x"
+
+      - name: Install Python dependencies and packager
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
+          python -m pip install -r requirements.txt pyinstaller
+          if ($LASTEXITCODE -ne 0) { throw "dependency install failed" }
+
+      - name: Run static Python checks
+        shell: pwsh
+        run: |
+          python -m compileall -q core gui installer.py main.py setup_app.py scripts tests
+          if ($LASTEXITCODE -ne 0) { throw "Python compilation check failed" }
+          python -m unittest discover -v
+          if ($LASTEXITCODE -ne 0) { throw "Python-only unit tests failed" }
+
+      - name: Build pinned Luau native host
+        shell: pwsh
+        run: |
+          cmake -S native -B build/native -A x64 -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
+          cmake --build build/native --config Release --target protez-native-host --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw "Native host build failed" }
+          $native = Join-Path $PWD "build/native/host-bin/protez-native-host.exe"
+          if (-not (Test-Path $native)) { throw "Native host output is missing: $native" }
+          & $native --version
+          if ($LASTEXITCODE -ne 0) { throw "Native host health check failed" }
+
+      - name: Bundle pixel fonts
+        shell: pwsh
+        run: |
+          $fontDir = Join-Path $PWD "assets/fonts"
+          New-Item -ItemType Directory -Force -Path $fontDir | Out-Null
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/google/fonts/main/ofl/pressstart2p/PressStart2P-Regular.ttf" -OutFile (Join-Path $fontDir "PressStart2P-Regular.ttf")
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/google/fonts/main/ofl/vt323/VT323-Regular.ttf" -OutFile (Join-Path $fontDir "VT323-Regular.ttf")
+          foreach ($font in @("PressStart2P-Regular.ttf", "VT323-Regular.ttf")) {
+            if ((Get-Item (Join-Path $fontDir $font)).Length -lt 1000) { throw "Downloaded font is incomplete: $font" }
+          }
+
+      - name: Package the self-contained application
+        shell: pwsh
+        run: |
+          $native = Join-Path $PWD "build/native/host-bin/protez-native-host.exe"
+          $arguments = @(
+            "--noconfirm", "--clean", "--onefile", "--windowed",
+            "--name", "Protez",
+            "--distpath", "dist",
+            "--workpath", "build/pyinstaller-app",
+            "--specpath", "build/spec-app",
+            "--add-data", "sandbox;sandbox",
+            "--add-data", "$native;tools",
+            "--add-data", "assets/fonts;assets/fonts",
+            "--collect-all", "customtkinter",
+            "--collect-all", "tkinterdnd2",
+            "--hidden-import", "tkinterdnd2.TkinterDnD",
+            "main.py"
+          )
+          python -m PyInstaller @arguments
+          if ($LASTEXITCODE -ne 0) { throw "Protez.exe packaging failed" }
+          if (-not (Test-Path "dist/Protez.exe")) { throw "Protez.exe was not created" }
+          & "$PWD/dist/Protez.exe" --ui-import-check
+          if ($LASTEXITCODE -ne 0) { throw "Packaged GUI import check failed" }
+          & "$PWD/dist/Protez.exe" --health-check
+          if ($LASTEXITCODE -ne 0) { throw "Packaged runtime health check failed" }
+
+      - name: Create self-repair installer
+        shell: pwsh
+        run: |
+          python scripts/create_installer_manifest.py dist/Protez.exe dist/manifest.json
+          if ($LASTEXITCODE -ne 0) { throw "Could not create embedded payload manifest" }
+          $arguments = @(
+            "--noconfirm", "--clean", "--onefile", "--windowed", "--uac-admin",
+            "--name", "Protez-Setup",
+            "--distpath", "dist/setup",
+            "--workpath", "build/pyinstaller-setup",
+            "--specpath", "build/spec-setup",
+            "--add-data", "dist/Protez.exe;installer_payload",
+            "--add-data", "dist/manifest.json;installer_payload",
+            "setup_app.py"
+          )
+          python -m PyInstaller @arguments
+          if ($LASTEXITCODE -ne 0) { throw "Protez-Setup.exe packaging failed" }
+          if (-not (Test-Path "dist/setup/Protez-Setup.exe")) { throw "Protez-Setup.exe was not created" }
+
+      - name: Assemble distributable files
+        shell: pwsh
+        run: |
+          $releaseDir = Join-Path $PWD "dist/release"
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+          Copy-Item "dist/setup/Protez-Setup.exe" (Join-Path $releaseDir "Protez-Setup.exe")
+          Copy-Item "dist/Protez.exe" (Join-Path $releaseDir "Protez.exe")
+          $entries = foreach ($file in Get-ChildItem $releaseDir -File | Sort-Object Name) {
+            $hash = (Get-FileHash -Algorithm SHA256 $file.FullName).Hash.ToLowerInvariant()
+            "$hash  $($file.Name)"
+          }
+          $entries | Set-Content -Encoding utf8 (Join-Path $releaseDir "SHA256SUMS.txt")
+
+      - name: Upload Windows executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: Protez-Windows-x64
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 30

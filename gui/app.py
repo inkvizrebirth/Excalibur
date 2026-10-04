@@ -6,12 +6,13 @@ import platform
 import queue
 import subprocess
 import threading
-from pathlib import Path
 
 import customtkinter as ctk
 from tkinter import font as tkfont
 
 from core.pipeline import DeobfuscationPipeline, PipelineError
+from core.runtime_paths import FONTS_DIR, OUTPUT_DIR
+from core.version import VERSION
 from gui.controls import Controls
 from gui.input_panel import InputPanel
 from gui.log_panel import LogPanel, QueueLogHandler
@@ -22,10 +23,6 @@ try:
 except ImportError:
     DND_FILES = None
     TkinterDnD = None
-
-ROOT = Path(__file__).resolve().parents[1]
-OUTPUT_DIR = ROOT / "output"
-
 
 class ProtezApp(ctk.CTk):
     def __init__(self):
@@ -53,7 +50,7 @@ class ProtezApp(ctk.CTk):
         self._restore_chrome_after_map = False
         self.bind("<Map>", self._on_map, add="+")
 
-        self.logger.info("Protez v1.0 initialized")
+        self.logger.info("Protez %s initialized", VERSION)
         self.logger.info("Loading fonts...")
         self.display_family, self.body_family = self._load_fonts()
         self.title_font = ctk.CTkFont(
@@ -103,7 +100,7 @@ class ProtezApp(ctk.CTk):
         load_font = getattr(manager, "load_font", None)
 
         for filename, expected_family, role in font_specs:
-            font_path = ROOT / "assets" / "fonts" / filename
+            font_path = FONTS_DIR / filename
             if not font_path.is_file():
                 self.logger.warning("Font not found: %s; using a system monospace font", filename)
                 continue

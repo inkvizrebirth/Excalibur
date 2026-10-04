@@ -12,10 +12,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from core.sandbox import DEFAULT_TOOLS_DIR, Sandbox, SandboxResult
+from core.runtime_paths import LOGS_DIR, TOOLS_DIR
+from core.sandbox import Sandbox, SandboxResult
 
-ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_LOGS_DIR = ROOT / "logs"
+DEFAULT_LOGS_DIR = LOGS_DIR
+DEFAULT_TOOLS_DIR = TOOLS_DIR
 DEFAULT_TRACE_PATH = DEFAULT_LOGS_DIR / "trace.jsonl"
 TRACE_ROTATION_BYTES = 100 * 1024 * 1024
 TRACE_PROCESS_OUTPUT_BYTES = 256 * 1024 * 1024

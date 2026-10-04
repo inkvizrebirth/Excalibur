@@ -7,9 +7,12 @@ import json
 import logging
 import os
 import platform
+import queue
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import tarfile
 import tempfile
 import urllib.error
@@ -19,30 +22,32 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
-ROOT = Path(__file__).resolve().parent
+from core.runtime_paths import (
+    DATA_ROOT,
+    ENVLOG_PATH,
+    FONTS_DIR,
+    HOOKS_PATH,
+    IS_FROZEN,
+    LOGS_DIR,
+    OUTPUT_DIR,
+    PACKAGED_TOOLS_DIR,
+    RESOURCE_ROOT,
+    TOOLS_DIR,
+)
+from core.version import VERSION
+
+ROOT = RESOURCE_ROOT
 REQUIREMENTS_FILE = ROOT / "requirements.txt"
-MARKER_FILE = ROOT / ".installed"
-SCHEMA_VERSION = 2
+MARKER_FILE = DATA_ROOT / ".installed"
+SCHEMA_VERSION = 3
 MIN_PYTHON = (3, 10)
 NATIVE_HOST_LUAU_TAG = "0.740"
 MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024
 DOWNLOAD_TIMEOUT_SECONDS = 45
 
-DIRECTORIES = (
-    "assets/fonts",
-    "assets/icons",
-    "tools",
-    "output",
-    "logs",
-)
-
 DISTRIBUTIONS = (
     "customtkinter",
     "tkinterdnd2",
-    "lupa",
-    "requests",
-    "Pygments",
-    "Pillow",
 )
 
 FONT_URLS = {
@@ -81,11 +86,29 @@ class InstallationError(RuntimeError):
 
 
 def configure_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s] %(levelname)s: %(message)s",
+    logger = logging.getLogger("protez")
+    logger.setLevel(logging.DEBUG)
+    if logger.handlers:
+        return
+    formatter = logging.Formatter(
+        "[%(asctime)s] %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    if IS_FROZEN:
+        logger.propagate = False
+        try:
+            LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            handler = logging.FileHandler(LOGS_DIR / "startup.log", encoding="utf-8")
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+        except OSError:
+            pass
+        if sys.stderr is not None:
+            stream_handler = logging.StreamHandler(sys.stderr)
+            stream_handler.setFormatter(formatter)
+            logger.addHandler(stream_handler)
+        return
+    logging.basicConfig(level=logging.INFO, format=formatter._fmt, datefmt="%H:%M:%S")
 
 
 def check_python() -> None:
@@ -98,8 +121,11 @@ def check_python() -> None:
 
 
 def ensure_directories() -> None:
-    for relative_path in DIRECTORIES:
-        (ROOT / relative_path).mkdir(parents=True, exist_ok=True)
+    for path in (DATA_ROOT, LOGS_DIR, OUTPUT_DIR, TOOLS_DIR):
+        path.mkdir(parents=True, exist_ok=True)
+    if not IS_FROZEN:
+        for relative_path in ("assets/fonts", "assets/icons"):
+            (ROOT / relative_path).mkdir(parents=True, exist_ok=True)
 
 
 def _requirements_digest() -> str:
@@ -112,7 +138,7 @@ def _requirements_digest() -> str:
 
 def _native_host_binary_path() -> Path:
     suffix = ".exe" if platform.system().lower() == "windows" else ""
-    return ROOT / "tools" / f"protez-native-host{suffix}"
+    return TOOLS_DIR / f"protez-native-host{suffix}"
 
 
 def _native_host_source_digest() -> str:
@@ -144,17 +170,101 @@ def _marker_is_current() -> bool:
         marker = json.loads(MARKER_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
+    if not isinstance(marker, dict):
+        return False
 
     native_host_available = marker.get("native_host_available") is True
+    suffix = ".exe" if platform.system().lower() == "windows" else ""
+    cli_runtime_available = all(
+        (TOOLS_DIR / f"{name}{suffix}").is_file()
+        for name in ("luau", "luau-compile")
+    )
+    runtime_available = (
+        _native_host_binary_path().is_file()
+        if native_host_available
+        else cli_runtime_available
+    )
     return (
         marker.get("schema") == SCHEMA_VERSION
+        and marker.get("app_version") == VERSION
         and marker.get("requirements_sha256") == _requirements_digest()
         and marker.get("native_host_source_sha256") == _native_host_source_digest()
         and isinstance(marker.get("native_host_available"), bool)
-        and (not native_host_available or _native_host_binary_path().is_file())
+        and runtime_available
         and marker.get("dependencies_installed") is True
         and _dependencies_available()
     )
+
+
+def _run_logged(
+    command: list[str],
+    *,
+    label: str,
+    cwd: Path,
+    timeout_seconds: float,
+) -> tuple[int, str]:
+    LOGGER.info("Starting %s", label)
+    LOGGER.info("Command: %s", subprocess.list2cmdline(command))
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            close_fds=True,
+            creationflags=creationflags,
+        )
+    except OSError as exc:
+        raise InstallationError(f"Could not start {label}: {exc}") from exc
+    if process.stdout is None:
+        process.kill()
+        raise InstallationError(f"Could not capture output from {label}")
+
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def read_output() -> None:
+        try:
+            for line in process.stdout:
+                lines.put(line.rstrip("\r\n"))
+        finally:
+            lines.put(None)
+
+    reader = threading.Thread(target=read_output, name="protez-installer-output", daemon=True)
+    reader.start()
+    tail: list[str] = []
+    reader_finished = False
+    deadline = time.monotonic() + timeout_seconds
+    while not reader_finished or process.poll() is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            process.wait()
+            reader.join(timeout=1.0)
+            raise InstallationError(f"{label} exceeded the {timeout_seconds:.0f} second timeout")
+        try:
+            line = lines.get(timeout=min(0.15, remaining))
+        except queue.Empty:
+            continue
+        if line is None:
+            reader_finished = True
+            continue
+        if line:
+            clipped_line = line[:2000]
+            LOGGER.info("%s", clipped_line)
+            tail.append(clipped_line)
+            if len(tail) > 32:
+                del tail[:-32]
+
+    return process.wait(), "\n".join(tail)
 
 
 def install_dependencies() -> None:
@@ -164,32 +274,45 @@ def install_dependencies() -> None:
         "pip",
         "install",
         "--disable-pip-version-check",
+        "--retries",
+        "2",
+        "--timeout",
+        "20",
         "-r",
         str(REQUIREMENTS_FILE),
     ]
     LOGGER.info("Installing Python dependencies from requirements.txt")
-    try:
-        result = subprocess.run(
+    last_code = 1
+    last_output = ""
+    for attempt in (1, 2):
+        last_code, last_output = _run_logged(
             command,
+            label=f"pip dependency install (attempt {attempt}/2)",
             cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
+            timeout_seconds=900,
         )
-    except OSError as exc:
-        raise InstallationError(f"Could not start pip: {exc}") from exc
+        if last_code == 0:
+            LOGGER.info("Python dependencies installed")
+            return
+        if attempt == 1:
+            LOGGER.warning("pip exited with code %s; repairing pip and retrying once", last_code)
+            repair_code, repair_output = _run_logged(
+                [sys.executable, "-m", "ensurepip", "--upgrade"],
+                label="pip self-repair",
+                cwd=ROOT,
+                timeout_seconds=180,
+            )
+            if repair_code != 0:
+                LOGGER.warning("ensurepip returned %s; retrying dependency installation", repair_code)
+                if repair_output:
+                    LOGGER.warning("ensurepip output: %s", repair_output)
 
-    if result.returncode != 0:
-        output = (result.stdout or "").strip()
-        detail = f"\n{output}" if output else ""
-        raise InstallationError(
-            f"Dependency installation failed (exit code {result.returncode}). "
-            f"Run '{sys.executable} -m pip install -r requirements.txt' manually."
-            f"{detail}"
-        )
-
-    LOGGER.info("Python dependencies installed")
+    detail = f"\nRecent output:\n{last_output}" if last_output else ""
+    raise InstallationError(
+        f"Dependency installation failed twice (last exit code {last_code}). "
+        "Check the connection and Python permissions, then choose Repair again."
+        f"{detail}"
+    )
 
 
 def _check_download_url(url: str) -> None:
@@ -249,7 +372,7 @@ def _download_file(
 
 
 def download_fonts() -> tuple[list[str], list[str]]:
-    fonts_dir = ROOT / "assets" / "fonts"
+    fonts_dir = FONTS_DIR
     available: list[str] = []
     missing: list[str] = []
 
@@ -405,7 +528,7 @@ def _expected_tool_names() -> set[str]:
 
 
 def download_luau_tools() -> tuple[list[str], list[str]]:
-    tools_dir = ROOT / "tools"
+    tools_dir = TOOLS_DIR
     expected = _expected_tool_names()
     available = {name for name in expected if (tools_dir / name).is_file()}
     if available == expected:
@@ -457,7 +580,7 @@ def download_luau_tools() -> tuple[list[str], list[str]]:
 
 
 def build_native_host() -> bool:
-    tools_dir = ROOT / "tools"
+    tools_dir = TOOLS_DIR
     destination = _native_host_binary_path()
     cmake = shutil.which("cmake")
     if cmake is None:
@@ -494,26 +617,21 @@ def build_native_host() -> bool:
 
     for label, command in (("configure", configure), ("build", build)):
         try:
-            result = subprocess.run(
+            return_code, output = _run_logged(
                 command,
+                label=f"native host CMake {label}",
                 cwd=ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=False,
-                timeout=1200,
+                timeout_seconds=1200,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except InstallationError as exc:
             LOGGER.warning("Native host %s did not complete: %s", label, exc)
             return destination.is_file()
-        if result.returncode != 0:
-            output = (result.stdout or "").strip()
-            detail = "\n".join(output.splitlines()[-24:])
+        if return_code != 0:
             LOGGER.warning(
                 "Native host %s failed (exit code %s); retaining CLI fallback%s",
                 label,
-                result.returncode,
-                f":\n{detail}" if detail else "",
+                return_code,
+                f":\n{output}" if output else "",
             )
             return destination.is_file()
 
@@ -549,6 +667,7 @@ def _write_marker(
 ) -> None:
     marker = {
         "schema": SCHEMA_VERSION,
+        "app_version": VERSION,
         "python_version": platform.python_version(),
         "requirements_sha256": _requirements_digest(),
         "dependencies_installed": True,
@@ -567,8 +686,81 @@ def _write_marker(
     os.replace(temporary_marker, MARKER_FILE)
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_frozen_runtime() -> None:
+    if not IS_FROZEN:
+        return
+    ensure_directories()
+    for required in (ENVLOG_PATH, HOOKS_PATH):
+        if not required.is_file():
+            raise InstallationError(f"Bundled runtime resource is missing: {required.name}")
+
+    packaged = PACKAGED_TOOLS_DIR / _native_host_binary_path().name
+    installed = _native_host_binary_path()
+    if packaged.is_file():
+        try:
+            needs_repair = (
+                not installed.is_file()
+                or installed.stat().st_size != packaged.stat().st_size
+                or _sha256_file(installed) != _sha256_file(packaged)
+            )
+        except OSError:
+            needs_repair = True
+        if needs_repair:
+            LOGGER.warning("Repairing missing or damaged native runtime from the built-in package")
+            temporary = installed.with_name(installed.name + ".repair")
+            try:
+                shutil.copy2(packaged, temporary)
+                if platform.system().lower() != "windows":
+                    temporary.chmod(0o755)
+                os.replace(temporary, installed)
+            except OSError as exc:
+                temporary.unlink(missing_ok=True)
+                raise InstallationError(f"Could not repair the native runtime: {exc}") from exc
+    elif not installed.is_file():
+        raise InstallationError("The bundled Luau runtime is missing and cannot be repaired offline")
+
+    command = [str(installed), "--version"]
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        result = subprocess.run(
+            command,
+            cwd=DATA_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+            creationflags=creationflags,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise InstallationError(f"Could not validate the bundled Luau runtime: {exc}") from exc
+    output = (result.stdout or "").strip()
+    if result.returncode != 0 or "Protez native Luau host" not in output:
+        raise InstallationError(
+            f"The bundled Luau runtime failed its health check (exit {result.returncode}): "
+            f"{output or 'no diagnostic output'}"
+        )
+    LOGGER.info("Runtime check passed: %s", output)
+    LOGGER.info("No Python, CMake, or Luau CLI installation is required for this build")
+
+
 def ensure_installed(*, force: bool = False) -> None:
     configure_logging()
+    if IS_FROZEN:
+        LOGGER.info("Checking bundled Protez runtime")
+        verify_frozen_runtime()
+        return
+
     check_python()
     ensure_directories()
 
@@ -580,6 +772,15 @@ def ensure_installed(*, force: bool = False) -> None:
     available_fonts, missing_fonts = download_fonts()
     available_tools, missing_tools = download_luau_tools()
     native_host_available = build_native_host()
+    if not native_host_available:
+        suffix = ".exe" if platform.system().lower() == "windows" else ""
+        required_tools = {f"luau{suffix}", f"luau-compile{suffix}"}
+        if not required_tools.issubset(available_tools):
+            missing_runtime = ", ".join(sorted(required_tools - set(available_tools)))
+            raise InstallationError(
+                "No usable Luau runtime/compiler is available. "
+                f"Missing: {missing_runtime}. Choose Repair again or check network access."
+            )
     _write_marker(
         available_fonts,
         missing_fonts,

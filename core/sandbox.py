@@ -16,11 +16,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Callable
 
-ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_TOOLS_DIR = ROOT / "tools"
-DEFAULT_LOGS_DIR = ROOT / "logs"
-ENVLOG_PATH = ROOT / "sandbox" / "envlog.luau"
-HOOKS_PATH = ROOT / "sandbox" / "hooks.luau"
+from core.runtime_paths import ENVLOG_PATH, HOOKS_PATH, LOGS_DIR, TOOLS_DIR
+
+DEFAULT_TOOLS_DIR = TOOLS_DIR
+DEFAULT_LOGS_DIR = LOGS_DIR
 CAPTURE_PATH = DEFAULT_LOGS_DIR / "captured_payload.luau"
 
 
@@ -44,6 +43,7 @@ class SandboxResult:
     duration_seconds: float
     captures: tuple[CapturedPayload, ...]
     captured_path: Path | None
+    captured_paths: tuple[Path, ...]
     run_log_path: Path
     trace_token: str | None
 
@@ -151,8 +151,11 @@ class _CaptureParser:
         self._current_file: BinaryIO | None = None
         self._work_dir: Path | None = None
         self._latest_path: Path | None = None
+        self._paths: list[Path] = []
 
-    def parse(self, log_path: Path) -> tuple[tuple[CapturedPayload, ...], Path | None]:
+    def parse(
+        self, log_path: Path
+    ) -> tuple[tuple[CapturedPayload, ...], Path | None, tuple[Path, ...]]:
         with tempfile.TemporaryDirectory(
             prefix="protez-captures-", dir=self._capture_path.parent
         ) as temp_dir:
@@ -176,9 +179,9 @@ class _CaptureParser:
             latest_temp = self._capture_path.with_name(self._capture_path.name + ".tmp")
             shutil.copyfile(self._latest_path, latest_temp)
             os.replace(latest_temp, self._capture_path)
-            return tuple(self._captures), self._capture_path
+            return tuple(self._captures), self._capture_path, tuple(self._paths)
         self._capture_path.unlink(missing_ok=True)
-        return (), None
+        return (), None, ()
 
     def _consume(self, line: bytes) -> None:
         if line.startswith(self._prefix):
@@ -261,6 +264,7 @@ class _CaptureParser:
         destination = self._capture_path.with_name(f"captured_payload_{index:03d}.luau")
         os.replace(self._current_path, destination)
         self._latest_path = destination
+        self._paths.append(destination)
         self._captures.append(
             CapturedPayload(
                 index=index,
@@ -524,7 +528,7 @@ class Sandbox:
                 logger=self.logger,
                 max_payload_bytes=self.max_output_bytes,
             )
-            captures, captured_path = parser.parse(run_log_path)
+            captures, captured_path, captured_paths = parser.parse(run_log_path)
         except OSError as exc:
             raise SandboxError(f"Could not parse captured payload output: {exc}") from exc
 
@@ -562,6 +566,7 @@ class Sandbox:
             duration_seconds=duration,
             captures=captures,
             captured_path=captured_path,
+            captured_paths=captured_paths,
             run_log_path=run_log_path,
             trace_token=trace_token,
         )

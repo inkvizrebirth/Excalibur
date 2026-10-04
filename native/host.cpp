@@ -510,7 +510,7 @@ void printUsage(const char* executable)
 {
     std::fprintf(
         stderr,
-        "Usage: %s --source <runner.luau> [--trace-token <32-hex>] [--max-trace-events <count>]\n",
+        "Usage: %s --source <runner.luau> [--compile-only] [--trace-token <32-hex>] [--max-trace-events <count>]\n",
         executable);
 }
 } // namespace
@@ -522,6 +522,7 @@ int main(int argc, char** argv)
 
     std::string sourcePath;
     std::string traceToken;
+    bool compileOnly = false;
     uint64_t maxTraceEvents = 25000;
 
     for (int index = 1; index < argc; ++index)
@@ -529,7 +530,7 @@ int main(int argc, char** argv)
         const std::string argument = argv[index];
         if (argument == "--version")
         {
-            std::puts("Protez native Luau host 0.1 (Luau 0.740)");
+            std::puts("Protez native Luau host 0.2 (Luau 0.740)");
             return 0;
         }
         if ((argument == "--source" || argument == "--trace-token" ||
@@ -538,7 +539,11 @@ int main(int argc, char** argv)
             printUsage(argv[0]);
             return 64;
         }
-        if (argument == "--source")
+        if (argument == "--compile-only")
+        {
+            compileOnly = true;
+        }
+        else if (argument == "--source")
         {
             sourcePath = argv[++index];
         }
@@ -650,6 +655,11 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "Luau load failed: %s\n", message ? message : "unknown error");
         lua_close(state);
         return 65;
+    }
+    if (compileOnly)
+    {
+        lua_close(state);
+        return 0;
     }
 
     const int status = lua_pcall(state, 0, 0, 0);
