@@ -100,13 +100,35 @@ jobs:
             "--hidden-import", "tkinterdnd2.TkinterDnD",
             "main.py"
           )
-          python -m PyInstaller @arguments
-          if ($LASTEXITCODE -ne 0) { throw "Protez.exe packaging failed" }
-          if (-not (Test-Path "dist/Protez.exe")) { throw "Protez.exe was not created" }
-          & "$PWD/dist/Protez.exe" --ui-import-check
-          if ($LASTEXITCODE -ne 0) { throw "Packaged GUI import check failed" }
-          & "$PWD/dist/Protez.exe" --health-check
-          if ($LASTEXITCODE -ne 0) { throw "Packaged runtime health check failed" }
+          $packageOutput = & python -m PyInstaller @arguments 2>&1
+          $packageExit = $LASTEXITCODE
+          $packageOutput | ForEach-Object { Write-Host $_ }
+          if ($packageExit -ne 0) {
+            $diagnostic = ($packageOutput | Select-Object -Last 24 | ForEach-Object { $_.ToString() }) -join " | "
+            Write-Output "::error title=PyInstaller app build failed::$diagnostic"
+            throw "Protez.exe packaging failed with exit code $packageExit"
+          }
+          if (-not (Test-Path "dist/Protez.exe")) {
+            Write-Output "::error title=Protez.exe missing::PyInstaller completed but dist/Protez.exe was not created"
+            throw "Protez.exe was not created"
+          }
+          $importOutput = & "$PWD/dist/Protez.exe" --ui-import-check 2>&1
+          $importExit = $LASTEXITCODE
+          $importOutput | ForEach-Object { Write-Host $_ }
+          if ($importExit -ne 0) {
+            $diagnostic = ($importOutput | Select-Object -Last 24 | ForEach-Object { $_.ToString() }) -join " | "
+            Write-Output "::error title=GUI import check failed::exit $importExit; $diagnostic"
+            throw "Packaged GUI import check failed with exit code $importExit"
+          }
+          $healthOutput = & "$PWD/dist/Protez.exe" --health-check 2>&1
+          $healthExit = $LASTEXITCODE
+          $healthOutput | ForEach-Object { Write-Host $_ }
+          if ($healthExit -ne 0) {
+            $logPath = Join-Path $env:LOCALAPPDATA "Protez/logs/startup.log"
+            $diagnostic = if (Test-Path $logPath) { (Get-Content $logPath -Tail 24) -join " | " } else { "startup.log is missing" }
+            Write-Output "::error title=Packaged runtime health check failed::exit $healthExit; $diagnostic"
+            throw "Packaged runtime health check failed with exit code $healthExit"
+          }
 
       - name: Create self-repair installer
         shell: pwsh
