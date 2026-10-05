@@ -5,6 +5,8 @@ on:
     branches:
       - main
       - "arena/**"
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -12,6 +14,8 @@ permissions:
 
 jobs:
   build-windows-x64:
+    permissions:
+      contents: write
     runs-on: windows-2022
     timeout-minutes: 50
     steps:
@@ -181,3 +185,12 @@ jobs:
           path: dist/release/*
           if-no-files-found: error
           retention-days: 30
+
+      - name: Attach standalone application to GitHub Release
+        if: github.event_name == 'release' && github.event.action == 'published'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$env:GITHUB_REF_NAME" "dist/Protez.exe" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Could not upload Protez.exe to the GitHub Release" }
