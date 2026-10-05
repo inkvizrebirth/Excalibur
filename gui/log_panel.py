@@ -24,12 +24,12 @@ class QueueLogHandler(logging.Handler):
 
 
 class LogPanel(ctk.CTkFrame):
-    MAX_LINES = 4000
+    MAX_LINES = 1000
 
     def __init__(self, master, records: queue.Queue[logging.LogRecord], font):
         super().__init__(
             master,
-            corner_radius=0,
+            corner_radius=6,
             border_width=1,
             border_color=BORDER,
             fg_color=PANEL,
@@ -38,19 +38,20 @@ class LogPanel(ctk.CTkFrame):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
-        header = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=30)
-        header.grid(row=0, column=0, sticky="ew", padx=10, pady=(4, 2))
+        header = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=23)
+        header.grid(row=0, column=0, sticky="ew", padx=9, pady=(2, 0))
+        header.grid_propagate(False)
         header.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             header,
-            text="LOGS",
+            text="ACTIVITY",
             text_color=NEON,
-            font=font,
+            font=ctk.CTkFont(family=font.cget("family"), size=13),
             anchor="w",
         ).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
             header,
-            text="LIVE / LOCAL",
+            text="LOCAL",
             text_color=MUTED,
             font=ctk.CTkFont(family=font.cget("family"), size=12),
             anchor="e",
@@ -58,24 +59,27 @@ class LogPanel(ctk.CTkFrame):
 
         self.textbox = ctk.CTkTextbox(
             self,
-            corner_radius=0,
+            width=300,
+            height=50,
+            corner_radius=4,
             border_width=0,
             fg_color=BG,
             text_color=NEON,
             font=font,
-            wrap="none",
+            wrap="word",
             activate_scrollbars=True,
         )
-        self.textbox.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        self.textbox.grid(row=1, column=0, sticky="nsew", padx=6, pady=(1, 6))
         self._text = self.textbox._textbox
         self._text.tag_configure("INFO", foreground=NEON)
         self._text.tag_configure("WARNING", foreground=WARN)
         self._text.tag_configure("ERROR", foreground=ERROR)
         self._text.tag_configure("DEBUG", foreground=MUTED)
         self.textbox.configure(state="disabled")
-        self.after(50, self._drain_records)
+        self.after(60, self._drain_records)
 
-    def _tag_for(self, levelno: int) -> str:
+    @staticmethod
+    def _tag_for(levelno: int) -> str:
         if levelno >= logging.ERROR:
             return "ERROR"
         if levelno >= logging.WARNING:
@@ -86,6 +90,7 @@ class LogPanel(ctk.CTkFrame):
 
     def _render_record(self, record: logging.LogRecord) -> None:
         timestamp = datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
+        level = record.levelname.upper()
         message = record.getMessage()
         if record.exc_info:
             message = f"{message}\n{logging.Formatter().formatException(record.exc_info)}"
@@ -93,7 +98,7 @@ class LogPanel(ctk.CTkFrame):
 
         self.textbox.configure(state="normal")
         for line in message.splitlines() or [""]:
-            self._text.insert("end", f"[{timestamp}] {line}\n", tag)
+            self._text.insert("end", f"[{timestamp}] {level:<7} {line}\n", tag)
         line_count = int(self._text.index("end-1c").split(".", maxsplit=1)[0])
         if line_count > self.MAX_LINES + 1:
             self._text.delete("1.0", f"{line_count - self.MAX_LINES}.0")
@@ -101,7 +106,7 @@ class LogPanel(ctk.CTkFrame):
         self.textbox.configure(state="disabled")
 
     def _drain_records(self) -> None:
-        for _ in range(500):
+        for _ in range(300):
             try:
                 record = self._records.get_nowait()
             except queue.Empty:
@@ -112,16 +117,6 @@ class LogPanel(ctk.CTkFrame):
                 # A malformed record must not stop future UI updates.
                 continue
         try:
-            self.after(50, self._drain_records)
+            self.after(60, self._drain_records)
         except Exception:
             pass
-
-    def clear(self) -> None:
-        while True:
-            try:
-                self._records.get_nowait()
-            except queue.Empty:
-                break
-        self.textbox.configure(state="normal")
-        self.textbox.delete("1.0", "end")
-        self.textbox.configure(state="disabled")

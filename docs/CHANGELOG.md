@@ -7,6 +7,8 @@
 - Added a timestamped startup/repair window and streamed prerequisite/build output to the UI through a logging queue.
 - Added a Windows x64 build workflow for a self-contained `Protez.exe` and elevated, user-selectable `Protez-Setup.exe`. Setup verifies the embedded app checksum, supports repair/reinstall, and creates shortcuts; the installed app runs without elevation.
 - Added Python-only unit tests for the static decoder and a packaged runtime health check.
+- Refined the desktop UI into a centered, compact `PROTEZ` window; removed secondary output/copy controls, fixed Windows pixel-font enumeration, and made successful results open automatically.
+- Added safe text-only handling for direct code URLs and simple linked `loadstring`/`HttpGet` loaders, with public-host checks, redirect validation, byte/time limits, and URL-resolution regression tests.
 
 ## 2026-10-04
 

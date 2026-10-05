@@ -2,22 +2,22 @@ from __future__ import annotations
 
 import customtkinter as ctk
 
-# Monochrome terminal palette; legacy names are kept for existing widgets.
-BG = "#000000"
-PANEL = "#0a0a0a"
-INPUT_BG = "#030303"
-BORDER = "#454545"
+# Quiet monochrome surfaces keep the compact UI focused on the source editor.
+BG = "#080808"
+PANEL = "#101010"
+INPUT_BG = "#050505"
+BORDER = "#292929"
 NEON = "#f5f5f5"
 ACID = "#ffffff"
-TEXT = "#e8e8e8"
-MUTED = "#858585"
-WARN = "#bcbcbc"
+TEXT = "#ededed"
+MUTED = "#888888"
+WARN = "#c6c6c6"
 ERROR = "#ffffff"
-RED_BG = "#171717"
+RED_BG = "#181818"
 
 
 class TerminalButton(ctk.CTkButton):
-    """Square, bordered button with an instant foreground/background inversion."""
+    """Monochrome button with a crisp inverse hover state."""
 
     def __init__(
         self,
@@ -36,7 +36,7 @@ class TerminalButton(ctk.CTkButton):
         self._enabled = True
         super().__init__(
             master,
-            corner_radius=0,
+            corner_radius=5,
             border_width=1,
             border_color=accent,
             fg_color=accent if active else base_bg,

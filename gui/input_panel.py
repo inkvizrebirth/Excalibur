@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from tkinter import filedialog
 
@@ -10,13 +11,14 @@ from gui.theme import BG, BORDER, INPUT_BG, MUTED, NEON, PANEL, TEXT, TerminalBu
 
 LOGGER = logging.getLogger("protez")
 ALLOWED_EXTENSIONS = {".lua", ".luau", ".txt"}
+_DIRECT_URL = re.compile(r"(?i)^\s*<?https?://\S+>?\s*$")
 
 
 class InputPanel(ctk.CTkFrame):
     def __init__(self, master, *, title_font, body_font):
         super().__init__(
             master,
-            corner_radius=0,
+            corner_radius=7,
             border_width=1,
             border_color=BORDER,
             fg_color=PANEL,
@@ -31,12 +33,13 @@ class InputPanel(ctk.CTkFrame):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
-        header = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=38)
-        header.grid(row=0, column=0, sticky="ew", padx=10, pady=(4, 2))
+        header = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=32)
+        header.grid(row=0, column=0, sticky="ew", padx=11, pady=(5, 3))
+        header.grid_propagate(False)
         header.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             header,
-            text="INPUT",
+            text="SOURCE",
             text_color=NEON,
             font=title_font,
             anchor="w",
@@ -44,15 +47,16 @@ class InputPanel(ctk.CTkFrame):
 
         tabs = ctk.CTkFrame(header, fg_color=PANEL, corner_radius=0)
         tabs.grid(row=0, column=1, sticky="e")
+        tab_font = ctk.CTkFont(family=title_font.cget("family"), size=7)
         self.paste_tab = TerminalButton(
             tabs,
             text="PASTE",
             command=lambda: self._select_tab("paste"),
             accent=NEON,
             base_bg=BG,
-            width=88,
-            height=28,
-            font=title_font,
+            width=64,
+            height=23,
+            font=tab_font,
         )
         self.paste_tab.grid(row=0, column=0, padx=(0, 4))
         self.file_tab = TerminalButton(
@@ -61,22 +65,22 @@ class InputPanel(ctk.CTkFrame):
             command=lambda: self._select_tab("file"),
             accent=NEON,
             base_bg=BG,
-            width=76,
-            height=28,
-            font=title_font,
+            width=54,
+            height=23,
+            font=tab_font,
         )
         self.file_tab.grid(row=0, column=1)
         self.paste_tab.set_active(True)
 
         self.content = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
-        self.content.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 4))
+        self.content.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 3))
         self.content.grid_columnconfigure(0, weight=1)
         self.content.grid_rowconfigure(0, weight=1)
 
         self.paste_view = ctk.CTkFrame(
             self.content,
             fg_color=INPUT_BG,
-            corner_radius=0,
+            corner_radius=5,
             border_width=1,
             border_color=BORDER,
         )
@@ -85,7 +89,7 @@ class InputPanel(ctk.CTkFrame):
         self.paste_view.grid_rowconfigure(0, weight=1)
         self.textbox = ctk.CTkTextbox(
             self.paste_view,
-            corner_radius=0,
+            corner_radius=4,
             border_width=0,
             fg_color=INPUT_BG,
             text_color=TEXT,
@@ -94,7 +98,7 @@ class InputPanel(ctk.CTkFrame):
             activate_scrollbars=True,
             undo=True,
         )
-        self.textbox.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        self.textbox.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
         self.textbox.bind("<KeyRelease>", self._update_status)
         self.textbox.bind("<<Paste>>", self._update_status_after_idle)
         self.textbox.bind("<<Cut>>", self._update_status_after_idle)
@@ -102,7 +106,7 @@ class InputPanel(ctk.CTkFrame):
         self.file_view = ctk.CTkFrame(
             self.content,
             fg_color=INPUT_BG,
-            corner_radius=0,
+            corner_radius=5,
             border_width=1,
             border_color=BORDER,
         )
@@ -112,42 +116,42 @@ class InputPanel(ctk.CTkFrame):
         self.drop_zone = ctk.CTkFrame(
             self.file_view,
             fg_color=INPUT_BG,
-            corner_radius=0,
+            corner_radius=5,
             border_width=1,
             border_color=NEON,
         )
-        self.drop_zone.grid(row=0, column=0, sticky="nsew", padx=14, pady=12)
+        self.drop_zone.grid(row=0, column=0, sticky="nsew", padx=12, pady=10)
         self.drop_zone.grid_columnconfigure(0, weight=1)
         self.drop_zone.grid_rowconfigure(0, weight=1)
         self.drop_label = ctk.CTkLabel(
             self.drop_zone,
-            text="DROP A LUA / LUAU / TXT FILE HERE\nOR USE BROWSE",
+            text="DROP A SCRIPT HERE\nOR BROWSE FOR A FILE",
             text_color=MUTED,
             font=body_font,
             justify="center",
         )
-        self.drop_label.grid(row=0, column=0, sticky="nsew", padx=12, pady=(10, 4))
+        self.drop_label.grid(row=0, column=0, sticky="nsew", padx=10, pady=(8, 3))
         self.browse_button = TerminalButton(
             self.drop_zone,
             text="BROWSE",
             command=self._browse_file,
             accent=NEON,
             base_bg=BG,
-            width=148,
-            height=36,
-            font=title_font,
+            width=104,
+            height=30,
+            font=tab_font,
         )
-        self.browse_button.grid(row=1, column=0, pady=(2, 12))
+        self.browse_button.grid(row=1, column=0, pady=(2, 9))
         self.file_view.grid_remove()
 
         self.status = ctk.CTkLabel(
             self,
-            text="Input: 0 chars | Type: waiting | File: none",
+            text="READY · PASTE SOURCE OR URL",
             text_color=MUTED,
-            font=ctk.CTkFont(family=body_font.cget("family"), size=15),
+            font=ctk.CTkFont(family=body_font.cget("family"), size=14),
             anchor="w",
         )
-        self.status.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 5))
+        self.status.grid(row=2, column=0, sticky="ew", padx=11, pady=(0, 4))
 
     @property
     def file_path(self) -> Path | None:
@@ -161,7 +165,7 @@ class InputPanel(ctk.CTkFrame):
             target.drop_target_register(file_type)
             target.dnd_bind("<<Drop>>", self._handle_drop)
             self._drop_enabled = True
-            self.drop_label.configure(text="DROP A LUA / LUAU / TXT FILE HERE\nOR USE BROWSE")
+            self.drop_label.configure(text="DROP A SCRIPT HERE\nOR BROWSE FOR A FILE")
             return True
         except Exception as exc:
             LOGGER.warning("Could not enable file drag-and-drop: %s", exc)
@@ -196,7 +200,7 @@ class InputPanel(ctk.CTkFrame):
         try:
             selected = filedialog.askopenfilename(
                 parent=self.winfo_toplevel(),
-                title="Select Lua source",
+                title="Select a source file",
                 filetypes=(
                     ("Lua / Luau scripts", "*.lua *.luau"),
                     ("Text files", "*.txt"),
@@ -232,9 +236,7 @@ class InputPanel(ctk.CTkFrame):
 
         self._file_path = path
         self._file_content = content
-        self.drop_label.configure(
-            text=f"SELECTED: {path.name}\n{len(content):,} CHARACTERS"
-        )
+        self.drop_label.configure(text=f"{path.name}\n{len(content):,} CHARACTERS")
         self._select_tab("file")
         LOGGER.info("Loaded input file: %s (%s characters)", path.name, len(content))
 
@@ -243,19 +245,12 @@ class InputPanel(ctk.CTkFrame):
 
     def _update_status(self, _event=None) -> None:
         source = self.get_script()
-        filename = self._file_path.name if self.file_path else "none"
-        self.status.configure(
-            text=(
-                f"Input: {len(source):,} chars | Type: {self._classify(source)} "
-                f"| File: {filename}"
-            )
-        )
-
-    @staticmethod
-    def _classify(source: str) -> str:
         if not source.strip():
-            return "waiting"
-        lowered = source[:200_000].lower()
-        if "loadstring" in lowered or "httpget" in lowered:
-            return "loadstring-wrapper"
-        return "unknown"
+            kind = "READY"
+        elif _DIRECT_URL.match(source):
+            kind = "CODE LINK"
+        elif "loadstring" in source.lower() or "httpget" in source.lower():
+            kind = "LOADER"
+        else:
+            kind = "SOURCE"
+        self.status.configure(text=f"{kind} · {len(source):,} CHARACTERS")
