@@ -23,6 +23,10 @@ target_compile_features(protez-native-host PRIVATE cxx_std_17)
 target_link_libraries(protez-native-host PRIVATE Luau.Compiler Luau.VM Luau.VM.Internals)
 
 if(MSVC)
+    set_property(
+        TARGET protez-native-host
+        PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
     target_compile_options(protez-native-host PRIVATE /W4 /permissive-)
 else()
     target_compile_options(protez-native-host PRIVATE -Wall -Wextra -Wpedantic)
