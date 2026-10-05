@@ -86,19 +86,25 @@ jobs:
         shell: pwsh
         run: |
           $native = Join-Path $PWD "build/native/host-bin/protez-native-host.exe"
+          $sandboxDir = (Resolve-Path "sandbox").Path
+          $fontDir = (Resolve-Path "assets/fonts").Path
+          $appDist = Join-Path $PWD "dist"
+          $appWork = Join-Path $PWD "build/pyinstaller-app"
+          $appSpec = Join-Path $PWD "build/spec-app"
+          $entryPoint = Join-Path $PWD "main.py"
           $arguments = @(
             "--noconfirm", "--clean", "--onefile", "--windowed",
             "--name", "Protez",
-            "--distpath", "dist",
-            "--workpath", "build/pyinstaller-app",
-            "--specpath", "build/spec-app",
-            "--add-data", "sandbox;sandbox",
+            "--distpath", $appDist,
+            "--workpath", $appWork,
+            "--specpath", $appSpec,
+            "--add-data", "$sandboxDir;sandbox",
             "--add-data", "$native;tools",
-            "--add-data", "assets/fonts;assets/fonts",
+            "--add-data", "$fontDir;assets/fonts",
             "--collect-all", "customtkinter",
             "--collect-all", "tkinterdnd2",
             "--hidden-import", "tkinterdnd2.TkinterDnD",
-            "main.py"
+            $entryPoint
           )
           $packageOutput = & python -m PyInstaller @arguments 2>&1
           $packageExit = $LASTEXITCODE
@@ -135,15 +141,21 @@ jobs:
         run: |
           python scripts/create_installer_manifest.py dist/Protez.exe dist/manifest.json
           if ($LASTEXITCODE -ne 0) { throw "Could not create embedded payload manifest" }
+          $appExecutable = (Resolve-Path "dist/Protez.exe").Path
+          $payloadManifest = (Resolve-Path "dist/manifest.json").Path
+          $setupDist = Join-Path $PWD "dist/setup"
+          $setupWork = Join-Path $PWD "build/pyinstaller-setup"
+          $setupSpec = Join-Path $PWD "build/spec-setup"
+          $entryPoint = Join-Path $PWD "setup_app.py"
           $arguments = @(
             "--noconfirm", "--clean", "--onefile", "--windowed", "--uac-admin",
             "--name", "Protez-Setup",
-            "--distpath", "dist/setup",
-            "--workpath", "build/pyinstaller-setup",
-            "--specpath", "build/spec-setup",
-            "--add-data", "dist/Protez.exe;installer_payload",
-            "--add-data", "dist/manifest.json;installer_payload",
-            "setup_app.py"
+            "--distpath", $setupDist,
+            "--workpath", $setupWork,
+            "--specpath", $setupSpec,
+            "--add-data", "$appExecutable;installer_payload",
+            "--add-data", "$payloadManifest;installer_payload",
+            $entryPoint
           )
           python -m PyInstaller @arguments
           if ($LASTEXITCODE -ne 0) { throw "Protez-Setup.exe packaging failed" }
