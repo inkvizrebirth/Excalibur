@@ -146,7 +146,7 @@ class ProtezSetup(tk.Tk):
         ).pack(anchor="w")
         ttk.Label(
             options,
-            text="The installer runs elevated; the installed app is launched normally, not as Administrator.",
+            text="Protez requests Administrator access when launched; Windows may show a confirmation prompt.",
             style="Muted.TLabel",
             wraplength=750,
         ).pack(anchor="w", pady=(6, 0))
@@ -412,13 +412,13 @@ class ProtezSetup(tk.Tk):
                 self.progress.configure(mode="determinate", value=100)
                 self.status.configure(text="Installation complete")
                 self.result_hint.configure(
-                    text=f"Installed to {payload}. Close this elevated window and launch Protez normally."
+                    text=f"Installed to {payload}. Close setup; Protez will request Administrator approval when started."
                 )
                 self.install_button.configure(text="REPAIR / REINSTALL", state="normal")
                 self.browse_button.configure(state="normal")
                 self.path_entry.configure(state="normal")
                 self.close_button.configure(state="normal")
-                self.logger.info("Setup complete. The app was not launched with elevated permissions.")
+                self.logger.info("Setup complete. Protez requests Administrator approval when launched.")
             else:
                 self.busy = False
                 self.progress.stop()

@@ -17,17 +17,17 @@ class Controls(ctk.CTkFrame):
         self._logger = logging.getLogger("protez")
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_columnconfigure(1, minsize=144)
+        self.grid_columnconfigure(1, minsize=118)
         self.grid_rowconfigure(0, weight=1)
 
         activity = ctk.CTkFrame(
             self,
             fg_color=PANEL,
-            corner_radius=12,
+            corner_radius=9,
             border_width=1,
             border_color=BORDER,
         )
-        activity.grid(row=0, column=0, sticky="nsew", padx=(0, 9))
+        activity.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
         activity.grid_columnconfigure(0, weight=1)
         activity.grid_rowconfigure(1, weight=1)
 
@@ -35,33 +35,33 @@ class Controls(ctk.CTkFrame):
             activity,
             text="READY",
             text_color=MUTED,
-            font=ctk.CTkFont(family=body_font.cget("family"), size=12, weight="bold"),
+            font=ctk.CTkFont(family=body_font.cget("family"), size=10, weight="bold"),
             anchor="w",
         )
-        self.progress_label.grid(row=0, column=0, sticky="ew", padx=12, pady=(5, 2))
+        self.progress_label.grid(row=0, column=0, sticky="ew", padx=8, pady=(3, 1))
         self.progress = ctk.CTkProgressBar(
             activity,
-            height=5,
-            corner_radius=3,
+            height=4,
+            corner_radius=2,
             border_width=0,
             fg_color=BG,
             progress_color=ACCENT,
         )
-        self.progress.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+        self.progress.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 5))
         self.progress.set(0)
 
         self.destroy_button = ctk.CTkButton(
             self,
             text="DESTROY",
             command=self._activate,
-            width=136,
-            height=48,
-            corner_radius=13,
+            width=108,
+            height=37,
+            corner_radius=10,
             border_width=0,
             fg_color=RED_BG,
             hover_color="#dce4f0",
             text_color="#090a0d",
-            font=ctk.CTkFont(family=body_font.cget("family"), size=12, weight="bold"),
+            font=ctk.CTkFont(family=body_font.cget("family"), size=10, weight="bold"),
             state="normal",
         )
         self.destroy_button.grid(row=0, column=1, sticky="nsew")

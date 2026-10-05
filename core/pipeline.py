@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from core.deobfuscator import DeobfuscationResult, deobfuscate_source
+from core.protection import ProtectionProfile, inspect_protection
 from core.runtime_paths import LOGS_DIR, OUTPUT_DIR, TOOLS_DIR
 from core.sandbox import Sandbox, SandboxError, SandboxResult
 from core.tracer import Tracer
@@ -43,6 +44,9 @@ class PipelineResult:
     decoded_layers: int
     transformations: tuple[str, ...]
     sandbox_result: SandboxResult | None
+    status: str = "complete"
+    notice: str | None = None
+    preview_path: Path | None = None
 
 
 class _LuauCompiler:
@@ -239,15 +243,33 @@ class DeobfuscationPipeline:
     def run(self, source: str, *, source_name: str = "input") -> PipelineResult:
         if not isinstance(source, str):
             raise TypeError("source must be text")
-        if self._running_elevated():
-            raise PipelineError(
-                "For safety, Protez will not execute input while running as Administrator. "
-                "Close it and launch Protez normally; only the installer needs elevation."
-            )
 
         started = time.monotonic()
-        deadline = started + self.max_pipeline_seconds
         source_analysis = deobfuscate_source(source)
+        protection = inspect_protection(source)
+        if protection is not None:
+            self._log_transformations("Input", source_analysis)
+            notice = (
+                f"{protection.display_name} detected; only a static preview was produced. "
+                "The original source was not reconstructed or executed."
+            )
+            self.logger.warning(notice)
+            self._progress(100, "PARTIAL")
+            return self._write_protection_analysis(
+                source=source,
+                source_name=source_name,
+                profile=protection,
+                source_analysis=source_analysis,
+                duration_seconds=time.monotonic() - started,
+                notice=notice,
+            )
+
+        deadline = started + self.max_pipeline_seconds
+        elevated_mode = self._running_elevated()
+        if elevated_mode:
+            self.logger.warning(
+                "Administrator mode: dynamic execution and tracing of user source are disabled"
+            )
         self.logger.info("Static Luau analysis started (%s bytes)", f"{source_analysis.input_bytes:,}")
         self._log_transformations("Input", source_analysis)
         self._progress(8, "ANALYZE")
@@ -282,7 +304,11 @@ class DeobfuscationPipeline:
         initial_result: SandboxResult | None = None
         pending: list[tuple[str, int, str]] = []
         remaining = deadline - time.monotonic()
-        if remaining > 0:
+        if elevated_mode:
+            self.logger.warning(
+                "Skipped initial sandbox in Administrator mode; user source was not executed"
+            )
+        elif remaining > 0:
             sandbox.timeout_seconds = min(self.sandbox_timeout_seconds, remaining)
             try:
                 initial_result = sandbox.run(runtime_source, source_name=source_name)
@@ -402,6 +428,14 @@ class DeobfuscationPipeline:
                 pending.append((payload, depth + 1, f"{candidate_name}.{index}"))
 
         if best_source is None:
+            if elevated_mode:
+                report_path = self._write_failure_report(
+                    source, source_name, None, layer_report
+                )
+                raise PipelineError(
+                    "No valid Luau source was recovered. Dynamic execution and tracing are "
+                    f"disabled in Administrator mode. Report: {report_path}"
+                )
             return self._trace_unresolved(
                 runtime_source,
                 source_name,
@@ -427,6 +461,7 @@ class DeobfuscationPipeline:
             layer_report=layer_report,
             sandbox_result=initial_result,
             duration_seconds=time.monotonic() - started,
+            dynamic_execution_skipped=elevated_mode,
         )
 
     def _is_valid_source(
@@ -536,6 +571,122 @@ class DeobfuscationPipeline:
         report_path = self._write_failure_report(source, source_name, trace_path, layer_report)
         raise PipelineError(f"No valid Luau source was recovered. Trace: {trace_path}. Report: {report_path}. {detail}")
 
+    def _write_protection_analysis(
+        self,
+        *,
+        source: str,
+        source_name: str,
+        profile: ProtectionProfile,
+        source_analysis: DeobfuscationResult,
+        duration_seconds: float,
+        notice: str,
+    ) -> PipelineResult:
+        """Write an honest static triage report for a detected VM-protected loader."""
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        preview_path = self.output_dir / f"analysis_{timestamp}.static-preview.luau"
+        report_path = self.output_dir / f"analysis_{timestamp}.report.json"
+        summary_path = self.output_dir / f"analysis_{timestamp}.report.txt"
+        paths = (preview_path, report_path, summary_path)
+        temps = tuple(path.with_name(path.name + ".tmp") for path in paths)
+
+        preview = (
+            "-- Protez static preview only; this is not reconstructed source.\n"
+            f"-- Detected: {profile.display_name}. The wrapper and payload were not executed.\n"
+            "-- Do not treat this file as deobfuscated Luau.\n\n"
+            + source_analysis.source
+        )
+        report = {
+            "app_version": VERSION,
+            "status": "partial",
+            "source_name": source_name,
+            "route": "static-protection-report",
+            "duration_seconds": round(duration_seconds, 3),
+            "input_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            "protection": {
+                "family": profile.family,
+                "version": profile.version,
+                "embedded_payload_characters": profile.embedded_payload_chars,
+            },
+            "recovered": False,
+            "source_reconstructed": False,
+            "payload_executed": False,
+            "input_transformations": list(source_analysis.transformations),
+            "visible_wrapper_literals": list(profile.visible_literals),
+            "outputs": {
+                "human_report": str(summary_path),
+                "static_preview": str(preview_path),
+            },
+            "limitations": [
+                "The detected wrapper uses a virtualized/encoded payload; the readable wrapper is not the original program.",
+                "Protez does not currently lift this Luraph VM payload into original Luau source.",
+                "Static string decoding and formatting do not reconstruct VM instructions or recover original control flow.",
+                "The supplied code and embedded payload were not executed.",
+            ],
+        }
+        transformations = (
+            "\n".join(f"  - {item}" for item in source_analysis.transformations)
+            if source_analysis.transformations
+            else "  - No supported static decoder pattern matched."
+        )
+        literals = (
+            "\n".join(f"  - {json.dumps(item, ensure_ascii=False)}" for item in profile.visible_literals)
+            if profile.visible_literals
+            else "  - No short, readable wrapper literals were found."
+        )
+        payload_size = (
+            f"approximately {profile.embedded_payload_chars:,} characters"
+            if profile.embedded_payload_chars
+            else "not identified by the static signature check"
+        )
+        summary = (
+            "PROTEZ // STATIC PROTECTION ANALYSIS\n"
+            "=====================================\n"
+            "STATUS: PARTIAL — ORIGINAL SOURCE NOT RECONSTRUCTED\n\n"
+            f"Protection: {profile.display_name}\n"
+            f"Embedded payload: {payload_size}\n"
+            f"Input: {source_name} ({source_analysis.input_bytes:,} bytes)\n"
+            f"Elapsed: {duration_seconds:.2f} seconds\n\n"
+            "Static wrapper transforms:\n"
+            f"{transformations}\n\n"
+            "Visible wrapper strings (not necessarily program behavior):\n"
+            f"{literals}\n\n"
+            "Why this is partial:\n"
+            "The readable code in a Luraph-protected file is a virtual-machine loader. Its encoded payload contains VM data, not plain Luau text. Protez currently detects this format and reports safe static indicators, but does not lift this VM into the original source.\n\n"
+            "Safety:\n"
+            "The input and payload were not executed. The adjacent .luau file is only a static preview of the wrapper and must not be mistaken for reconstructed/deobfuscated source.\n\n"
+            "Files:\n"
+            f"  Human report: {summary_path}\n"
+            f"  Machine report: {report_path}\n"
+            f"  Static preview: {preview_path}\n"
+        )
+        try:
+            temps[0].write_text(preview, encoding="utf-8", newline="")
+            os.replace(temps[0], paths[0])
+            temps[1].write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            os.replace(temps[1], paths[1])
+            temps[2].write_text(summary, encoding="utf-8", newline="")
+            os.replace(temps[2], paths[2])
+        except OSError as exc:
+            for temp in temps:
+                temp.unlink(missing_ok=True)
+            raise PipelineError(f"Could not write static protection analysis: {exc}") from exc
+
+        self.logger.info("Static analysis report written to %s", summary_path)
+        self.logger.info("Machine-readable report written to %s", report_path)
+        self.logger.info("Wrapper-only preview written to %s", preview_path)
+        return PipelineResult(
+            output_path=summary_path,
+            report_path=report_path,
+            route="static-protection-report",
+            decoded_layers=0,
+            transformations=source_analysis.transformations,
+            sandbox_result=None,
+            status="partial",
+            notice=notice,
+            preview_path=preview_path,
+        )
+
     def _write_result(
         self,
         *,
@@ -550,6 +701,7 @@ class DeobfuscationPipeline:
         layer_report: list[dict[str, object]],
         sandbox_result: SandboxResult | None,
         duration_seconds: float,
+        dynamic_execution_skipped: bool,
     ) -> PipelineResult:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -557,6 +709,15 @@ class DeobfuscationPipeline:
         report_path = self.output_dir / f"deobfuscated_{timestamp}.report.json"
         output_temp = output_path.with_name(output_path.name + ".tmp")
         report_temp = report_path.with_name(report_path.name + ".tmp")
+        safety_notes = [
+            "HTTP and remote module requests remain disabled in the mock runtime.",
+            "Dynamic inspection is process-limited and is not an OS security boundary.",
+            "A syntactically valid output is not a guarantee of full deobfuscation.",
+        ]
+        if dynamic_execution_skipped:
+            safety_notes.append(
+                "Dynamic sandbox execution was skipped because Protez is running as Administrator."
+            )
         report = {
             "app_version": VERSION,
             "source_name": source_name,
@@ -569,11 +730,7 @@ class DeobfuscationPipeline:
             "input_transformations": list(source_analysis.transformations),
             "selected_transformations": list(transformations),
             "layers": layer_report,
-            "safety_notes": [
-                "HTTP and remote module requests remain disabled in the mock runtime.",
-                "Dynamic inspection is process-limited and is not an OS security boundary.",
-                "A syntactically valid output is not a guarantee of full deobfuscation.",
-            ],
+            "safety_notes": safety_notes,
         }
         try:
             output_temp.write_text(source, encoding="utf-8", newline="")
@@ -602,7 +759,7 @@ class DeobfuscationPipeline:
         self,
         source: str,
         source_name: str,
-        trace_path: Path,
+        trace_path: Path | None,
         layer_report: list[dict[str, object]],
     ) -> Path:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -613,12 +770,18 @@ class DeobfuscationPipeline:
             "source_name": source_name,
             "input_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
             "recovered": False,
-            "trace_path": str(trace_path),
+            "trace_path": str(trace_path) if trace_path is not None else None,
+            "dynamic_execution_skipped": trace_path is None,
             "layers": layer_report,
             "limitations": [
                 "No syntactically valid source layer was recovered.",
                 "Remote HTTP and require requests are disabled.",
                 "VM handler lifting and source reconstruction are not implemented.",
+                *(
+                    ["Dynamic sandbox execution and tracing were skipped in Administrator mode."]
+                    if trace_path is None
+                    else []
+                ),
             ],
         }
         try:

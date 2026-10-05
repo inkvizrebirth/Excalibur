@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-05 — 0.3.0
+
+- Tightened the main desktop window and added a white pixel-sword application/window icon.
+- Configured the Windows application to request Administrator approval at launch; static analysis remains available when elevated, while dynamic sandbox execution and tracing are skipped.
+- Added static Luraph VM detection and a clearly labeled partial report with wrapper strings and a non-executable preview. The report explicitly states that the original source is not reconstructed.
+- Kept the release upload limited to `Protez.exe`; the separate installer remains a CI artifact.
+
 ## 2026-10-05 — 0.2.0
 
 - Added a bounded static Luau tokenizer/evaluator for constant strings, arithmetic, bitwise helpers, Base64, and table concatenation; unknown expressions are preserved rather than executed.

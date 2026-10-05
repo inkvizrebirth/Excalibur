@@ -5,14 +5,14 @@ import tkinter as tk
 
 
 class AnimatedBorder:
-    """A low-profile moving gradient drawn around a frameless Tk window."""
+    """A low-profile moving blue gradient drawn around a frameless Tk window."""
 
     _STOPS = (
-        (0.00, (164, 242, 255)),  # ice blue
-        (0.27, (188, 174, 255)),  # soft violet
-        (0.52, (246, 248, 255)),  # silver
-        (0.76, (139, 224, 241)),  # teal
-        (1.00, (164, 242, 255)),
+        (0.00, (35, 164, 255)),
+        (0.27, (66, 219, 255)),
+        (0.52, (122, 167, 255)),
+        (0.76, (29, 110, 255)),
+        (1.00, (35, 164, 255)),
     )
 
     def __init__(self, root, *, background: str = "#080808", width: float = 2.0):
@@ -66,7 +66,7 @@ class AnimatedBorder:
                 point[1],
                 next_point[0],
                 next_point[1],
-                fill="#a4f2ff",
+                fill="#23a4ff",
                 width=self.line_width,
                 capstyle="round",
                 tags=("animated-outline",),
@@ -86,7 +86,7 @@ class AnimatedBorder:
                     for left, right in zip(left_color, right_color)
                 )
                 return "#%02x%02x%02x" % channels
-        return "#a4f2ff"
+        return "#23a4ff"
 
     def _animate(self) -> None:
         if self._closed:

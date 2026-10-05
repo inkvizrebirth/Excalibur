@@ -29,7 +29,7 @@ class LogPanel(ctk.CTkFrame):
     def __init__(self, master, records: queue.Queue[logging.LogRecord], font, log_font=None):
         super().__init__(
             master,
-            corner_radius=12,
+            corner_radius=9,
             border_width=1,
             border_color=BORDER,
             fg_color=PANEL,
@@ -38,30 +38,30 @@ class LogPanel(ctk.CTkFrame):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
-        header = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=28)
-        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(5, 2))
+        header = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=22)
+        header.grid(row=0, column=0, sticky="ew", padx=9, pady=(3, 1))
         header.grid_propagate(False)
         header.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             header,
             text="ACTIVITY",
             text_color=NEON,
-            font=ctk.CTkFont(family=font.cget("family"), size=12, weight="bold"),
+            font=ctk.CTkFont(family=font.cget("family"), size=9, weight="bold"),
             anchor="w",
         ).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
             header,
             text="● LIVE",
             text_color=ACCENT,
-            font=ctk.CTkFont(family=font.cget("family"), size=10, weight="bold"),
+            font=ctk.CTkFont(family=font.cget("family"), size=9, weight="bold"),
             anchor="e",
         ).grid(row=0, column=1, sticky="e")
 
         self.textbox = ctk.CTkTextbox(
             self,
             width=300,
-            height=68,
-            corner_radius=8,
+            height=44,
+            corner_radius=7,
             border_width=0,
             fg_color=BG,
             text_color=NEON,
@@ -69,7 +69,7 @@ class LogPanel(ctk.CTkFrame):
             wrap="word",
             activate_scrollbars=True,
         )
-        self.textbox.grid(row=1, column=0, sticky="nsew", padx=8, pady=(1, 8))
+        self.textbox.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
         self._text = self.textbox._textbox
         self._text.tag_configure("INFO", foreground=NEON)
         self._text.tag_configure("WARNING", foreground=WARN)

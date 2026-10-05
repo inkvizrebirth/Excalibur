@@ -15,7 +15,7 @@ import customtkinter as ctk
 from tkinter import font as tkfont
 
 from core.pipeline import DeobfuscationPipeline, PipelineError
-from core.runtime_paths import FONTS_DIR
+from core.runtime_paths import FONTS_DIR, ICON_PATH
 from core.source_input import SourceInputError, resolve_source_input
 from core.version import VERSION
 from gui.animated_border import AnimatedBorder
@@ -33,10 +33,10 @@ except ImportError:
 
 
 class ProtezApp(ctk.CTk):
-    WINDOW_WIDTH = 560
-    WINDOW_HEIGHT = 510
-    MIN_WIDTH = 480
-    MIN_HEIGHT = 485
+    WINDOW_WIDTH = 480
+    WINDOW_HEIGHT = 360
+    MIN_WIDTH = 440
+    MIN_HEIGHT = 330
 
     def __init__(self):
         ctk.set_appearance_mode("dark")
@@ -57,6 +57,12 @@ class ProtezApp(ctk.CTk):
         self._fade_supported = True
 
         self.title("PROTEZ")
+        if ICON_PATH.is_file():
+            try:
+                self.iconbitmap(str(ICON_PATH))
+                self.iconbitmap(default=str(ICON_PATH))
+            except Exception as exc:
+                self.logger.warning("Could not set the Protez window icon: %s", exc)
         self.overrideredirect(True)
         self.geometry(self._centered_geometry(self.WINDOW_WIDTH, self.WINDOW_HEIGHT))
         self.minsize(self.MIN_WIDTH, self.MIN_HEIGHT)
@@ -210,17 +216,17 @@ class ProtezApp(ctk.CTk):
         title_bar = ctk.CTkFrame(
             self,
             fg_color=PANEL,
-            corner_radius=15,
+            corner_radius=12,
             border_width=0,
-            height=48,
+            height=40,
         )
-        title_bar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 0))
+        title_bar.grid(row=0, column=0, sticky="ew", padx=7, pady=(6, 0))
         title_bar.grid_propagate(False)
         title_bar.grid_columnconfigure(1, weight=1)
         title_bar.grid_rowconfigure(0, weight=1)
 
-        self.logo = ProtezLogo(title_bar, size=36, background=PANEL)
-        self.logo.grid(row=0, column=0, sticky="w", padx=(9, 10), pady=5)
+        self.logo = ProtezLogo(title_bar, size=32, background=PANEL)
+        self.logo.grid(row=0, column=0, sticky="w", padx=(5, 8), pady=4)
         self.title_text = ctk.CTkLabel(
             title_bar,
             text="PROTEZ",
@@ -231,33 +237,33 @@ class ProtezApp(ctk.CTk):
         self.title_text.grid(row=0, column=1, sticky="w")
 
         window_buttons = ctk.CTkFrame(title_bar, fg_color="transparent", corner_radius=0)
-        window_buttons.grid(row=0, column=2, sticky="e", padx=(4, 8), pady=5)
+        window_buttons.grid(row=0, column=2, sticky="e", padx=(4, 6), pady=3)
         self.minimize_button = ctk.CTkButton(
             window_buttons,
             text="−",
             command=self._minimize_window,
-            width=32,
-            height=31,
-            corner_radius=10,
+            width=28,
+            height=26,
+            corner_radius=8,
             border_width=0,
             fg_color="transparent",
             hover_color="#272a31",
             text_color=MUTED,
-            font=ctk.CTkFont(family=self.body_family, size=18),
+            font=ctk.CTkFont(family=self.body_family, size=16),
         )
         self.minimize_button.grid(row=0, column=0, padx=(0, 2))
         self.close_button = ctk.CTkButton(
             window_buttons,
             text="×",
             command=self._on_close,
-            width=32,
-            height=31,
-            corner_radius=10,
+            width=28,
+            height=26,
+            corner_radius=8,
             border_width=0,
             fg_color="transparent",
             hover_color="#37232b",
             text_color=TEXT,
-            font=ctk.CTkFont(family=self.body_family, size=18),
+            font=ctk.CTkFont(family=self.body_family, size=16),
         )
         self.close_button.grid(row=0, column=1, padx=(2, 0))
 
@@ -266,11 +272,11 @@ class ProtezApp(ctk.CTk):
             widget.bind("<B1-Motion>", self._drag_window, add="+")
 
         content = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
-        content.grid(row=1, column=0, sticky="nsew", padx=9, pady=(8, 9))
+        content.grid(row=1, column=0, sticky="nsew", padx=7, pady=(6, 7))
         content.grid_columnconfigure(0, weight=1)
-        content.grid_rowconfigure(0, weight=7, minsize=244)
-        content.grid_rowconfigure(1, weight=0, minsize=56)
-        content.grid_rowconfigure(2, weight=2, minsize=104)
+        content.grid_rowconfigure(0, weight=5, minsize=166)
+        content.grid_rowconfigure(1, weight=0, minsize=42)
+        content.grid_rowconfigure(2, weight=2, minsize=68)
 
         self.input_panel = InputPanel(
             content,
@@ -278,7 +284,7 @@ class ProtezApp(ctk.CTk):
             body_font=self.body_font,
             code_font=self.code_font,
         )
-        self.input_panel.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+        self.input_panel.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
 
         self.controls = Controls(
             content,
@@ -286,7 +292,7 @@ class ProtezApp(ctk.CTk):
             body_font=self.body_font,
             on_destroy=self._start_deobfuscation,
         )
-        self.controls.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.controls.grid(row=1, column=0, sticky="ew", pady=(0, 6))
 
         self.log_panel = LogPanel(
             content,
@@ -329,6 +335,7 @@ class ProtezApp(ctk.CTk):
 
             hwnd = ctypes.c_void_p(self.winfo_id())
             user32 = ctypes.windll.user32
+            self._ensure_taskbar_presence(user32, hwnd, ctypes)
             user32.GetWindowRect.argtypes = [
                 ctypes.c_void_p,
                 ctypes.POINTER(ctypes.wintypes.RECT),
@@ -376,6 +383,46 @@ class ProtezApp(ctk.CTk):
             # Other Windows versions and non-DWM window managers still retain
             # rounded panels and the animated Canvas outline.
             return
+
+    def _ensure_taskbar_presence(self, user32, hwnd, ctypes) -> None:
+        """Keep the frameless main window visible in the Windows taskbar."""
+        try:
+            get_style = getattr(user32, "GetWindowLongPtrW", None)
+            set_style = getattr(user32, "SetWindowLongPtrW", None)
+            if get_style is None:
+                get_style = user32.GetWindowLongW
+            if set_style is None:
+                set_style = user32.SetWindowLongW
+            get_style.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            get_style.restype = ctypes.c_ssize_t
+            set_style.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+            set_style.restype = ctypes.c_ssize_t
+
+            ex_style_index = -20  # GWL_EXSTYLE
+            app_window = 0x00040000  # WS_EX_APPWINDOW
+            tool_window = 0x00000080  # WS_EX_TOOLWINDOW
+            current_style = get_style(hwnd, ex_style_index)
+            desired_style = (current_style | app_window) & ~tool_window
+            if desired_style == current_style:
+                return
+            set_style(hwnd, ex_style_index, desired_style)
+
+            user32.SetWindowPos.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint,
+            ]
+            user32.SetWindowPos.restype = ctypes.c_int
+            flags = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020
+            if not user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, flags):
+                raise OSError(ctypes.get_last_error(), "SetWindowPos failed")
+            self.logger.info("Frameless window registered in the taskbar")
+        except Exception as exc:
+            self.logger.warning("Could not register the window in the taskbar: %s", exc)
 
     def _fade_in(self, frame: int) -> None:
         if self._closed or self._closing:
@@ -496,7 +543,10 @@ class ProtezApp(ctk.CTk):
                 ),
             )
             result = pipeline.run(resolved.source, source_name=resolved.source_name)
-            self.ui_events.put(("output", str(result.output_path)))
+            if result.status == "partial":
+                self.ui_events.put(("partial", str(result.output_path), result.notice))
+            else:
+                self.ui_events.put(("output", str(result.output_path)))
         except SourceInputError as exc:
             self.logger.error("Could not resolve source input: %s", exc)
             self.ui_events.put(("failed", str(exc)))
@@ -520,9 +570,12 @@ class ProtezApp(ctk.CTk):
             try:
                 if event[0] == "progress":
                     self.controls.set_progress(event[1], event[2])
-                elif event[0] == "output":
+                elif event[0] in {"output", "partial"}:
                     path = Path(event[1])
-                    self.controls.set_progress(100, "DONE")
+                    is_partial = event[0] == "partial"
+                    self.controls.set_progress(100, "PARTIAL" if is_partial else "DONE")
+                    if is_partial and len(event) > 2 and event[2]:
+                        self.controls.set_status("PARTIAL · SEE REPORT", error=False)
                     try:
                         self._open_result(path)
                     except Exception:
@@ -582,14 +635,14 @@ class ProtezApp(ctk.CTk):
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
             )
-        self.logger.info("Opened recovered script automatically: %s", path)
+        self.logger.info("Opened analysis result automatically: %s", path)
 
     def _show_result_in_app(self, path: Path) -> None:
         try:
             with path.open("r", encoding="utf-8", errors="replace") as source_file:
                 content = source_file.read(1_000_001)
         except OSError:
-            self.logger.exception("Could not open recovered script")
+            self.logger.exception("Could not open the analysis result")
             return
         truncated = len(content) > 1_000_000
         if truncated:

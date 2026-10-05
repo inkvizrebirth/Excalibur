@@ -18,7 +18,7 @@ class InputPanel(ctk.CTkFrame):
     def __init__(self, master, *, title_font, body_font, code_font=None):
         super().__init__(
             master,
-            corner_radius=13,
+            corner_radius=12,
             border_width=1,
             border_color=BORDER,
             fg_color=PANEL,
@@ -33,29 +33,29 @@ class InputPanel(ctk.CTkFrame):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
-        header = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=40)
-        header.grid(row=0, column=0, sticky="ew", padx=13, pady=(7, 4))
+        header = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=32)
+        header.grid(row=0, column=0, sticky="ew", padx=10, pady=(4, 3))
         header.grid_propagate(False)
         header.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             header,
             text="SOURCE",
             text_color=NEON,
-            font=ctk.CTkFont(family=body_font.cget("family"), size=12, weight="bold"),
+            font=ctk.CTkFont(family=body_font.cget("family"), size=10, weight="bold"),
             anchor="w",
         ).grid(row=0, column=0, sticky="w")
 
         tabs = ctk.CTkFrame(header, fg_color=PANEL, corner_radius=0)
         tabs.grid(row=0, column=1, sticky="e")
-        tab_font = ctk.CTkFont(family=body_font.cget("family"), size=10, weight="bold")
+        tab_font = ctk.CTkFont(family=body_font.cget("family"), size=9, weight="bold")
         self.paste_tab = TerminalButton(
             tabs,
             text="PASTE",
             command=lambda: self._select_tab("paste"),
             accent=NEON,
             base_bg=BG,
-            width=74,
-            height=28,
+            width=64,
+            height=25,
             font=tab_font,
         )
         self.paste_tab.grid(row=0, column=0, padx=(0, 5))
@@ -65,15 +65,15 @@ class InputPanel(ctk.CTkFrame):
             command=lambda: self._select_tab("file"),
             accent=NEON,
             base_bg=BG,
-            width=60,
-            height=28,
+            width=52,
+            height=25,
             font=tab_font,
         )
         self.file_tab.grid(row=0, column=1)
         self.paste_tab.set_active(True)
 
         self.content = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
-        self.content.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 4))
+        self.content.grid(row=1, column=0, sticky="nsew", padx=7, pady=(0, 3))
         self.content.grid_columnconfigure(0, weight=1)
         self.content.grid_rowconfigure(0, weight=1)
 
@@ -89,8 +89,8 @@ class InputPanel(ctk.CTkFrame):
         self.paste_view.grid_rowconfigure(0, weight=1)
         self.textbox = ctk.CTkTextbox(
             self.paste_view,
-            width=360,
-            height=180,
+            width=340,
+            height=100,
             corner_radius=8,
             border_width=0,
             fg_color=INPUT_BG,
@@ -100,7 +100,7 @@ class InputPanel(ctk.CTkFrame):
             activate_scrollbars=True,
             undo=True,
         )
-        self.textbox.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        self.textbox.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
         self.textbox.bind("<KeyRelease>", self._update_status)
         self.textbox.bind("<<Paste>>", self._update_status_after_idle)
         self.textbox.bind("<<Cut>>", self._update_status_after_idle)
@@ -137,8 +137,8 @@ class InputPanel(ctk.CTkFrame):
             self.drop_zone,
             text="BROWSE",
             command=self._browse_file,
-            width=112,
-            height=34,
+            width=100,
+            height=29,
             corner_radius=10,
             border_width=1,
             border_color=BORDER,
@@ -154,10 +154,10 @@ class InputPanel(ctk.CTkFrame):
             self,
             text="READY · PASTE SOURCE OR URL",
             text_color=MUTED,
-            font=ctk.CTkFont(family=body_font.cget("family"), size=11, weight="bold"),
+            font=ctk.CTkFont(family=body_font.cget("family"), size=10, weight="bold"),
             anchor="w",
         )
-        self.status.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 7))
+        self.status.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 4))
 
     @property
     def file_path(self) -> Path | None:

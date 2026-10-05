@@ -50,6 +50,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Python compilation check failed" }
           python -m unittest discover -v
           if ($LASTEXITCODE -ne 0) { throw "Python-only unit tests failed" }
+          python main.py --ui-import-check
+          if ($LASTEXITCODE -ne 0) { throw "GUI module import check failed" }
 
       - name: Build pinned Luau native host
         shell: pwsh
@@ -92,12 +94,14 @@ jobs:
           $native = Join-Path $PWD "build/native/host-bin/protez-native-host.exe"
           $sandboxDir = (Resolve-Path "sandbox").Path
           $fontDir = (Resolve-Path "assets/fonts").Path
+          $iconPath = (Resolve-Path "assets/icons/protez.ico").Path
           $appDist = Join-Path $PWD "dist"
           $appWork = Join-Path $PWD "build/pyinstaller-app"
           $appSpec = Join-Path $PWD "build/spec-app"
           $entryPoint = Join-Path $PWD "main.py"
           $arguments = @(
-            "--noconfirm", "--clean", "--onefile", "--windowed",
+            "--noconfirm", "--clean", "--onefile", "--windowed", "--uac-admin",
+            "--icon", $iconPath,
             "--name", "Protez",
             "--distpath", $appDist,
             "--workpath", $appWork,
@@ -105,6 +109,7 @@ jobs:
             "--add-data", "$sandboxDir;sandbox",
             "--add-data", "$native;tools",
             "--add-data", "$fontDir;assets/fonts",
+            "--add-data", "$iconPath;assets/icons",
             "--collect-all", "customtkinter",
             "--collect-all", "tkinterdnd2",
             "--hidden-import", "tkinterdnd2.TkinterDnD",
@@ -122,23 +127,13 @@ jobs:
             Write-Output "::error title=Protez.exe missing::PyInstaller completed but dist/Protez.exe was not created"
             throw "Protez.exe was not created"
           }
-          $importOutput = & "$PWD/dist/Protez.exe" --ui-import-check 2>&1
-          $importExit = $LASTEXITCODE
-          $importOutput | ForEach-Object { Write-Host $_ }
-          if ($importExit -ne 0) {
-            $diagnostic = ($importOutput | Select-Object -Last 24 | ForEach-Object { $_.ToString() }) -join " | "
-            Write-Output "::error title=GUI import check failed::exit $importExit; $diagnostic"
-            throw "Packaged GUI import check failed with exit code $importExit"
+          $binary = [System.IO.File]::ReadAllBytes((Resolve-Path "dist/Protez.exe"))
+          $manifestAscii = [System.Text.Encoding]::ASCII.GetString($binary)
+          $manifestUnicode = [System.Text.Encoding]::Unicode.GetString($binary)
+          if (-not ($manifestAscii.Contains("requireAdministrator") -or $manifestUnicode.Contains("requireAdministrator"))) {
+            throw "The packaged executable does not contain the required Administrator manifest"
           }
-          $healthOutput = & "$PWD/dist/Protez.exe" --health-check 2>&1
-          $healthExit = $LASTEXITCODE
-          $healthOutput | ForEach-Object { Write-Host $_ }
-          if ($healthExit -ne 0) {
-            $logPath = Join-Path $env:LOCALAPPDATA "Protez/logs/startup.log"
-            $diagnostic = if (Test-Path $logPath) { (Get-Content $logPath -Tail 24) -join " | " } else { "startup.log is missing" }
-            Write-Output "::error title=Packaged runtime health check failed::exit $healthExit; $diagnostic"
-            throw "Packaged runtime health check failed with exit code $healthExit"
-          }
+          Write-Host "Protez.exe contains the requireAdministrator manifest; it was not launched in CI."
 
       - name: Create self-repair installer
         shell: pwsh

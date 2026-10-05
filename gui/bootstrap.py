@@ -7,6 +7,7 @@ import tkinter as tk
 from tkinter import ttk
 from datetime import datetime
 
+from core.runtime_paths import ICON_PATH
 from core.version import VERSION
 
 
@@ -28,6 +29,12 @@ class BootstrapWindow(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"PROTEZ / STARTUP CHECK / {VERSION}")
+        if ICON_PATH.is_file():
+            try:
+                self.iconbitmap(str(ICON_PATH))
+                self.iconbitmap(default=str(ICON_PATH))
+            except tk.TclError:
+                pass
         self.geometry("780x570")
         self.minsize(680, 480)
         self.configure(bg="#050505")
