@@ -29,7 +29,8 @@ class AnimatedBorder:
             takefocus=False,
         )
         self._canvas.place(x=0, y=0, relwidth=1, relheight=1)
-        self._canvas.lower()
+        # Created before the controls, so normal Tk stacking keeps it behind them.
+        # Canvas.lower() lowers canvas items and requires a tag or item ID.
         self._canvas.bind("<Configure>", self._rebuild)
         self._rebuild()
         self._animate()
