@@ -6,7 +6,7 @@ from datetime import datetime
 
 import customtkinter as ctk
 
-from gui.theme import BG, BORDER, ERROR, MUTED, NEON, PANEL, WARN
+from gui.theme import ACCENT, BG, BORDER, ERROR, MUTED, NEON, PANEL, WARN
 
 
 class QueueLogHandler(logging.Handler):
@@ -26,10 +26,10 @@ class QueueLogHandler(logging.Handler):
 class LogPanel(ctk.CTkFrame):
     MAX_LINES = 1000
 
-    def __init__(self, master, records: queue.Queue[logging.LogRecord], font):
+    def __init__(self, master, records: queue.Queue[logging.LogRecord], font, log_font=None):
         super().__init__(
             master,
-            corner_radius=6,
+            corner_radius=12,
             border_width=1,
             border_color=BORDER,
             fg_color=PANEL,
@@ -38,38 +38,38 @@ class LogPanel(ctk.CTkFrame):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
-        header = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=23)
-        header.grid(row=0, column=0, sticky="ew", padx=9, pady=(2, 0))
+        header = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=28)
+        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(5, 2))
         header.grid_propagate(False)
         header.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             header,
             text="ACTIVITY",
             text_color=NEON,
-            font=ctk.CTkFont(family=font.cget("family"), size=13),
+            font=ctk.CTkFont(family=font.cget("family"), size=12, weight="bold"),
             anchor="w",
         ).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(
             header,
-            text="LOCAL",
-            text_color=MUTED,
-            font=ctk.CTkFont(family=font.cget("family"), size=12),
+            text="● LIVE",
+            text_color=ACCENT,
+            font=ctk.CTkFont(family=font.cget("family"), size=10, weight="bold"),
             anchor="e",
         ).grid(row=0, column=1, sticky="e")
 
         self.textbox = ctk.CTkTextbox(
             self,
             width=300,
-            height=50,
-            corner_radius=4,
+            height=68,
+            corner_radius=8,
             border_width=0,
             fg_color=BG,
             text_color=NEON,
-            font=font,
+            font=log_font or font,
             wrap="word",
             activate_scrollbars=True,
         )
-        self.textbox.grid(row=1, column=0, sticky="nsew", padx=6, pady=(1, 6))
+        self.textbox.grid(row=1, column=0, sticky="nsew", padx=8, pady=(1, 8))
         self._text = self.textbox._textbox
         self._text.tag_configure("INFO", foreground=NEON)
         self._text.tag_configure("WARNING", foreground=WARN)
@@ -98,7 +98,7 @@ class LogPanel(ctk.CTkFrame):
 
         self.textbox.configure(state="normal")
         for line in message.splitlines() or [""]:
-            self._text.insert("end", f"[{timestamp}] {level:<7} {line}\n", tag)
+            self._text.insert("end", f"{timestamp}  {level:<7} {line}\n", tag)
         line_count = int(self._text.index("end-1c").split(".", maxsplit=1)[0])
         if line_count > self.MAX_LINES + 1:
             self._text.delete("1.0", f"{line_count - self.MAX_LINES}.0")
@@ -114,7 +114,6 @@ class LogPanel(ctk.CTkFrame):
             try:
                 self._render_record(record)
             except Exception:
-                # A malformed record must not stop future UI updates.
                 continue
         try:
             self.after(60, self._drain_records)

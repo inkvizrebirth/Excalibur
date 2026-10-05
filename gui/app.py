@@ -18,10 +18,12 @@ from core.pipeline import DeobfuscationPipeline, PipelineError
 from core.runtime_paths import FONTS_DIR
 from core.source_input import SourceInputError, resolve_source_input
 from core.version import VERSION
+from gui.animated_border import AnimatedBorder
 from gui.controls import Controls
 from gui.input_panel import InputPanel
 from gui.log_panel import LogPanel, QueueLogHandler
-from gui.theme import BG, BORDER, MUTED, TEXT, TerminalButton
+from gui.logo import ProtezLogo
+from gui.theme import BG, MUTED, PANEL, TEXT
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -32,9 +34,9 @@ except ImportError:
 
 class ProtezApp(ctk.CTk):
     WINDOW_WIDTH = 560
-    WINDOW_HEIGHT = 500
-    MIN_WIDTH = 470
-    MIN_HEIGHT = 410
+    WINDOW_HEIGHT = 510
+    MIN_WIDTH = 480
+    MIN_HEIGHT = 485
 
     def __init__(self):
         ctk.set_appearance_mode("dark")
@@ -47,7 +49,12 @@ class ProtezApp(ctk.CTk):
         self._configure_logger()
         self._worker: threading.Thread | None = None
         self._closed = False
-        self._last_output_path: Path | None = None
+        self._closing = False
+        self._shape_pending = False
+        self._restore_chrome_after_map = False
+        self._drag_offset: tuple[int, int] | None = None
+        self._resize_anchor: tuple[int, int, int, int] | None = None
+        self._fade_supported = True
 
         self.title("PROTEZ")
         self.overrideredirect(True)
@@ -55,25 +62,30 @@ class ProtezApp(ctk.CTk):
         self.minsize(self.MIN_WIDTH, self.MIN_HEIGHT)
         self.configure(fg_color=BG)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._drag_offset: tuple[int, int] | None = None
-        self._resize_anchor: tuple[int, int, int, int] | None = None
-        self._restore_chrome_after_map = False
+        try:
+            self.attributes("-alpha", 0.0)
+        except Exception:
+            self._fade_supported = False
+
+        # Draw the animated border first so the rounded UI panels sit above it.
+        self._animated_border = AnimatedBorder(self, background=BG, width=2.0)
+        self.bind("<Configure>", self._schedule_native_shape, add="+")
         self.bind("<Map>", self._on_map, add="+")
         self.bind("<Control-Return>", self._start_deobfuscation, add="+")
 
         self.logger.info("Protez %s initialized", VERSION)
         self.logger.info("Loading fonts...")
-        self.display_family, self.body_family = self._load_fonts()
-        self.title_font = ctk.CTkFont(
-            family=self.display_family,
-            size=10,
-            weight="normal",
-        )
-        self.body_font = ctk.CTkFont(family=self.body_family, size=17)
-        self.code_font = ctk.CTkFont(family=self.body_family, size=18)
+        self.display_family, self.pixel_body_family = self._load_fonts()
+        self.body_family, self.code_family = self._readable_font_families()
+        self.title_font = ctk.CTkFont(family=self.display_family, size=13, weight="normal")
+        self.body_font = ctk.CTkFont(family=self.body_family, size=12)
+        self.code_font = ctk.CTkFont(family=self.code_family, size=13)
+        self.log_font = ctk.CTkFont(family=self.code_family, size=11)
 
         self._build_layout()
         self._enable_drag_and_drop()
+        self.after(35, self._apply_native_shape)
+        self.after(20, lambda: self._fade_in(0))
         self.after(60, self._poll_ui_events)
         self.logger.info("Ready. Paste source, a code link, or choose a file.")
 
@@ -84,7 +96,7 @@ class ProtezApp(ctk.CTk):
         except Exception:
             screen_width, screen_height = width, height
         x = max(0, (screen_width - width) // 2)
-        y = max(0, (screen_height - height) // 2 - 24)
+        y = max(0, (screen_height - height) // 2 - 20)
         return f"{width}x{height}+{x}+{y}"
 
     def _configure_logger(self) -> None:
@@ -103,7 +115,6 @@ class ProtezApp(ctk.CTk):
             available = {family.lower(): family for family in tkfont.families(self)}
         except Exception:
             available = {}
-
         fallback = next(
             (
                 available[name]
@@ -118,26 +129,22 @@ class ProtezApp(ctk.CTk):
         windows_load_font = getattr(manager, "windows_load_font", None)
         font_specs = (
             ("PressStart2P-Regular.ttf", "Press Start 2P", "display"),
-            ("VT323-Regular.ttf", "VT323", "body"),
+            ("VT323-Regular.ttf", "VT323", "pixel_body"),
         )
 
         for filename, expected_family, role in font_specs:
             font_path = FONTS_DIR / filename
             if not font_path.is_file():
-                self.logger.warning("Font not found: %s; using a system monospace font", filename)
+                self.logger.warning("Font not found: %s; using a readable system font", filename)
                 continue
             try:
                 loaded = False
                 if sys.platform.startswith("win"):
-                    # CustomTkinter's default Windows loader marks private fonts
-                    # non-enumerable; Tk then silently substitutes another font.
+                    # FR_NOT_ENUM in CustomTkinter's default loader made Tk silently
+                    # substitute another font even though registration succeeded.
                     if callable(windows_load_font):
                         loaded = bool(
-                            windows_load_font(
-                                str(font_path),
-                                private=True,
-                                enumerable=True,
-                            )
+                            windows_load_font(str(font_path), private=True, enumerable=True)
                         )
                     if not loaded:
                         from ctypes import byref, create_unicode_buffer, windll
@@ -157,30 +164,44 @@ class ProtezApp(ctk.CTk):
                     available = {}
                 matched = available.get(expected_family.lower())
                 if matched is None:
-                    # Tk can use a registered family before it appears in the
-                    # cached family list on some Windows/Tk combinations.
                     probe = tkfont.Font(self, family=expected_family, size=12)
-                    actual_family = str(probe.actual("family"))
-                    if actual_family.lower() == expected_family.lower():
-                        matched = actual_family
+                    actual = str(probe.actual("family"))
+                    if actual.lower() == expected_family.lower():
+                        matched = actual
                 if matched:
                     loaded_families[role] = matched
                     self.logger.info("Loaded pixel font: %s", matched)
                 else:
-                    self.logger.warning(
-                        "Registered %s but Tk could not select it; using a system fallback",
-                        filename,
-                    )
+                    self.logger.warning("Tk could not select %s; using a system font", filename)
             except Exception as exc:
                 self.logger.warning("Could not load font %s: %s", filename, exc)
 
         display_family = loaded_families.get("display", fallback)
-        body_family = loaded_families.get("body", fallback)
+        pixel_body_family = loaded_families.get("pixel_body", fallback)
         if len(loaded_families) == len(font_specs):
             self.logger.info("Pixel fonts ready")
         else:
-            self.logger.warning("One or more pixel fonts are unavailable; using a system fallback")
-        return display_family, body_family
+            self.logger.warning("One or more pixel fonts are unavailable; using system fallbacks")
+        return display_family, pixel_body_family
+
+    def _readable_font_families(self) -> tuple[str, str]:
+        try:
+            available = {family.lower(): family for family in tkfont.families(self)}
+        except Exception:
+            available = {}
+        body = next(
+            (available[name] for name in ("segoe ui", "arial", "tahoma") if name in available),
+            "Segoe UI",
+        )
+        code = next(
+            (
+                available[name]
+                for name in ("cascadia mono", "consolas", "courier new", "tkfixedfont")
+                if name in available
+            ),
+            "Consolas",
+        )
+        return body, code
 
     def _build_layout(self) -> None:
         self.grid_columnconfigure(0, weight=1)
@@ -188,68 +209,74 @@ class ProtezApp(ctk.CTk):
 
         title_bar = ctk.CTkFrame(
             self,
-            fg_color=BG,
-            corner_radius=0,
-            border_width=1,
-            border_color=BORDER,
-            height=36,
+            fg_color=PANEL,
+            corner_radius=15,
+            border_width=0,
+            height=48,
         )
-        title_bar.grid(row=0, column=0, sticky="ew")
+        title_bar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 0))
         title_bar.grid_propagate(False)
-        title_bar.grid_columnconfigure(0, weight=1)
+        title_bar.grid_columnconfigure(1, weight=1)
+        title_bar.grid_rowconfigure(0, weight=1)
 
-        heading = ctk.CTkFrame(title_bar, fg_color=BG, corner_radius=0)
-        heading.grid(row=0, column=0, sticky="nsew", padx=(12, 4))
+        self.logo = ProtezLogo(title_bar, size=36, background=PANEL)
+        self.logo.grid(row=0, column=0, sticky="w", padx=(9, 10), pady=5)
         self.title_text = ctk.CTkLabel(
-            heading,
+            title_bar,
             text="PROTEZ",
             text_color=TEXT,
             font=self.title_font,
             anchor="w",
         )
-        self.title_text.grid(row=0, column=0, sticky="w")
+        self.title_text.grid(row=0, column=1, sticky="w")
 
-        window_buttons = ctk.CTkFrame(title_bar, fg_color=BG, corner_radius=0)
-        window_buttons.grid(row=0, column=1, sticky="e", padx=(4, 6), pady=4)
-        button_font = ctk.CTkFont(family=self.body_family, size=18)
-        button_style = {
-            "accent": TEXT,
-            "base_bg": BG,
-            "base_text": TEXT,
-            "width": 27,
-            "height": 25,
-            "font": button_font,
-        }
-        self.minimize_button = TerminalButton(
+        window_buttons = ctk.CTkFrame(title_bar, fg_color="transparent", corner_radius=0)
+        window_buttons.grid(row=0, column=2, sticky="e", padx=(4, 8), pady=5)
+        self.minimize_button = ctk.CTkButton(
             window_buttons,
-            text="—",
+            text="−",
             command=self._minimize_window,
-            **button_style,
+            width=32,
+            height=31,
+            corner_radius=10,
+            border_width=0,
+            fg_color="transparent",
+            hover_color="#272a31",
+            text_color=MUTED,
+            font=ctk.CTkFont(family=self.body_family, size=18),
         )
-        self.minimize_button.grid(row=0, column=0, padx=(0, 3))
-        self.close_button = TerminalButton(
+        self.minimize_button.grid(row=0, column=0, padx=(0, 2))
+        self.close_button = ctk.CTkButton(
             window_buttons,
             text="×",
             command=self._on_close,
-            **button_style,
+            width=32,
+            height=31,
+            corner_radius=10,
+            border_width=0,
+            fg_color="transparent",
+            hover_color="#37232b",
+            text_color=TEXT,
+            font=ctk.CTkFont(family=self.body_family, size=18),
         )
-        self.close_button.grid(row=0, column=1, padx=(3, 0))
+        self.close_button.grid(row=0, column=1, padx=(2, 0))
 
-        for widget in (title_bar, heading, self.title_text):
+        for widget in (title_bar, self.logo, self.title_text):
             widget.bind("<ButtonPress-1>", self._begin_window_drag, add="+")
             widget.bind("<B1-Motion>", self._drag_window, add="+")
 
         content = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
-        content.grid(row=1, column=0, sticky="nsew", padx=10, pady=(8, 9))
+        content.grid(row=1, column=0, sticky="nsew", padx=9, pady=(8, 9))
         content.grid_columnconfigure(0, weight=1)
-        content.grid_rowconfigure(0, weight=7, minsize=235)
-        content.grid_rowconfigure(1, weight=0, minsize=47)
-        content.grid_rowconfigure(2, weight=2, minsize=83)
+        content.grid_rowconfigure(0, weight=7, minsize=244)
+        content.grid_rowconfigure(1, weight=0, minsize=56)
+        content.grid_rowconfigure(2, weight=2, minsize=104)
 
         self.input_panel = InputPanel(
             content,
             title_font=self.title_font,
-            body_font=self.code_font,
+            body_font=self.body_font,
+            code_font=self.code_font,
         )
         self.input_panel.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
 
@@ -261,21 +288,119 @@ class ProtezApp(ctk.CTk):
         )
         self.controls.grid(row=1, column=0, sticky="ew", pady=(0, 8))
 
-        self.log_panel = LogPanel(content, self.log_records, self.body_font)
+        self.log_panel = LogPanel(
+            content,
+            self.log_records,
+            self.body_font,
+            log_font=self.log_font,
+        )
         self.log_panel.grid(row=2, column=0, sticky="nsew")
 
         self.resize_grip = ctk.CTkLabel(
             self,
             text="◢",
-            width=12,
-            height=12,
+            width=13,
+            height=13,
             text_color=MUTED,
             fg_color=BG,
-            font=ctk.CTkFont(family=self.body_family, size=11),
+            font=ctk.CTkFont(family=self.body_family, size=12),
         )
         self.resize_grip.place(relx=1, rely=1, anchor="se")
         self.resize_grip.bind("<ButtonPress-1>", self._begin_resize)
         self.resize_grip.bind("<B1-Motion>", self._resize_window)
+
+    def _schedule_native_shape(self, _event=None) -> None:
+        if sys.platform != "win32" or self._shape_pending or self._closing:
+            return
+        self._shape_pending = True
+        try:
+            self.after_idle(self._apply_native_shape)
+        except Exception:
+            self._shape_pending = False
+
+    def _apply_native_shape(self) -> None:
+        self._shape_pending = False
+        if sys.platform != "win32" or self._closing:
+            return
+        try:
+            import ctypes
+            import ctypes.wintypes
+            from ctypes import byref, sizeof
+
+            hwnd = ctypes.c_void_p(self.winfo_id())
+            user32 = ctypes.windll.user32
+            user32.GetWindowRect.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.wintypes.RECT),
+            ]
+            user32.GetWindowRect.restype = ctypes.c_int
+            rect = ctypes.wintypes.RECT()
+            if user32.GetWindowRect(hwnd, byref(rect)):
+                width = max(1, rect.right - rect.left)
+                height = max(1, rect.bottom - rect.top)
+            else:
+                width = max(1, self.winfo_width())
+                height = max(1, self.winfo_height())
+            gdi = ctypes.windll.gdi32
+            gdi.CreateRoundRectRgn.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            gdi.CreateRoundRectRgn.restype = ctypes.c_void_p
+            gdi.SetWindowRgn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+            gdi.SetWindowRgn.restype = ctypes.c_int
+            gdi.DeleteObject.argtypes = [ctypes.c_void_p]
+            region = gdi.CreateRoundRectRgn(0, 0, width + 1, height + 1, 38, 38)
+            if not region:
+                return
+            if not gdi.SetWindowRgn(hwnd, region, 1):
+                gdi.DeleteObject(region)
+
+            # Disable the bright system accent edge; the app draws its own gradient.
+            dwm = ctypes.windll.dwmapi
+            dwm.DwmSetWindowAttribute.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_void_p,
+                ctypes.c_uint,
+            ]
+            border_color = ctypes.c_int(0xFFFFFFFE)  # DWMWA_COLOR_NONE
+            corner_preference = ctypes.c_int(2)  # DWMWCP_ROUND
+            dwm.DwmSetWindowAttribute(hwnd, 34, byref(border_color), sizeof(border_color))
+            dwm.DwmSetWindowAttribute(hwnd, 33, byref(corner_preference), sizeof(corner_preference))
+        except Exception:
+            # Other Windows versions and non-DWM window managers still retain
+            # rounded panels and the animated Canvas outline.
+            return
+
+    def _fade_in(self, frame: int) -> None:
+        if self._closed or self._closing:
+            return
+        if not self._fade_supported:
+            return
+        progress = min(1.0, frame / 12)
+        opacity = 1.0 - (1.0 - progress) ** 3
+        try:
+            self.attributes("-alpha", opacity)
+        except Exception:
+            self._fade_supported = False
+            return
+        if frame < 12:
+            self.after(18, lambda: self._fade_in(frame + 1))
+
+    def _fade_out(self, frame: int = 0) -> None:
+        if not self._fade_supported or frame >= 8:
+            self._finish_close()
+            return
+        try:
+            self.attributes("-alpha", max(0.0, 1.0 - (frame + 1) / 8))
+            self.after(16, lambda: self._fade_out(frame + 1))
+        except Exception:
+            self._finish_close()
 
     def _begin_window_drag(self, event) -> None:
         self._drag_offset = (event.x_root - self.winfo_x(), event.y_root - self.winfo_y())
@@ -317,6 +442,7 @@ class ProtezApp(ctk.CTk):
         if self._restore_chrome_after_map and self.state() == "normal":
             self._restore_chrome_after_map = False
             self.after_idle(lambda: self.overrideredirect(True))
+            self.after(80, self._apply_native_shape)
 
     def _enable_drag_and_drop(self) -> None:
         if TkinterDnD is None or DND_FILES is None:
@@ -331,35 +457,36 @@ class ProtezApp(ctk.CTk):
             self.logger.warning("Drag-and-drop unavailable; BROWSE remains active: %s", exc)
 
     def _start_deobfuscation(self, _event=None) -> str:
-        if self.controls.busy:
+        if self._closing or self._closed or self.controls.busy:
             return "break"
-        source = self.input_panel.get_script()
-        if not source.strip():
-            self.logger.warning("No source or code link was provided")
-            self.controls.set_status("PASTE SOURCE OR URL")
-            return "break"
+        try:
+            source = self.input_panel.get_script()
+            if not source.strip():
+                self.logger.warning("No source or code link was provided")
+                self.controls.set_status("PASTE SOURCE OR URL")
+                return "break"
 
-        source_path = self.input_panel.file_path
-        source_name = source_path.name if source_path else "pasted input"
-        self.logger.info("Started source processing")
-        self.controls.set_busy(True)
-        self.controls.set_progress(0, "STARTING")
-        self._worker = threading.Thread(
-            target=self._run_pipeline,
-            args=(source, source_name),
-            name="protez-deobfuscation",
-            daemon=True,
-        )
-        self._worker.start()
+            source_path = self.input_panel.file_path
+            source_name = source_path.name if source_path else "pasted input"
+            self.logger.info("Started source processing")
+            self.controls.set_busy(True)
+            self.controls.set_progress(0, "STARTING")
+            self._worker = threading.Thread(
+                target=self._run_pipeline,
+                args=(source, source_name),
+                name="protez-deobfuscation",
+                daemon=True,
+            )
+            self._worker.start()
+        except Exception:
+            self.logger.exception("The DESTROY action could not start")
+            self.controls.set_busy(False)
+            self.controls.set_status("COULD NOT START · SEE ACTIVITY", error=True)
         return "break"
 
     def _run_pipeline(self, source: str, source_name: str) -> None:
         try:
-            resolved = resolve_source_input(
-                source,
-                source_name=source_name,
-                logger=self.logger,
-            )
+            resolved = resolve_source_input(source, source_name=source_name, logger=self.logger)
             if resolved.fetched_urls:
                 self.ui_events.put(("progress", 3, "FETCHED"))
             pipeline = DeobfuscationPipeline(
@@ -383,7 +510,7 @@ class ProtezApp(ctk.CTk):
             self.ui_events.put(("finished",))
 
     def _poll_ui_events(self) -> None:
-        if self._closed:
+        if self._closed or self._closing:
             return
         for _ in range(200):
             try:
@@ -395,7 +522,6 @@ class ProtezApp(ctk.CTk):
                     self.controls.set_progress(event[1], event[2])
                 elif event[0] == "output":
                     path = Path(event[1])
-                    self._last_output_path = path
                     self.controls.set_progress(100, "DONE")
                     try:
                         self._open_result(path)
@@ -415,18 +541,14 @@ class ProtezApp(ctk.CTk):
     def _open_result(self, path: Path) -> None:
         if not path.is_file():
             raise FileNotFoundError(f"Result file not found: {path}")
-
         system = platform.system().lower()
         if system == "windows":
             system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
-            editor_candidates = (
-                system_root / "System32" / "notepad.exe",
-                Path(shutil.which("notepad.exe") or ""),
-            )
-            editor = next(
-                (candidate for candidate in editor_candidates if candidate.is_file()),
-                None,
-            )
+            candidates = [system_root / "System32" / "notepad.exe"]
+            located = shutil.which("notepad.exe")
+            if located:
+                candidates.append(Path(located))
+            editor = next((candidate for candidate in candidates if candidate.is_file()), None)
             if editor is not None:
                 subprocess.Popen(
                     [str(editor), str(path)],
@@ -519,7 +641,7 @@ class ProtezApp(ctk.CTk):
             window,
             text=details,
             text_color=MUTED,
-            font=ctk.CTkFont(family=self.body_family, size=13),
+            font=ctk.CTkFont(family=self.body_family, size=11),
             anchor="w",
             wraplength=640,
         ).grid(row=2, column=0, sticky="ew", padx=12, pady=(3, 10))
@@ -527,14 +649,19 @@ class ProtezApp(ctk.CTk):
         window.focus_force()
 
     def _on_close(self) -> None:
-        if self._closed:
+        if self._closed or self._closing:
             return
+        self._closing = True
+        self._fade_out()
+
+    def _finish_close(self) -> None:
         self._closed = True
         try:
             self.logger.removeHandler(self._queue_handler)
         except Exception:
             pass
         try:
+            self._animated_border.close()
             self.destroy()
         except Exception:
             traceback.print_exc()

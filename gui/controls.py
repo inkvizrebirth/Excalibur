@@ -1,30 +1,33 @@
 from __future__ import annotations
 
+import logging
+
 import customtkinter as ctk
 
-from gui.theme import BG, BORDER, ERROR, MUTED, NEON, PANEL, RED_BG, TerminalButton
+from gui.theme import ACCENT, BG, BORDER, ERROR, MUTED, NEON, PANEL, RED_BG
 
 
 class Controls(ctk.CTkFrame):
-    """One primary action and a compact activity/progress readout."""
+    """Primary run action with visible state and a compact progress meter."""
 
     def __init__(self, master, *, title_font, body_font, on_destroy):
         super().__init__(master, fg_color="transparent", corner_radius=0)
-        self._body_font = body_font
         self._busy = False
+        self._on_destroy = on_destroy
+        self._logger = logging.getLogger("protez")
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_columnconfigure(1, minsize=132)
+        self.grid_columnconfigure(1, minsize=144)
         self.grid_rowconfigure(0, weight=1)
 
         activity = ctk.CTkFrame(
             self,
             fg_color=PANEL,
-            corner_radius=6,
+            corner_radius=12,
             border_width=1,
             border_color=BORDER,
         )
-        activity.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        activity.grid(row=0, column=0, sticky="nsew", padx=(0, 9))
         activity.grid_columnconfigure(0, weight=1)
         activity.grid_rowconfigure(1, weight=1)
 
@@ -32,31 +35,34 @@ class Controls(ctk.CTkFrame):
             activity,
             text="READY",
             text_color=MUTED,
-            font=ctk.CTkFont(family=body_font.cget("family"), size=14),
+            font=ctk.CTkFont(family=body_font.cget("family"), size=12, weight="bold"),
             anchor="w",
         )
-        self.progress_label.grid(row=0, column=0, sticky="ew", padx=9, pady=(4, 1))
+        self.progress_label.grid(row=0, column=0, sticky="ew", padx=12, pady=(5, 2))
         self.progress = ctk.CTkProgressBar(
             activity,
-            height=4,
-            corner_radius=2,
+            height=5,
+            corner_radius=3,
             border_width=0,
             fg_color=BG,
-            progress_color=NEON,
+            progress_color=ACCENT,
         )
-        self.progress.grid(row=1, column=0, sticky="ew", padx=9, pady=(0, 7))
+        self.progress.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
         self.progress.set(0)
 
-        self.destroy_button = TerminalButton(
+        self.destroy_button = ctk.CTkButton(
             self,
             text="DESTROY",
-            command=on_destroy,
-            accent=ERROR,
-            base_bg=RED_BG,
-            base_text=ERROR,
-            width=124,
-            height=43,
-            font=ctk.CTkFont(family=title_font.cget("family"), size=8),
+            command=self._activate,
+            width=136,
+            height=48,
+            corner_radius=13,
+            border_width=0,
+            fg_color=RED_BG,
+            hover_color="#dce4f0",
+            text_color="#090a0d",
+            font=ctk.CTkFont(family=body_font.cget("family"), size=12, weight="bold"),
+            state="normal",
         )
         self.destroy_button.grid(row=0, column=1, sticky="nsew")
 
@@ -64,10 +70,24 @@ class Controls(ctk.CTkFrame):
     def busy(self) -> bool:
         return self._busy
 
+    def _activate(self) -> None:
+        if self._busy:
+            return
+        self._logger.info("DESTROY action clicked")
+        try:
+            self._on_destroy()
+        except Exception:
+            self._logger.exception("The DESTROY action could not be started")
+            self.set_status("COULD NOT START · SEE ACTIVITY", error=True)
+
     def set_busy(self, busy: bool) -> None:
         self._busy = busy
-        self.destroy_button.configure(text="WORKING..." if busy else "DESTROY")
-        self.destroy_button.set_enabled(not busy)
+        self.destroy_button.configure(
+            text="PROCESSING…" if busy else "DESTROY",
+            state="disabled" if busy else "normal",
+            fg_color="#2a2d34" if busy else RED_BG,
+            text_color=MUTED if busy else "#090a0d",
+        )
 
     def set_progress(self, percent: float, label: str = "WORKING") -> None:
         value = max(0.0, min(100.0, float(percent)))
@@ -77,5 +97,5 @@ class Controls(ctk.CTkFrame):
     def set_status(self, text: str, *, error: bool = False) -> None:
         self.progress_label.configure(
             text=str(text).upper()[:72],
-            text_color=ERROR if error else MUTED,
+            text_color=ERROR if error else NEON,
         )

@@ -15,72 +15,72 @@ _DIRECT_URL = re.compile(r"(?i)^\s*<?https?://\S+>?\s*$")
 
 
 class InputPanel(ctk.CTkFrame):
-    def __init__(self, master, *, title_font, body_font):
+    def __init__(self, master, *, title_font, body_font, code_font=None):
         super().__init__(
             master,
-            corner_radius=7,
+            corner_radius=13,
             border_width=1,
             border_color=BORDER,
             fg_color=PANEL,
         )
-        self._title_font = title_font
-        self._body_font = body_font
         self._active_tab = "paste"
         self._file_path: Path | None = None
         self._file_content = ""
         self._drop_enabled = False
+        self._body_font = body_font
+        self._code_font = code_font or body_font
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
-        header = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=32)
-        header.grid(row=0, column=0, sticky="ew", padx=11, pady=(5, 3))
+        header = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=0, height=40)
+        header.grid(row=0, column=0, sticky="ew", padx=13, pady=(7, 4))
         header.grid_propagate(False)
         header.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             header,
             text="SOURCE",
             text_color=NEON,
-            font=title_font,
+            font=ctk.CTkFont(family=body_font.cget("family"), size=12, weight="bold"),
             anchor="w",
         ).grid(row=0, column=0, sticky="w")
 
         tabs = ctk.CTkFrame(header, fg_color=PANEL, corner_radius=0)
         tabs.grid(row=0, column=1, sticky="e")
-        tab_font = ctk.CTkFont(family=title_font.cget("family"), size=7)
+        tab_font = ctk.CTkFont(family=body_font.cget("family"), size=10, weight="bold")
         self.paste_tab = TerminalButton(
             tabs,
             text="PASTE",
             command=lambda: self._select_tab("paste"),
             accent=NEON,
             base_bg=BG,
-            width=64,
-            height=23,
+            width=74,
+            height=28,
             font=tab_font,
         )
-        self.paste_tab.grid(row=0, column=0, padx=(0, 4))
+        self.paste_tab.grid(row=0, column=0, padx=(0, 5))
         self.file_tab = TerminalButton(
             tabs,
             text="FILE",
             command=lambda: self._select_tab("file"),
             accent=NEON,
             base_bg=BG,
-            width=54,
-            height=23,
+            width=60,
+            height=28,
             font=tab_font,
         )
         self.file_tab.grid(row=0, column=1)
         self.paste_tab.set_active(True)
 
         self.content = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
-        self.content.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 3))
+        self.content.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 4))
         self.content.grid_columnconfigure(0, weight=1)
         self.content.grid_rowconfigure(0, weight=1)
 
         self.paste_view = ctk.CTkFrame(
             self.content,
             fg_color=INPUT_BG,
-            corner_radius=5,
+            corner_radius=10,
             border_width=1,
             border_color=BORDER,
         )
@@ -89,16 +89,18 @@ class InputPanel(ctk.CTkFrame):
         self.paste_view.grid_rowconfigure(0, weight=1)
         self.textbox = ctk.CTkTextbox(
             self.paste_view,
-            corner_radius=4,
+            width=360,
+            height=180,
+            corner_radius=8,
             border_width=0,
             fg_color=INPUT_BG,
             text_color=TEXT,
-            font=body_font,
+            font=self._code_font,
             wrap="none",
             activate_scrollbars=True,
             undo=True,
         )
-        self.textbox.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        self.textbox.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         self.textbox.bind("<KeyRelease>", self._update_status)
         self.textbox.bind("<<Paste>>", self._update_status_after_idle)
         self.textbox.bind("<<Cut>>", self._update_status_after_idle)
@@ -106,7 +108,7 @@ class InputPanel(ctk.CTkFrame):
         self.file_view = ctk.CTkFrame(
             self.content,
             fg_color=INPUT_BG,
-            corner_radius=5,
+            corner_radius=10,
             border_width=1,
             border_color=BORDER,
         )
@@ -116,42 +118,46 @@ class InputPanel(ctk.CTkFrame):
         self.drop_zone = ctk.CTkFrame(
             self.file_view,
             fg_color=INPUT_BG,
-            corner_radius=5,
+            corner_radius=10,
             border_width=1,
-            border_color=NEON,
+            border_color="#414651",
         )
-        self.drop_zone.grid(row=0, column=0, sticky="nsew", padx=12, pady=10)
+        self.drop_zone.grid(row=0, column=0, sticky="nsew", padx=14, pady=12)
         self.drop_zone.grid_columnconfigure(0, weight=1)
         self.drop_zone.grid_rowconfigure(0, weight=1)
         self.drop_label = ctk.CTkLabel(
             self.drop_zone,
             text="DROP A SCRIPT HERE\nOR BROWSE FOR A FILE",
             text_color=MUTED,
-            font=body_font,
+            font=ctk.CTkFont(family=body_font.cget("family"), size=13),
             justify="center",
         )
-        self.drop_label.grid(row=0, column=0, sticky="nsew", padx=10, pady=(8, 3))
-        self.browse_button = TerminalButton(
+        self.drop_label.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 4))
+        self.browse_button = ctk.CTkButton(
             self.drop_zone,
             text="BROWSE",
             command=self._browse_file,
-            accent=NEON,
-            base_bg=BG,
-            width=104,
-            height=30,
+            width=112,
+            height=34,
+            corner_radius=10,
+            border_width=1,
+            border_color=BORDER,
+            fg_color="#17191e",
+            hover_color="#252932",
+            text_color=TEXT,
             font=tab_font,
         )
-        self.browse_button.grid(row=1, column=0, pady=(2, 9))
+        self.browse_button.grid(row=1, column=0, pady=(3, 12))
         self.file_view.grid_remove()
 
         self.status = ctk.CTkLabel(
             self,
             text="READY · PASTE SOURCE OR URL",
             text_color=MUTED,
-            font=ctk.CTkFont(family=body_font.cget("family"), size=14),
+            font=ctk.CTkFont(family=body_font.cget("family"), size=11, weight="bold"),
             anchor="w",
         )
-        self.status.grid(row=2, column=0, sticky="ew", padx=11, pady=(0, 4))
+        self.status.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 7))
 
     @property
     def file_path(self) -> Path | None:

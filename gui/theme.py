@@ -2,22 +2,24 @@ from __future__ import annotations
 
 import customtkinter as ctk
 
-# Quiet monochrome surfaces keep the compact UI focused on the source editor.
-BG = "#080808"
-PANEL = "#101010"
-INPUT_BG = "#050505"
-BORDER = "#292929"
-NEON = "#f5f5f5"
+# Near-black surfaces with restrained icy accents. The animated outline carries
+# the color; controls and code remain high-contrast and calm.
+BG = "#08090b"
+PANEL = "#111318"
+INPUT_BG = "#07080a"
+BORDER = "#282c34"
+NEON = "#f5f7fb"
 ACID = "#ffffff"
-TEXT = "#ededed"
-MUTED = "#888888"
-WARN = "#c6c6c6"
-ERROR = "#ffffff"
-RED_BG = "#181818"
+TEXT = "#f7f8fc"
+MUTED = "#a7adba"
+WARN = "#f4cb7a"
+ERROR = "#ff8792"
+RED_BG = "#f2f4f8"
+ACCENT = "#a4eaff"
 
 
 class TerminalButton(ctk.CTkButton):
-    """Monochrome button with a crisp inverse hover state."""
+    """Rounded monochrome utility button with a clear inverse hover state."""
 
     def __init__(
         self,
@@ -36,9 +38,9 @@ class TerminalButton(ctk.CTkButton):
         self._enabled = True
         super().__init__(
             master,
-            corner_radius=5,
+            corner_radius=10,
             border_width=1,
-            border_color=accent,
+            border_color=BORDER if not active else accent,
             fg_color=accent if active else base_bg,
             text_color=BG if active else self._base_text,
             hover=False,
@@ -52,17 +54,16 @@ class TerminalButton(ctk.CTkButton):
         if not self._enabled:
             background = self._base_bg
             foreground = MUTED
+            border = BORDER
         elif self._active or hover:
             background = self._accent
             foreground = BG
+            border = self._accent
         else:
             background = self._base_bg
             foreground = self._base_text
-        self.configure(
-            fg_color=background,
-            text_color=foreground,
-            border_color=self._accent,
-        )
+            border = BORDER
+        self.configure(fg_color=background, text_color=foreground, border_color=border)
 
     def _on_enter(self, _event=None) -> None:
         if self._enabled:
