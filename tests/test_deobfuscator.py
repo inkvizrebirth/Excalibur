@@ -78,6 +78,67 @@ class DeobfuscatorTests(unittest.TestCase):
         oversized = 'local value = string.rep("x", 40000)'
         self.assertEqual(deobfuscate_source(oversized).source, oversized)
 
+    def test_propagates_immutable_constants_and_decoder_aliases(self) -> None:
+        source = 'local code = 65; local chr = string.char; local value = chr(code); return value'
+        result = deobfuscate_source(source)
+        self.assertEqual(
+            result.source,
+            'local code = 65; local chr = string.char; local value = "A"; return "A"',
+        )
+        self.assertTrue(any("immutable local/API propagation" in item for item in result.transformations))
+
+    def test_propagation_respects_writes_shadowing_and_lexical_scopes(self) -> None:
+        reassigned = 'local value = 1; value = 2; return value'
+        shadowed = 'local value = 1; do local value = 2; print(value) end; return value'
+        scoped = 'do local value = 1; print(value) end; return value'
+        self.assertEqual(deobfuscate_source(reassigned).source, reassigned)
+        self.assertEqual(deobfuscate_source(shadowed).source, shadowed)
+        self.assertEqual(
+            deobfuscate_source(scoped).source,
+            'do local value = 1; print(1) end; return value',
+        )
+
+    def test_folds_read_only_numeric_and_keyed_tables(self) -> None:
+        source = 'local bytes = {[1] = 72, [2] = 105}; return string.char(bytes[1], bytes[2])'
+        self.assertEqual(deobfuscate_source(source).source, 'local bytes = {[1] = 72, [2] = 105}; return "Hi"')
+        table_concat = 'local values = {"H", "i"}; return table.concat(values)'
+        self.assertEqual(deobfuscate_source(table_concat).source, 'local values = {"H", "i"}; return "Hi"')
+        fields = 'local record = {message = "ready"}; return record.message'
+        self.assertEqual(deobfuscate_source(fields).source, 'local record = {message = "ready"}; return "ready"')
+
+    def test_expands_multi_return_byte_and_unpack_only_in_final_call_argument(self) -> None:
+        byte_range = 'local value = string.char(string.byte("OK", 1, 2))'
+        self.assertEqual(deobfuscate_source(byte_range).source, 'local value = "OK"')
+        unpack = 'local bytes = {79, 75}; local value = string.char(table.unpack(bytes))'
+        self.assertEqual(
+            deobfuscate_source(unpack).source,
+            'local bytes = {79, 75}; local value = "OK"',
+        )
+        multiple = 'local first, second = string.byte("OK", 1, 2)'
+        self.assertEqual(deobfuscate_source(multiple).source, multiple)
+
+    def test_decodes_more_local_encodings_and_math(self) -> None:
+        base64 = 'local decode = crypt.base64decode; local value = decode("SGk")'
+        self.assertEqual(deobfuscate_source(base64).source, 'local decode = crypt.base64decode; local value = "Hi"')
+        formatted = 'local value = string.format("%02X-%s", 65, "A")'
+        self.assertEqual(deobfuscate_source(formatted).source, 'local value = "41-A"')
+        bitwise = 'local value = bit32.bxor(65, 1)'
+        self.assertEqual(deobfuscate_source(bitwise).source, 'local value = 64')
+        numeric = 'local value = math.floor(math.pi * 2)'
+        self.assertEqual(deobfuscate_source(numeric).source, 'local value = 6')
+
+    def test_folds_constant_short_circuit_without_evaluating_dead_branch(self) -> None:
+        source = 'local no = false and dynamic(); local yes = true or dynamic()'
+        self.assertEqual(deobfuscate_source(source).source, 'local no = false; local yes = true')
+
+    def test_preserves_call_parentheses_when_propagating_arguments(self) -> None:
+        source = 'local value = 7; print(value); return (value)'
+        self.assertEqual(deobfuscate_source(source).source, 'local value = 7; print(7); return (7)')
+
+    def test_does_not_propagate_through_luau_if_expressions(self) -> None:
+        source = 'local value = if flag then 1 else 2; return value'
+        self.assertEqual(deobfuscate_source(source).source, source)
+
 
 if __name__ == "__main__":
     unittest.main()

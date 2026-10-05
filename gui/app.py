@@ -15,7 +15,7 @@ import customtkinter as ctk
 from tkinter import font as tkfont
 
 from core.pipeline import DeobfuscationPipeline, PipelineError
-from core.runtime_paths import FONTS_DIR, ICON_PATH
+from core.runtime_paths import ICON_PATH
 from core.source_input import SourceInputError, resolve_source_input
 from core.version import VERSION
 from gui.animated_border import AnimatedBorder
@@ -73,17 +73,16 @@ class ProtezApp(ctk.CTk):
         except Exception:
             self._fade_supported = False
 
-        # Draw the animated border first so the rounded UI panels sit above it.
+        # Draw the animated square outline first so UI panels sit above it.
         self._animated_border = AnimatedBorder(self, background=BG, width=2.0)
         self.bind("<Configure>", self._schedule_native_shape, add="+")
         self.bind("<Map>", self._on_map, add="+")
         self.bind("<Control-Return>", self._start_deobfuscation, add="+")
 
         self.logger.info("Protez %s initialized", VERSION)
-        self.logger.info("Loading fonts...")
-        self.display_family, self.pixel_body_family = self._load_fonts()
+        self.logger.info("Selecting crisp system fonts...")
         self.body_family, self.code_family = self._readable_font_families()
-        self.title_font = ctk.CTkFont(family=self.display_family, size=13, weight="normal")
+        self.title_font = ctk.CTkFont(family=self.body_family, size=14, weight="bold")
         self.body_font = ctk.CTkFont(family=self.body_family, size=12)
         self.code_font = ctk.CTkFont(family=self.code_family, size=13)
         self.log_font = ctk.CTkFont(family=self.code_family, size=11)
@@ -116,80 +115,6 @@ class ProtezApp(ctk.CTk):
         self.logger.addHandler(handler)
         self._queue_handler = handler
 
-    def _load_fonts(self) -> tuple[str, str]:
-        try:
-            available = {family.lower(): family for family in tkfont.families(self)}
-        except Exception:
-            available = {}
-        fallback = next(
-            (
-                available[name]
-                for name in ("dejavu sans mono", "courier new", "courier", "fixed")
-                if name in available
-            ),
-            "TkFixedFont",
-        )
-        loaded_families: dict[str, str] = {}
-        manager = getattr(ctk, "FontManager", None)
-        load_font = getattr(manager, "load_font", None)
-        windows_load_font = getattr(manager, "windows_load_font", None)
-        font_specs = (
-            ("PressStart2P-Regular.ttf", "Press Start 2P", "display"),
-            ("VT323-Regular.ttf", "VT323", "pixel_body"),
-        )
-
-        for filename, expected_family, role in font_specs:
-            font_path = FONTS_DIR / filename
-            if not font_path.is_file():
-                self.logger.warning("Font not found: %s; using a readable system font", filename)
-                continue
-            try:
-                loaded = False
-                if sys.platform.startswith("win"):
-                    # FR_NOT_ENUM in CustomTkinter's default loader made Tk silently
-                    # substitute another font even though registration succeeded.
-                    if callable(windows_load_font):
-                        loaded = bool(
-                            windows_load_font(str(font_path), private=True, enumerable=True)
-                        )
-                    if not loaded:
-                        from ctypes import byref, create_unicode_buffer, windll
-
-                        font_buffer = create_unicode_buffer(str(font_path))
-                        loaded = bool(
-                            windll.gdi32.AddFontResourceExW(byref(font_buffer), 0x10, 0)
-                        )
-                elif callable(load_font):
-                    loaded = bool(load_font(str(font_path)))
-                if not loaded:
-                    raise RuntimeError("the font manager could not register the font")
-
-                try:
-                    available = {family.lower(): family for family in tkfont.families(self)}
-                except Exception:
-                    available = {}
-                matched = available.get(expected_family.lower())
-                if matched is None:
-                    probe = tkfont.Font(self, family=expected_family, size=12)
-                    actual = str(probe.actual("family"))
-                    if actual.lower() == expected_family.lower():
-                        matched = actual
-                if matched:
-                    loaded_families[role] = matched
-                    self.logger.info("Loaded pixel font: %s", matched)
-                else:
-                    self.logger.warning("Tk could not select %s; using a system font", filename)
-            except Exception as exc:
-                self.logger.warning("Could not load font %s: %s", filename, exc)
-
-        display_family = loaded_families.get("display", fallback)
-        pixel_body_family = loaded_families.get("pixel_body", fallback)
-        if len(loaded_families) == len(font_specs):
-            self.logger.info("Pixel fonts ready")
-        else:
-            self.logger.warning("One or more pixel fonts are unavailable; using system fallbacks")
-        return display_family, pixel_body_family
-
     def _readable_font_families(self) -> tuple[str, str]:
         try:
             available = {family.lower(): family for family in tkfont.families(self)}
@@ -216,7 +141,7 @@ class ProtezApp(ctk.CTk):
         title_bar = ctk.CTkFrame(
             self,
             fg_color=PANEL,
-            corner_radius=12,
+            corner_radius=0,
             border_width=0,
             height=40,
         )
@@ -244,7 +169,7 @@ class ProtezApp(ctk.CTk):
             command=self._minimize_window,
             width=28,
             height=26,
-            corner_radius=8,
+            corner_radius=0,
             border_width=0,
             fg_color="transparent",
             hover_color="#272a31",
@@ -258,7 +183,7 @@ class ProtezApp(ctk.CTk):
             command=self._on_close,
             width=28,
             height=26,
-            corner_radius=8,
+            corner_radius=0,
             border_width=0,
             fg_color="transparent",
             hover_color="#37232b",
@@ -349,19 +274,17 @@ class ProtezApp(ctk.CTk):
                 width = max(1, self.winfo_width())
                 height = max(1, self.winfo_height())
             gdi = ctypes.windll.gdi32
-            gdi.CreateRoundRectRgn.argtypes = [
-                ctypes.c_int,
-                ctypes.c_int,
+            gdi.CreateRectRgn.argtypes = [
                 ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_int,
             ]
-            gdi.CreateRoundRectRgn.restype = ctypes.c_void_p
+            gdi.CreateRectRgn.restype = ctypes.c_void_p
             gdi.SetWindowRgn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
             gdi.SetWindowRgn.restype = ctypes.c_int
             gdi.DeleteObject.argtypes = [ctypes.c_void_p]
-            region = gdi.CreateRoundRectRgn(0, 0, width + 1, height + 1, 38, 38)
+            region = gdi.CreateRectRgn(0, 0, width + 1, height + 1)
             if not region:
                 return
             if not gdi.SetWindowRgn(hwnd, region, 1):
@@ -376,12 +299,11 @@ class ProtezApp(ctk.CTk):
                 ctypes.c_uint,
             ]
             border_color = ctypes.c_int(0xFFFFFFFE)  # DWMWA_COLOR_NONE
-            corner_preference = ctypes.c_int(2)  # DWMWCP_ROUND
+            corner_preference = ctypes.c_int(1)  # DWMWCP_DONOTROUND
             dwm.DwmSetWindowAttribute(hwnd, 34, byref(border_color), sizeof(border_color))
             dwm.DwmSetWindowAttribute(hwnd, 33, byref(corner_preference), sizeof(corner_preference))
         except Exception:
-            # Other Windows versions and non-DWM window managers still retain
-            # rounded panels and the animated Canvas outline.
+            # Older Windows versions still retain square Tk panels and outlines.
             return
 
     def _ensure_taskbar_presence(self, user32, hwnd, ctypes) -> None:
@@ -531,18 +453,26 @@ class ProtezApp(ctk.CTk):
             self.controls.set_status("COULD NOT START · SEE ACTIVITY", error=True)
         return "break"
 
-    def _run_pipeline(self, source: str, source_name: str) -> None:
+    def _run_pipeline(self, source: str | bytes, source_name: str) -> None:
         try:
-            resolved = resolve_source_input(source, source_name=source_name, logger=self.logger)
-            if resolved.fetched_urls:
-                self.ui_events.put(("progress", 3, "FETCHED"))
+            if isinstance(source, bytes):
+                resolved_source = source
+                resolved_name = source_name
+            else:
+                resolved = resolve_source_input(source, source_name=source_name, logger=self.logger)
+                if resolved.fetched_urls:
+                    self.ui_events.put(("progress", 3, "FETCHED"))
+                resolved_source = resolved.source
+                resolved_name = resolved.source_name
             pipeline = DeobfuscationPipeline(
                 logger=self.logger,
                 progress_callback=lambda percent, stage: self.ui_events.put(
                     ("progress", percent, stage)
                 ),
             )
-            result = pipeline.run(resolved.source, source_name=resolved.source_name)
+            result = pipeline.run(resolved_source, source_name=resolved_name)
+            if result.notice and result.status != "partial":
+                self.logger.warning("Result limitation: %s", result.notice)
             if result.status == "partial":
                 self.ui_events.put(("partial", str(result.output_path), result.notice))
             else:

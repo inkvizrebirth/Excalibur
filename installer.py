@@ -25,9 +25,9 @@ from typing import Any, BinaryIO
 from core.runtime_paths import (
     DATA_ROOT,
     ENVLOG_PATH,
-    FONTS_DIR,
     HOOKS_PATH,
     IS_FROZEN,
+    LICENSES_DIR,
     LOGS_DIR,
     OUTPUT_DIR,
     PACKAGED_TOOLS_DIR,
@@ -39,7 +39,7 @@ from core.version import VERSION
 ROOT = RESOURCE_ROOT
 REQUIREMENTS_FILE = ROOT / "requirements.txt"
 MARKER_FILE = DATA_ROOT / ".installed"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MIN_PYTHON = (3, 10)
 NATIVE_HOST_LUAU_TAG = "0.740"
 MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024
@@ -49,17 +49,6 @@ DISTRIBUTIONS = (
     "customtkinter",
     "tkinterdnd2",
 )
-
-FONT_URLS = {
-    "PressStart2P-Regular.ttf": (
-        "https://raw.githubusercontent.com/google/fonts/main/"
-        "ofl/pressstart2p/PressStart2P-Regular.ttf"
-    ),
-    "VT323-Regular.ttf": (
-        "https://raw.githubusercontent.com/google/fonts/main/"
-        "ofl/vt323/VT323-Regular.ttf"
-    ),
-}
 
 TOOL_NAMES = {
     "luau",
@@ -124,8 +113,7 @@ def ensure_directories() -> None:
     for path in (DATA_ROOT, LOGS_DIR, OUTPUT_DIR, TOOLS_DIR):
         path.mkdir(parents=True, exist_ok=True)
     if not IS_FROZEN:
-        for relative_path in ("assets/fonts", "assets/icons"):
-            (ROOT / relative_path).mkdir(parents=True, exist_ok=True)
+        (ROOT / "assets/icons").mkdir(parents=True, exist_ok=True)
 
 
 def _requirements_digest() -> str:
@@ -369,29 +357,6 @@ def _download_file(
         raise InstallationError(f"Download failed for {url}: {exc}") from exc
     finally:
         partial_path.unlink(missing_ok=True)
-
-
-def download_fonts() -> tuple[list[str], list[str]]:
-    fonts_dir = FONTS_DIR
-    available: list[str] = []
-    missing: list[str] = []
-
-    for filename, url in FONT_URLS.items():
-        destination = fonts_dir / filename
-        if destination.is_file() and destination.stat().st_size > 0:
-            available.append(filename)
-            continue
-        try:
-            _download_file(url, destination, max_bytes=20 * 1024 * 1024)
-            available.append(filename)
-            LOGGER.info("Downloaded font: %s", filename)
-        except InstallationError as exc:
-            missing.append(filename)
-            LOGGER.warning(
-                "%s. Install the font manually from %s", exc, url
-            )
-
-    return available, missing
 
 
 def _platform_tokens() -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -659,8 +624,6 @@ def build_native_host() -> bool:
 
 
 def _write_marker(
-    available_fonts: list[str],
-    missing_fonts: list[str],
     available_tools: list[str],
     missing_tools: list[str],
     native_host_available: bool,
@@ -671,8 +634,6 @@ def _write_marker(
         "python_version": platform.python_version(),
         "requirements_sha256": _requirements_digest(),
         "dependencies_installed": True,
-        "fonts_available": available_fonts,
-        "fonts_missing": missing_fonts,
         "luau_tools_available": available_tools,
         "luau_tools_missing": missing_tools,
         "native_host_available": native_host_available,
@@ -694,16 +655,9 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def verify_frozen_runtime() -> None:
-    if not IS_FROZEN:
-        return
-    ensure_directories()
-    for required in (ENVLOG_PATH, HOOKS_PATH):
-        if not required.is_file():
-            raise InstallationError(f"Bundled runtime resource is missing: {required.name}")
-
-    packaged = PACKAGED_TOOLS_DIR / _native_host_binary_path().name
-    installed = _native_host_binary_path()
+def _repair_packaged_binary(packaged: Path, installed: Path, *, label: str, required: bool) -> None:
+    if required and not packaged.is_file():
+        raise InstallationError(f"Bundled {label} is missing from the executable resources")
     if packaged.is_file():
         try:
             needs_repair = (
@@ -714,7 +668,7 @@ def verify_frozen_runtime() -> None:
         except OSError:
             needs_repair = True
         if needs_repair:
-            LOGGER.warning("Repairing missing or damaged native runtime from the built-in package")
+            LOGGER.warning("Repairing missing or damaged %s from the built-in package", label)
             temporary = installed.with_name(installed.name + ".repair")
             try:
                 shutil.copy2(packaged, temporary)
@@ -723,15 +677,16 @@ def verify_frozen_runtime() -> None:
                 os.replace(temporary, installed)
             except OSError as exc:
                 temporary.unlink(missing_ok=True)
-                raise InstallationError(f"Could not repair the native runtime: {exc}") from exc
+                raise InstallationError(f"Could not repair the bundled {label}: {exc}") from exc
     elif not installed.is_file():
-        raise InstallationError("The bundled Luau runtime is missing and cannot be repaired offline")
+        raise InstallationError(f"The bundled {label} is missing and cannot be repaired offline")
 
-    command = [str(installed), "--version"]
+
+def _run_version_check(binary: Path, *, expected: str, label: str) -> str:
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     try:
         result = subprocess.run(
-            command,
+            [str(binary), "--version"],
             cwd=DATA_ROOT,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -743,15 +698,48 @@ def verify_frozen_runtime() -> None:
             creationflags=creationflags,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise InstallationError(f"Could not validate the bundled Luau runtime: {exc}") from exc
+        raise InstallationError(f"Could not validate the bundled {label}: {exc}") from exc
     output = (result.stdout or "").strip()
-    if result.returncode != 0 or "Protez native Luau host" not in output:
+    if result.returncode != 0 or expected.lower() not in output.lower():
         raise InstallationError(
-            f"The bundled Luau runtime failed its health check (exit {result.returncode}): "
+            f"The bundled {label} failed its health check (exit {result.returncode}): "
             f"{output or 'no diagnostic output'}"
         )
-    LOGGER.info("Runtime check passed: %s", output)
-    LOGGER.info("No Python, CMake, or Luau CLI installation is required for this build")
+    LOGGER.info("%s check passed: %s", label.capitalize(), output)
+    return output
+
+
+def verify_frozen_runtime() -> None:
+    if not IS_FROZEN:
+        return
+    ensure_directories()
+    for required in (ENVLOG_PATH, HOOKS_PATH):
+        if not required.is_file():
+            raise InstallationError(f"Bundled runtime resource is missing: {required.name}")
+
+    host_name = _native_host_binary_path().name
+    host_path = _native_host_binary_path()
+    _repair_packaged_binary(
+        PACKAGED_TOOLS_DIR / host_name,
+        host_path,
+        label="native Luau host",
+        required=True,
+    )
+    decompiler_name = "luau-decompiler.exe" if os.name == "nt" else "luau-decompiler"
+    decompiler_path = TOOLS_DIR / decompiler_name
+    _repair_packaged_binary(
+        PACKAGED_TOOLS_DIR / decompiler_name,
+        decompiler_path,
+        label="offline Luau bytecode decompiler",
+        required=True,
+    )
+    license_file = LICENSES_DIR / "luau-decompiler-mit.txt"
+    if not license_file.is_file():
+        raise InstallationError("The bundled bytecode decompiler license notice is missing")
+
+    _run_version_check(host_path, expected="Protez native Luau host", label="Luau runtime")
+    _run_version_check(decompiler_path, expected="luau-decompiler", label="bytecode decompiler")
+    LOGGER.info("The executable includes its offline bytecode decompiler; no Rust install is required")
 
 
 def ensure_installed(*, force: bool = False) -> None:
@@ -769,7 +757,6 @@ def ensure_installed(*, force: bool = False) -> None:
         return
 
     install_dependencies()
-    available_fonts, missing_fonts = download_fonts()
     available_tools, missing_tools = download_luau_tools()
     native_host_available = build_native_host()
     if not native_host_available:
@@ -782,8 +769,6 @@ def ensure_installed(*, force: bool = False) -> None:
                 f"Missing: {missing_runtime}. Choose Repair again or check network access."
             )
     _write_marker(
-        available_fonts,
-        missing_fonts,
         available_tools,
         missing_tools,
         native_host_available,

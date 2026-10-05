@@ -23,7 +23,7 @@ class Controls(ctk.CTkFrame):
         activity = ctk.CTkFrame(
             self,
             fg_color=PANEL,
-            corner_radius=9,
+            corner_radius=0,
             border_width=1,
             border_color=BORDER,
         )
@@ -42,7 +42,7 @@ class Controls(ctk.CTkFrame):
         self.progress = ctk.CTkProgressBar(
             activity,
             height=4,
-            corner_radius=2,
+            corner_radius=0,
             border_width=0,
             fg_color=BG,
             progress_color=ACCENT,
@@ -56,7 +56,7 @@ class Controls(ctk.CTkFrame):
             command=self._activate,
             width=108,
             height=37,
-            corner_radius=10,
+            corner_radius=0,
             border_width=0,
             fg_color=RED_BG,
             hover_color="#dce4f0",

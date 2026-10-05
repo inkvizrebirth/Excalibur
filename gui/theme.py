@@ -19,7 +19,7 @@ ACCENT = "#a4eaff"
 
 
 class TerminalButton(ctk.CTkButton):
-    """Rounded monochrome utility button with a clear inverse hover state."""
+    """Square monochrome utility button with a clear inverse hover state."""
 
     def __init__(
         self,
@@ -38,7 +38,7 @@ class TerminalButton(ctk.CTkButton):
         self._enabled = True
         super().__init__(
             master,
-            corner_radius=10,
+            corner_radius=0,
             border_width=1,
             border_color=BORDER if not active else accent,
             fg_color=accent if active else base_bg,

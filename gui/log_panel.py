@@ -29,7 +29,7 @@ class LogPanel(ctk.CTkFrame):
     def __init__(self, master, records: queue.Queue[logging.LogRecord], font, log_font=None):
         super().__init__(
             master,
-            corner_radius=9,
+            corner_radius=0,
             border_width=1,
             border_color=BORDER,
             fg_color=PANEL,
@@ -61,7 +61,7 @@ class LogPanel(ctk.CTkFrame):
             self,
             width=300,
             height=44,
-            corner_radius=7,
+            corner_radius=0,
             border_width=0,
             fg_color=BG,
             text_color=NEON,

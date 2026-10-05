@@ -35,6 +35,16 @@ jobs:
         with:
           cmake-version: "3.30.x"
 
+      - name: Check out pinned offline bytecode decompiler
+        uses: actions/checkout@v4
+        with:
+          repository: PumbaaDev/luau-decompiler
+          ref: ee07098c31e11601a9ca434bc12932a4ded65f7b
+          path: build/luau-decompiler
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install Python dependencies and packager
         shell: pwsh
         run: |
@@ -77,23 +87,41 @@ jobs:
           & $native --version
           if ($LASTEXITCODE -ne 0) { throw "Native host health check failed" }
 
-      - name: Bundle pixel fonts
+      - name: Build offline Luau bytecode decompiler
         shell: pwsh
         run: |
-          $fontDir = Join-Path $PWD "assets/fonts"
-          New-Item -ItemType Directory -Force -Path $fontDir | Out-Null
-          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/google/fonts/main/ofl/pressstart2p/PressStart2P-Regular.ttf" -OutFile (Join-Path $fontDir "PressStart2P-Regular.ttf")
-          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/google/fonts/main/ofl/vt323/VT323-Regular.ttf" -OutFile (Join-Path $fontDir "VT323-Regular.ttf")
-          foreach ($font in @("PressStart2P-Regular.ttf", "VT323-Regular.ttf")) {
-            if ((Get-Item (Join-Path $fontDir $font)).Length -lt 1000) { throw "Downloaded font is incomplete: $font" }
+          $sourceDir = Join-Path $PWD "build/luau-decompiler"
+          $sourceCommit = (& git -C $sourceDir rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $sourceCommit -ne "ee07098c31e11601a9ca434bc12932a4ded65f7b") {
+            throw "Offline bytecode decompiler source checkout does not match the recorded commit: $sourceCommit"
+          }
+          cargo build --manifest-path (Join-Path $sourceDir "Cargo.toml") --locked --release -p luau-cli --bin luau-decompiler
+          if ($LASTEXITCODE -ne 0) { throw "Offline bytecode decompiler build failed" }
+          $decompiler = Join-Path $sourceDir "target/release/luau-decompiler.exe"
+          if (-not (Test-Path $decompiler)) { throw "Built Luau bytecode decompiler is missing: $decompiler" }
+          $version = & $decompiler --version
+          if ($LASTEXITCODE -ne 0 -or "$version" -notmatch "luau-decompiler") {
+            throw "Offline bytecode decompiler health check failed: $version"
+          }
+          Write-Host $version
+          $help = (& $decompiler --help 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $help -notmatch "--output") {
+            throw "Offline bytecode decompiler CLI help did not confirm the required output option"
+          }
+          $licenseDir = Join-Path $PWD "build/third-party"
+          New-Item -ItemType Directory -Force -Path $licenseDir | Out-Null
+          Copy-Item (Join-Path $sourceDir "LICENSE") (Join-Path $licenseDir "luau-decompiler-mit.txt")
+          if (-not (Test-Path (Join-Path $licenseDir "luau-decompiler-mit.txt"))) {
+            throw "Could not stage the bytecode decompiler license notice"
           }
 
       - name: Package the self-contained application
         shell: pwsh
         run: |
           $native = Join-Path $PWD "build/native/host-bin/protez-native-host.exe"
+          $decompiler = Join-Path $PWD "build/luau-decompiler/target/release/luau-decompiler.exe"
+          $decompilerLicense = Join-Path $PWD "build/third-party/luau-decompiler-mit.txt"
           $sandboxDir = (Resolve-Path "sandbox").Path
-          $fontDir = (Resolve-Path "assets/fonts").Path
           $iconPath = (Resolve-Path "assets/icons/protez.ico").Path
           $appDist = Join-Path $PWD "dist"
           $appWork = Join-Path $PWD "build/pyinstaller-app"
@@ -108,7 +136,8 @@ jobs:
             "--specpath", $appSpec,
             "--add-data", "$sandboxDir;sandbox",
             "--add-data", "$native;tools",
-            "--add-data", "$fontDir;assets/fonts",
+            "--add-data", "$decompiler;tools",
+            "--add-data", "$decompilerLicense;licenses",
             "--add-data", "$iconPath;assets/icons",
             "--collect-all", "customtkinter",
             "--collect-all", "tkinterdnd2",

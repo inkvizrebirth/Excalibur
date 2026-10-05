@@ -14,7 +14,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from core.bytecode_decompiler import (
+    BUNDLED_DECOMPILER_COMMIT,
+    BUNDLED_DECOMPILER_REPOSITORY,
+    BytecodeDecompilerError,
+    LocalBytecodeDecompiler,
+)
 from core.deobfuscator import DeobfuscationResult, deobfuscate_source
+from core.formatter import format_luau
 from core.protection import ProtectionProfile, inspect_protection
 from core.runtime_paths import LOGS_DIR, OUTPUT_DIR, TOOLS_DIR
 from core.sandbox import Sandbox, SandboxError, SandboxResult
@@ -240,9 +247,11 @@ class DeobfuscationPipeline:
         self.max_payload_candidates = max_payload_candidates
         self.max_pipeline_seconds = max_pipeline_seconds
 
-    def run(self, source: str, *, source_name: str = "input") -> PipelineResult:
+    def run(self, source: str | bytes, *, source_name: str = "input") -> PipelineResult:
+        if isinstance(source, bytes):
+            return self._run_bytecode(source, source_name=source_name)
         if not isinstance(source, str):
-            raise TypeError("source must be text")
+            raise TypeError("source must be text or compiled Luau bytecode")
 
         started = time.monotonic()
         source_analysis = deobfuscate_source(source)
@@ -448,14 +457,24 @@ class DeobfuscationPipeline:
         if initial_result is not None and initial_result.output_limited:
             self.logger.warning("Keeping the valid source fallback after the sandbox output limit")
 
+        best_source, formatting_applied = self._format_verified_candidate(
+            best_source,
+            compiler,
+            label="formatted recovered source",
+            deadline=deadline,
+        )
         decoded_layers = max(0, best_depth)
+        selected_transformations = best_transformations + (
+            ("compile-verified whitespace formatting",) if formatting_applied else ()
+        )
         return self._write_result(
             source=best_source,
+            formatting_applied=formatting_applied,
             original_source=source,
             source_name=source_name,
             route=best_route,
             decoded_layers=decoded_layers,
-            transformations=best_transformations,
+            transformations=selected_transformations,
             source_analysis=source_analysis,
             candidate_count=candidate_count,
             layer_report=layer_report,
@@ -463,6 +482,143 @@ class DeobfuscationPipeline:
             duration_seconds=time.monotonic() - started,
             dynamic_execution_skipped=elevated_mode,
         )
+
+    def _run_bytecode(self, bytecode: bytes, *, source_name: str) -> PipelineResult:
+        started = time.monotonic()
+        deadline = started + self.max_pipeline_seconds
+        self.logger.info("Offline Luau bytecode decompilation started (%s bytes)", f"{len(bytecode):,}")
+        self._progress(8, "BYTECODE")
+        decompiler = LocalBytecodeDecompiler(
+            tools_dir=self.tools_dir,
+            timeout_seconds=min(30.0, self.max_pipeline_seconds),
+            logger=self.logger,
+        )
+        try:
+            source, binary = decompiler.decompile(bytecode, source_name=source_name)
+        except BytecodeDecompilerError as exc:
+            raise PipelineError(str(exc)) from exc
+
+        elapsed = time.monotonic() - started
+        if elapsed >= self.max_pipeline_seconds:
+            raise PipelineError("The total pipeline time limit was reached during bytecode decompilation")
+        self._progress(78, "VERIFY")
+        compiler = _LuauCompiler(
+            tools_dir=self.tools_dir,
+            timeout_seconds=min(self.compiler_timeout_seconds, self.max_pipeline_seconds - elapsed),
+            logger=self.logger,
+        )
+        try:
+            compiler.verify_text(source, label="decompiled bytecode output")
+        except InvalidLuauPayload as exc:
+            raise PipelineError(f"The local decompiler did not produce valid Luau: {exc}") from exc
+        source, formatting_applied = self._format_verified_candidate(
+            source,
+            compiler,
+            label="formatted decompiled bytecode",
+            deadline=deadline,
+        )
+        bundled_binary = decompiler.is_bundled_binary(binary)
+        transformations = ("offline Luau bytecode decompilation",) + (
+            ("compile-verified whitespace formatting",) if formatting_applied else ()
+        )
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        output_path = self.output_dir / f"decompiled_{timestamp}.luau"
+        report_path = self.output_dir / f"decompiled_{timestamp}.report.json"
+        output_temp = output_path.with_name(output_path.name + ".tmp")
+        report_temp = report_path.with_name(report_path.name + ".tmp")
+        report = {
+            "app_version": VERSION,
+            "status": "complete",
+            "route": "local-luau-bytecode-decompiler",
+            "source_name": source_name,
+            "decompiler": binary.name,
+            "decompiler_provenance": (
+                "verified-frozen-bundle" if bundled_binary else "local-binary-unverified"
+            ),
+            "decompiler_repository": BUNDLED_DECOMPILER_REPOSITORY if bundled_binary else None,
+            "decompiler_source_commit": BUNDLED_DECOMPILER_COMMIT if bundled_binary else None,
+            "formatting_applied": formatting_applied,
+            "formatting_validation": "compile-only" if formatting_applied else None,
+            "transformations": list(transformations),
+            "bytecode_size": len(bytecode),
+            "bytecode_sha256": hashlib.sha256(bytecode).hexdigest(),
+            "output_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            "bytecode_executed": False,
+            "source_compiled_for_syntax_check_only": True,
+            "original_source_recovered": False,
+            "known_loss": [
+                "Compilation discards comments and may omit original variable names without debug metadata.",
+                "Recovered source is a semantic approximation, not a byte-for-byte copy of the original script.",
+                "Opcode-shuffled or unsupported custom bytecode may produce partial or incorrect output.",
+                "The pinned upstream README documents standard Luau bytecode v3-v9; support for other versions is not claimed.",
+            ],
+            "outputs": {"source": str(output_path)},
+        }
+        try:
+            output_temp.write_text(source, encoding="utf-8", newline="")
+            os.replace(output_temp, output_path)
+            report_temp.write_text(
+                json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+            os.replace(report_temp, report_path)
+        except OSError as exc:
+            output_temp.unlink(missing_ok=True)
+            report_temp.unlink(missing_ok=True)
+            raise PipelineError(f"Could not write bytecode decompilation output: {exc}") from exc
+
+        duration = time.monotonic() - started
+        self.logger.info("Luau bytecode decompilation passed compile-only syntax verification")
+        if formatting_applied:
+            self.logger.info("Conservative whitespace formatting passed compile-only verification")
+        self.logger.info("Decompiled Luau written to %s", output_path)
+        self.logger.info("Bytecode decompilation report written to %s", report_path)
+        self._progress(100, "DONE")
+        return PipelineResult(
+            output_path=output_path,
+            report_path=report_path,
+            route="local-luau-bytecode-decompiler",
+            decoded_layers=0,
+            transformations=transformations,
+            sandbox_result=None,
+            status="complete",
+            notice=(
+                "Bytecode was statically decompiled and not executed. Original comments and some names "
+                "cannot be recovered from compiled bytecode."
+            ),
+        )
+
+    def _format_verified_candidate(
+        self,
+        source: str,
+        compiler: _LuauCompiler,
+        *,
+        label: str,
+        deadline: float,
+    ) -> tuple[str, bool]:
+        """Format only syntax-checked source, retaining the original on any failure."""
+        try:
+            formatted = format_luau(source)
+        except Exception as exc:
+            self.logger.warning("Could not prepare conservative formatting; preserving original: %s", exc)
+            return source, False
+        if formatted == source:
+            return source, False
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            self.logger.warning("Skipped optional formatting after reaching the pipeline time limit")
+            return source, False
+        compiler.timeout_seconds = min(compiler.timeout_seconds, max(0.001, remaining))
+        try:
+            compiler.verify_text(formatted, label=label)
+        except PipelineError as exc:
+            self.logger.warning("Formatted candidate did not pass compile-only validation; preserving original: %s", exc)
+            return source, False
+
+        self.logger.info("Conservative token-preserving formatting passed compile-only validation")
+        return formatted, True
 
     def _is_valid_source(
         self,
@@ -691,6 +847,7 @@ class DeobfuscationPipeline:
         self,
         *,
         source: str,
+        formatting_applied: bool,
         original_source: str,
         source_name: str,
         route: str,
@@ -729,6 +886,8 @@ class DeobfuscationPipeline:
             "output_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
             "input_transformations": list(source_analysis.transformations),
             "selected_transformations": list(transformations),
+            "formatting_applied": formatting_applied,
+            "formatting_validation": "compile-only" if formatting_applied else None,
             "layers": layer_report,
             "safety_notes": safety_notes,
         }
@@ -743,6 +902,8 @@ class DeobfuscationPipeline:
             raise PipelineError(f"Could not write output/report: {exc}") from exc
 
         self.logger.info("Recovered source through route: %s", route)
+        if formatting_applied:
+            self.logger.info("Whitespace formatting was compile-only verified")
         self.logger.info("Output written to %s", output_path)
         self.logger.info("Analysis report written to %s", report_path)
         self._progress(100, "DONE")

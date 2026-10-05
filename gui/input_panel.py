@@ -10,7 +10,9 @@ import customtkinter as ctk
 from gui.theme import BG, BORDER, INPUT_BG, MUTED, NEON, PANEL, TEXT, TerminalButton
 
 LOGGER = logging.getLogger("protez")
-ALLOWED_EXTENSIONS = {".lua", ".luau", ".txt"}
+BYTECODE_EXTENSIONS = {".luac", ".lbc", ".bin"}
+ALLOWED_EXTENSIONS = {".lua", ".luau", ".txt", *BYTECODE_EXTENSIONS}
+MAX_INPUT_FILE_BYTES = 64 * 1024 * 1024
 _DIRECT_URL = re.compile(r"(?i)^\s*<?https?://\S+>?\s*$")
 
 
@@ -18,14 +20,14 @@ class InputPanel(ctk.CTkFrame):
     def __init__(self, master, *, title_font, body_font, code_font=None):
         super().__init__(
             master,
-            corner_radius=12,
+            corner_radius=0,
             border_width=1,
             border_color=BORDER,
             fg_color=PANEL,
         )
         self._active_tab = "paste"
         self._file_path: Path | None = None
-        self._file_content = ""
+        self._file_content: str | bytes = ""
         self._drop_enabled = False
         self._body_font = body_font
         self._code_font = code_font or body_font
@@ -80,7 +82,7 @@ class InputPanel(ctk.CTkFrame):
         self.paste_view = ctk.CTkFrame(
             self.content,
             fg_color=INPUT_BG,
-            corner_radius=10,
+            corner_radius=0,
             border_width=1,
             border_color=BORDER,
         )
@@ -91,7 +93,7 @@ class InputPanel(ctk.CTkFrame):
             self.paste_view,
             width=340,
             height=100,
-            corner_radius=8,
+            corner_radius=0,
             border_width=0,
             fg_color=INPUT_BG,
             text_color=TEXT,
@@ -108,7 +110,7 @@ class InputPanel(ctk.CTkFrame):
         self.file_view = ctk.CTkFrame(
             self.content,
             fg_color=INPUT_BG,
-            corner_radius=10,
+            corner_radius=0,
             border_width=1,
             border_color=BORDER,
         )
@@ -118,7 +120,7 @@ class InputPanel(ctk.CTkFrame):
         self.drop_zone = ctk.CTkFrame(
             self.file_view,
             fg_color=INPUT_BG,
-            corner_radius=10,
+            corner_radius=0,
             border_width=1,
             border_color="#414651",
         )
@@ -139,7 +141,7 @@ class InputPanel(ctk.CTkFrame):
             command=self._browse_file,
             width=100,
             height=29,
-            corner_radius=10,
+            corner_radius=0,
             border_width=1,
             border_color=BORDER,
             fg_color="#17191e",
@@ -177,7 +179,7 @@ class InputPanel(ctk.CTkFrame):
             LOGGER.warning("Could not enable file drag-and-drop: %s", exc)
             return False
 
-    def get_script(self) -> str:
+    def get_script(self) -> str | bytes:
         if self._active_tab == "file":
             return self._file_content
         try:
@@ -208,7 +210,8 @@ class InputPanel(ctk.CTkFrame):
                 parent=self.winfo_toplevel(),
                 title="Select a source file",
                 filetypes=(
-                    ("Lua / Luau scripts", "*.lua *.luau"),
+                    ("Lua / Luau source", "*.lua *.luau"),
+                    ("Compiled Luau bytecode", "*.luac *.lbc *.bin"),
                     ("Text files", "*.txt"),
                     ("All files", "*.*"),
                 ),
@@ -231,26 +234,43 @@ class InputPanel(ctk.CTkFrame):
         return "break"
 
     def _load_file(self, path: Path) -> None:
-        if path.suffix.lower() not in ALLOWED_EXTENSIONS:
+        extension = path.suffix.lower()
+        if extension not in ALLOWED_EXTENSIONS:
             LOGGER.warning("Unsupported file type: %s", path.name)
             return
         try:
-            content = path.read_text(encoding="utf-8", errors="replace")
+            size = path.stat().st_size
+            if size > MAX_INPUT_FILE_BYTES:
+                LOGGER.warning(
+                    "Input file exceeds the %s MiB file limit: %s",
+                    MAX_INPUT_FILE_BYTES // (1024 * 1024),
+                    path.name,
+                )
+                return
+            if extension in BYTECODE_EXTENSIONS:
+                content: str | bytes = path.read_bytes()
+            else:
+                content = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             LOGGER.exception("Could not read input file: %s", path)
             return
 
         self._file_path = path
         self._file_content = content
-        self.drop_label.configure(text=f"{path.name}\n{len(content):,} CHARACTERS")
+        unit = "BYTES" if isinstance(content, bytes) else "CHARACTERS"
+        self.drop_label.configure(text=f"{path.name}\n{len(content):,} {unit}")
         self._select_tab("file")
-        LOGGER.info("Loaded input file: %s (%s characters)", path.name, len(content))
+        LOGGER.info("Loaded input file: %s (%s %s)", path.name, f"{len(content):,}", unit.lower())
 
     def _update_status_after_idle(self, _event=None) -> None:
         self.after_idle(self._update_status)
 
     def _update_status(self, _event=None) -> None:
         source = self.get_script()
+        if isinstance(source, bytes):
+            kind = "LUAU BYTECODE" if source.strip() else "READY"
+            self.status.configure(text=f"{kind} · {len(source):,} BYTES")
+            return
         if not source.strip():
             kind = "READY"
         elif _DIRECT_URL.match(source):

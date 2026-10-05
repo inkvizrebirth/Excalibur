@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-05 — 0.4.0
+
+- Added static Luau bytecode decompilation through the bundled offline `luau-decompiler` CLI; bytecode and recovered source are not executed. Reports record provenance only when a frozen build's active binary matches the packaged copy and document lossy recovery and the upstream-documented v3–v9 scope.
+- Added bounded, token-preserving whitespace formatting for supported Luau source. The pipeline keeps formatted output only after a compile-only syntax check; unsupported syntax or a failed check leaves the candidate unchanged.
+- Removed rounded UI corners and pixel-font loading. The compact desktop UI now uses crisp system and monospace fonts while preserving the sword icon, Paste/File, Browse fallback, optional drag-and-drop, queued logs, background processing, and UAC behavior.
+- The Windows workflow builds the pinned offline decompiler and packages its MIT notice. GitHub Releases remain limited to `Protez.exe`; the installer stays a CI artifact.
+
 ## 2026-10-05 — 0.3.0
 
 - Tightened the main desktop window and added a white pixel-sword application/window icon.

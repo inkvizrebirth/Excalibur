@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import tkinter as tk
 
 
@@ -36,19 +35,23 @@ class AnimatedBorder:
         self._animate()
 
     @staticmethod
-    def _rounded_path(width: float, height: float, radius: float, steps: int = 48):
-        radius = max(8.0, min(radius, (width - 4) / 2, (height - 4) / 2))
-        corners = (
-            (width - radius - 1, radius + 1, -90, 0),
-            (width - radius - 1, height - radius - 1, 0, 90),
-            (radius + 1, height - radius - 1, 90, 180),
-            (radius + 1, radius + 1, 180, 270),
-        )
-        points = []
-        for cx, cy, start, end in corners:
-            for index in range(steps):
-                angle = math.radians(start + (end - start) * index / steps)
-                points.append((cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
+    def _square_path(width: float, height: float, inset: float = 1.5, steps: int = 48):
+        left = inset
+        top = inset
+        right = max(left + 1, width - inset)
+        bottom = max(top + 1, height - inset)
+        corners = ((left, top), (right, top), (right, bottom), (left, bottom))
+        points: list[tuple[float, float]] = []
+        for index, point in enumerate(corners):
+            next_point = corners[(index + 1) % len(corners)]
+            for step in range(steps):
+                fraction = step / steps
+                points.append(
+                    (
+                        point[0] + (next_point[0] - point[0]) * fraction,
+                        point[1] + (next_point[1] - point[1]) * fraction,
+                    )
+                )
         return points
 
     def _rebuild(self, _event=None) -> None:
@@ -56,7 +59,7 @@ class AnimatedBorder:
             return
         width = max(40, self._canvas.winfo_width())
         height = max(40, self._canvas.winfo_height())
-        points = self._rounded_path(width, height, radius=20)
+        points = self._square_path(width, height)
         self._canvas.delete("animated-outline")
         self._items.clear()
         for index, point in enumerate(points):
@@ -68,7 +71,7 @@ class AnimatedBorder:
                 next_point[1],
                 fill="#23a4ff",
                 width=self.line_width,
-                capstyle="round",
+                capstyle="projecting",
                 tags=("animated-outline",),
             )
             self._items.append(item)
