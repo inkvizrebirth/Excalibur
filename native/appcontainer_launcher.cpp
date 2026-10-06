@@ -154,7 +154,7 @@ bool makeWorkerDirectory(const std::wstring& profileName, PSID& appContainerSid,
     }
 
     PWSTR rawPath = nullptr;
-    result = GetAppContainerFolderPath(appContainerSid, &rawPath);
+    result = GetAppContainerFolderPath(profileName.c_str(), &rawPath);
     if (FAILED(result) || !rawPath)
         return false;
     profilePath = rawPath;
