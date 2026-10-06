@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Added bounded, local-only static extraction for recognized Luraph LPH container layouts: Ascii85 framing with single/two-stream Zstandard or legacy two-stream raw LZMA1/range streams. Protez saves intermediate VM-interpreter/custom-bytecode artifacts and records sizes, hashes, and safety flags. This does not devirtualize the custom VM or reconstruct original Luau; unsupported variants remain explicitly partial. The wrapper, interpreter, and payload are never executed.
+- Added the `zstandard` runtime dependency to the self-contained Windows package and deterministic tests for stream decoding, limits, report output, and the no-execution path.
+
 ## 2026-10-05 — 0.4.0
 
 - Added static Luau bytecode decompilation through the bundled offline `luau-decompiler` CLI; bytecode and recovered source are not executed. Reports record provenance only when a frozen build's active binary matches the packaged copy and document lossy recovery and the upstream-documented v3–v9 scope.

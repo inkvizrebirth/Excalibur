@@ -22,6 +22,11 @@ from core.bytecode_decompiler import (
 )
 from core.deobfuscator import DeobfuscationResult, deobfuscate_source
 from core.formatter import format_luau
+from core.luraph_static import (
+    LuraphStaticError,
+    LuraphStaticUnpackResult,
+    unpack_luraph_static,
+)
 from core.protection import ProtectionProfile, inspect_protection
 from core.runtime_paths import LOGS_DIR, OUTPUT_DIR, TOOLS_DIR
 from core.sandbox import Sandbox, SandboxError, SandboxResult
@@ -259,8 +264,8 @@ class DeobfuscationPipeline:
         if protection is not None:
             self._log_transformations("Input", source_analysis)
             notice = (
-                f"{protection.display_name} detected; only a static preview was produced. "
-                "The original source was not reconstructed or executed."
+                f"{protection.display_name} detected; bounded static container extraction was selected. "
+                "Original-source reconstruction and code execution are disabled."
             )
             self.logger.warning(notice)
             self._progress(100, "PARTIAL")
@@ -737,48 +742,150 @@ class DeobfuscationPipeline:
         duration_seconds: float,
         notice: str,
     ) -> PipelineResult:
-        """Write an honest static triage report for a detected VM-protected loader."""
+        """Write static triage plus any bounded Luraph container artifacts."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         preview_path = self.output_dir / f"analysis_{timestamp}.static-preview.luau"
         report_path = self.output_dir / f"analysis_{timestamp}.report.json"
         summary_path = self.output_dir / f"analysis_{timestamp}.report.txt"
-        paths = (preview_path, report_path, summary_path)
-        temps = tuple(path.with_name(path.name + ".tmp") for path in paths)
+
+        unpack_started = time.monotonic()
+        unpack_result: LuraphStaticUnpackResult | None = None
+        unpack_error: str | None = None
+        try:
+            unpack_result = unpack_luraph_static(source)
+        except LuraphStaticError as exc:
+            unpack_error = str(exc)
+        except Exception as exc:
+            self.logger.exception("Unexpected error during static Luraph container extraction")
+            unpack_error = f"unexpected static unpack error: {type(exc).__name__}: {exc}"
+
+        elapsed_seconds = duration_seconds + (time.monotonic() - unpack_started)
+        vm_source_path: Path | None = None
+        bytecode_path: Path | None = None
+        vm_source_details: dict[str, object] | None = None
+        bytecode_details: dict[str, object] | None = None
+
+        if unpack_result is not None:
+            if unpack_result.vm_source is not None:
+                vm_source_path = self.output_dir / (
+                    f"analysis_{timestamp}.luraph-vm-interpreter.luau"
+                )
+                vm_source_details = {
+                    "path": str(vm_source_path),
+                    "bytes": len(unpack_result.vm_source),
+                    "sha256": hashlib.sha256(unpack_result.vm_source).hexdigest(),
+                }
+            bytecode_path = self.output_dir / f"analysis_{timestamp}.luraph-custom-bytecode.bin"
+            bytecode_details = {
+                "path": str(bytecode_path),
+                "bytes": len(unpack_result.custom_bytecode),
+                "sha256": hashlib.sha256(unpack_result.custom_bytecode).hexdigest(),
+            }
+            self.logger.info(
+                "Statically unpacked Luraph %s container; no Luau code was executed",
+                unpack_result.layout,
+            )
+            if vm_source_details is not None:
+                self.logger.info("Luraph VM-interpreter artifact written to %s", vm_source_path)
+            self.logger.info("Luraph custom-bytecode artifact written to %s", bytecode_path)
+            notice = (
+                f"{profile.display_name} container streams were statically unpacked "
+                f"({unpack_result.layout}); original Luau source was not reconstructed "
+                "and no code was executed."
+            )
+        else:
+            unpack_error = unpack_error or "no supported Luraph container layout was found"
+            self.logger.warning(
+                "Luraph static stream extraction did not complete: %s",
+                unpack_error,
+            )
+            notice = (
+                f"{profile.display_name} detected; Protez produced a static wrapper preview only. "
+                f"Stream extraction did not complete: {unpack_error}. No code was executed."
+            )
 
         preview = (
             "-- Protez static preview only; this is not reconstructed source.\n"
-            f"-- Detected: {profile.display_name}. The wrapper and payload were not executed.\n"
+            f"-- Detected: {profile.display_name}. The wrapper, VM interpreter, "
+            "and payload were not executed.\n"
             "-- Do not treat this file as deobfuscated Luau.\n\n"
             + source_analysis.source
         )
+        static_unpack_report: dict[str, object] = {
+            "attempted": True,
+            "success": unpack_result is not None,
+            "container_layout": (
+                unpack_result.layout if unpack_result is not None else profile.container_layout
+            ),
+            "source_reconstructed": False,
+            "custom_vm_devirtualized": False,
+            "wrapper_executed": False,
+            "vm_interpreter_executed": False,
+            "payload_executed": False,
+            "compressed_stream_bytes": (
+                list(unpack_result.compressed_stream_sizes) if unpack_result is not None else []
+            ),
+            "decoded_stream_bytes": (
+                list(unpack_result.decoded_stream_sizes) if unpack_result is not None else []
+            ),
+            "vm_interpreter": vm_source_details,
+            "custom_bytecode": bytecode_details,
+            "error": None if unpack_result is not None else unpack_error,
+        }
+        limitations = [
+            (
+                "The readable Luraph wrapper is not the original program; container decoding "
+                "does not recover source-level control flow."
+            ),
+            (
+                "The extracted custom VM bytecode is not standard Luau bytecode and is not "
+                "passed to the ordinary Luau bytecode decompiler."
+            ),
+            (
+                "Protez does not currently lift Luraph VM prototypes/opcode handlers into "
+                "the original Luau source."
+            ),
+            (
+                "No wrapper, recovered VM interpreter, bytecode, or payload was executed; "
+                "no external service received the input."
+            ),
+        ]
+        if unpack_result is None:
+            limitations.insert(
+                0,
+                "Static Luraph stream extraction was attempted but did not complete: "
+                + (unpack_error or "unknown error"),
+            )
         report = {
             "app_version": VERSION,
             "status": "partial",
             "source_name": source_name,
             "route": "static-protection-report",
-            "duration_seconds": round(duration_seconds, 3),
+            "duration_seconds": round(elapsed_seconds, 3),
             "input_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
             "protection": {
                 "family": profile.family,
                 "version": profile.version,
                 "embedded_payload_characters": profile.embedded_payload_chars,
+                "raw_payload_streams": profile.raw_payload_streams,
+                "valid_payload_streams": profile.valid_payload_streams,
+                "container_layout": profile.container_layout,
             },
             "recovered": False,
             "source_reconstructed": False,
             "payload_executed": False,
             "input_transformations": list(source_analysis.transformations),
             "visible_wrapper_literals": list(profile.visible_literals),
+            "static_unpack": static_unpack_report,
             "outputs": {
                 "human_report": str(summary_path),
+                "machine_report": str(report_path),
                 "static_preview": str(preview_path),
+                "luraph_vm_interpreter": str(vm_source_path) if vm_source_path else None,
+                "luraph_custom_bytecode": str(bytecode_path) if bytecode_path else None,
             },
-            "limitations": [
-                "The detected wrapper uses a virtualized/encoded payload; the readable wrapper is not the original program.",
-                "Protez does not currently lift this Luraph VM payload into original Luau source.",
-                "Static string decoding and formatting do not reconstruct VM instructions or recover original control flow.",
-                "The supplied code and embedded payload were not executed.",
-            ],
+            "limitations": limitations,
         }
         transformations = (
             "\n".join(f"  - {item}" for item in source_analysis.transformations)
@@ -786,7 +893,10 @@ class DeobfuscationPipeline:
             else "  - No supported static decoder pattern matched."
         )
         literals = (
-            "\n".join(f"  - {json.dumps(item, ensure_ascii=False)}" for item in profile.visible_literals)
+            "\n".join(
+                f"  - {json.dumps(item, ensure_ascii=False)}"
+                for item in profile.visible_literals
+            )
             if profile.visible_literals
             else "  - No short, readable wrapper literals were found."
         )
@@ -795,37 +905,90 @@ class DeobfuscationPipeline:
             if profile.embedded_payload_chars
             else "not identified by the static signature check"
         )
+        if unpack_result is not None:
+            unpack_lines = [
+                f"  - Static container extraction: SUCCEEDED ({unpack_result.layout})",
+            ]
+            if vm_source_details is not None:
+                unpack_lines.append(
+                    "  - VM interpreter (intermediate, not original source): "
+                    f"{vm_source_path} ({vm_source_details['bytes']:,} bytes, "
+                    f"SHA-256 {vm_source_details['sha256']})"
+                )
+            else:
+                unpack_lines.append(
+                    "  - Separate VM-interpreter stream: "
+                    "not present in this container layout"
+                )
+            unpack_lines.append(
+                "  - Custom VM bytecode (not Luau bytecode): "
+                f"{bytecode_path} ({bytecode_details['bytes']:,} bytes, "
+                f"SHA-256 {bytecode_details['sha256']})"
+            )
+        else:
+            unpack_lines = [
+                "  - Static container extraction: NOT COMPLETED",
+                f"  - Detail: {unpack_error}",
+            ]
         summary = (
             "PROTEZ // STATIC PROTECTION ANALYSIS\n"
             "=====================================\n"
             "STATUS: PARTIAL — ORIGINAL SOURCE NOT RECONSTRUCTED\n\n"
             f"Protection: {profile.display_name}\n"
+            f"Container layout: {profile.container_layout or 'not classified'}\n"
             f"Embedded payload: {payload_size}\n"
             f"Input: {source_name} ({source_analysis.input_bytes:,} bytes)\n"
-            f"Elapsed: {duration_seconds:.2f} seconds\n\n"
+            f"Elapsed: {elapsed_seconds:.2f} seconds\n\n"
+            "Static Luraph extraction:\n"
+            f"{chr(10).join(unpack_lines)}\n\n"
             "Static wrapper transforms:\n"
             f"{transformations}\n\n"
             "Visible wrapper strings (not necessarily program behavior):\n"
             f"{literals}\n\n"
-            "Why this is partial:\n"
-            "The readable code in a Luraph-protected file is a virtual-machine loader. Its encoded payload contains VM data, not plain Luau text. Protez currently detects this format and reports safe static indicators, but does not lift this VM into the original source.\n\n"
+            "What this result means:\n"
+            "The Luraph container may now be unpacked into its VM-interpreter stream "
+            "and/or custom virtual bytecode. "
+            "This is an intermediate static-analysis result, not the unobfuscated "
+            "program. Protez does not yet "
+            "reconstruct Luraph prototypes, opcode semantics, or original "
+            "source-level control flow.\n\n"
             "Safety:\n"
-            "The input and payload were not executed. The adjacent .luau file is only a static preview of the wrapper and must not be mistaken for reconstructed/deobfuscated source.\n\n"
+            "The wrapper, decoded VM interpreter, custom bytecode, and payload were not "
+            "executed. All analysis "
+            "was local; the input was not uploaded to an external service. Treat "
+            "intermediate artifacts as "
+            "untrusted code/data and review them before sharing.\n\n"
             "Files:\n"
             f"  Human report: {summary_path}\n"
             f"  Machine report: {report_path}\n"
             f"  Static preview: {preview_path}\n"
+            + (f"  VM interpreter: {vm_source_path}\n" if vm_source_path else "")
+            + (f"  Custom VM bytecode: {bytecode_path}\n" if bytecode_path else "")
         )
+
+        writes: list[tuple[Path, bytes]] = [
+            (preview_path, preview.encode("utf-8")),
+            (
+                report_path,
+                (json.dumps(report, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+            ),
+            (summary_path, summary.encode("utf-8")),
+        ]
+        if unpack_result is not None:
+            if vm_source_path is not None and unpack_result.vm_source is not None:
+                writes.append((vm_source_path, unpack_result.vm_source))
+            if bytecode_path is not None:
+                writes.append((bytecode_path, unpack_result.custom_bytecode))
+        temporary_paths = [path.with_name(path.name + ".tmp") for path, _ in writes]
         try:
-            temps[0].write_text(preview, encoding="utf-8", newline="")
-            os.replace(temps[0], paths[0])
-            temps[1].write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-            os.replace(temps[1], paths[1])
-            temps[2].write_text(summary, encoding="utf-8", newline="")
-            os.replace(temps[2], paths[2])
+            for (path, payload), temporary_path in zip(writes, temporary_paths):
+                temporary_path.write_bytes(payload)
+                os.replace(temporary_path, path)
         except OSError as exc:
-            for temp in temps:
-                temp.unlink(missing_ok=True)
+            for temporary_path in temporary_paths:
+                temporary_path.unlink(missing_ok=True)
+            for path, _ in writes:
+                path.unlink(missing_ok=True)
             raise PipelineError(f"Could not write static protection analysis: {exc}") from exc
 
         self.logger.info("Static analysis report written to %s", summary_path)

@@ -141,6 +141,7 @@ jobs:
             "--add-data", "$iconPath;assets/icons",
             "--collect-all", "customtkinter",
             "--collect-all", "tkinterdnd2",
+            "--collect-all", "zstandard",
             "--hidden-import", "tkinterdnd2.TkinterDnD",
             $entryPoint
           )

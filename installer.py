@@ -48,6 +48,7 @@ DOWNLOAD_TIMEOUT_SECONDS = 45
 DISTRIBUTIONS = (
     "customtkinter",
     "tkinterdnd2",
+    "zstandard",
 )
 
 TOOL_NAMES = {

@@ -4,11 +4,13 @@ import re
 from dataclasses import dataclass
 
 from core.deobfuscator import _decode_string, tokenize
+from core.luraph_static import inspect_luraph_container
 
 _LURAPH_VERSION = re.compile(
-    r"\bLuraph\s+Obfuscator\s+(?:v|version\s*)?([0-9]+(?:\.[0-9]+)*)\b",
+    r"\bLuraph(?:\s+Obfuscator)?\s+(?:v|version\s*)?([0-9]+(?:\.[0-9]+)*)\b",
     re.IGNORECASE,
 )
+_LONG_BRACKET_OPEN = re.compile(r"\[(=*)\[")
 _MAX_VISIBLE_LITERAL_BYTES = 256
 _MAX_VISIBLE_LITERALS = 80
 
@@ -19,6 +21,9 @@ class ProtectionProfile:
     version: str | None
     embedded_payload_chars: int
     visible_literals: tuple[str, ...]
+    container_layout: str | None = None
+    raw_payload_streams: int = 0
+    valid_payload_streams: int = 0
 
     @property
     def display_name(self) -> str:
@@ -27,13 +32,28 @@ class ProtectionProfile:
         return self.family
 
 
+def _starts_lph_literal(token_text: str) -> bool:
+    if token_text.startswith("["):
+        opening = _LONG_BRACKET_OPEN.match(token_text)
+        if opening is None:
+            return False
+        offset = opening.end()
+        if token_text.startswith("\r\n", offset):
+            offset += 2
+        elif token_text.startswith(("\n", "\r"), offset):
+            offset += 1
+        return token_text.startswith("LPH", offset)
+    return len(token_text) > 1 and token_text[0] in "\"'" and token_text.startswith("LPH", 1)
+
+
 def inspect_protection(source: str) -> ProtectionProfile | None:
-    """Identify a known VM wrapper without evaluating or invoking its payload."""
+    """Identify a known VM wrapper by comments/container signatures only.
+
+    This function performs lexical inspection. It does not evaluate the wrapper,
+    its embedded virtual machine, or the virtual bytecode.
+    """
     if not isinstance(source, str):
         raise TypeError("source must be text")
-
-    if not _LURAPH_VERSION.search(source):
-        return None
 
     tokens = tokenize(source)
     version_match = next(
@@ -46,7 +66,8 @@ def inspect_protection(source: str) -> ProtectionProfile | None:
         ),
         None,
     )
-    if version_match is None:
+    container_info = inspect_luraph_container(source, tokens=tokens)
+    if version_match is None and not container_info.detected:
         return None
 
     payload_chars = 0
@@ -55,9 +76,10 @@ def inspect_protection(source: str) -> ProtectionProfile | None:
     for token in tokens:
         if token.kind != "string":
             continue
-        if len(token.text) > 4096:
-            if "LPH&" in token.text[:64]:
-                payload_chars = max(payload_chars, len(token.text))
+        if _starts_lph_literal(token.text):
+            payload_chars += len(token.text)
+            continue
+        if len(token.text) > 4096 or len(literals) >= _MAX_VISIBLE_LITERALS:
             continue
         raw = _decode_string(token)
         if raw is None or len(raw) > _MAX_VISIBLE_LITERAL_BYTES:
@@ -66,31 +88,22 @@ def inspect_protection(source: str) -> ProtectionProfile | None:
             value = raw.decode("utf-8")
         except UnicodeDecodeError:
             continue
-        if "LPH&" in value[:64]:
-            payload_chars = max(payload_chars, len(value))
-            continue
         if len(value) < 3 or any(
             ord(character) < 32 and character not in "\t\r\n" for character in value
         ):
             continue
-        if value not in seen:
+        if value not in seen and len(literals) < _MAX_VISIBLE_LITERALS:
             seen.add(value)
             literals.append(value)
-            if len(literals) >= _MAX_VISIBLE_LITERALS:
-                break
-
-    # A short header literal may be below the large-string threshold.
-    if not payload_chars:
-        for token in tokens:
-            if token.kind == "string" and "LPH&" in token.text[:64]:
-                payload_chars = len(token.text)
-                break
 
     return ProtectionProfile(
         family="Luraph Obfuscator",
-        version=version_match.group(1),
+        version=version_match.group(1) if version_match is not None else None,
         embedded_payload_chars=payload_chars,
         visible_literals=tuple(literals),
+        container_layout=container_info.layout,
+        raw_payload_streams=container_info.raw_stream_count,
+        valid_payload_streams=container_info.valid_stream_count,
     )
 
 
