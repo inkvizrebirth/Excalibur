@@ -55,7 +55,6 @@ def _run_family(
     work_dir: Path,
     luraph_ground_truth: Path | None = None,
     expect_remote_payload_loader: bool = False,
-    expect_runtime_capture: bool = False,
 ) -> None:
     source = fixture.read_text(encoding="utf-8")
     output_dir = work_dir / family.lower()
@@ -72,19 +71,21 @@ def _run_family(
     report = json.loads(result.report_path.read_text(encoding="utf-8"))
     analysis = report["family_specific_analysis"]
     outputs = report.get("outputs", {})
-    if expect_runtime_capture:
-        if result.status != "complete" or analysis.get("source_origin") != "runtime-loadstring-capture":
-            raise RuntimeError(f"{family} did not recover the isolated loadstring payload")
-        capture = analysis.get("runtime_capture_recovery") or {}
-        if int(capture.get("source_bytes", 0)) < 512 or not capture.get("artifact"):
-            raise RuntimeError(f"{family} did not preserve a substantial runtime payload artifact")
-        source_path = Path(outputs.get("source") or "")
-    elif expect_remote_payload_loader:
+    if expect_remote_payload_loader:
         if result.status != "partial" or not analysis.get("remote_payload_loader_count"):
             raise RuntimeError(f"{family} did not report the fixture's remote payload loader as partial")
         source_path = Path(outputs.get("partial_source_candidate") or "")
         if not source_path.is_file():
             raise RuntimeError(f"{family} did not preserve its partial source candidate")
+        if family == "Luraph":
+            captures = outputs.get("runtime_capture_payloads", [])
+            if not any(
+                int(capture.get("size_bytes", 0)) >= 512
+                and capture.get("output")
+                and Path(capture["output"]).is_file()
+                for capture in captures
+            ):
+                raise RuntimeError("Luraph did not preserve its captured VM payload for further analysis")
     else:
         if result.status != "complete":
             raise RuntimeError(f"{family} smoke analysis was partial: {result.notice}")
@@ -164,7 +165,6 @@ def main() -> int:
     parser.add_argument("--luraph-ground-truth", type=Path)
     parser.add_argument("--moonsec-fixture", type=Path, action="append", required=True)
     parser.add_argument("--remote-payload-loader-fixture", type=Path, action="append", default=[])
-    parser.add_argument("--runtime-capture-fixture", type=Path, action="append", default=[])
     parser.add_argument("--tools-dir", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     args = parser.parse_args()
@@ -172,7 +172,6 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args.work_dir.mkdir(parents=True, exist_ok=True)
     remote_loader_fixtures = {path.resolve() for path in args.remote_payload_loader_fixture}
-    runtime_capture_fixtures = {path.resolve() for path in args.runtime_capture_fixture}
     for index, fixture in enumerate(args.luraph_fixture):
         _run_family(
             family="Luraph",
@@ -182,7 +181,6 @@ def main() -> int:
             # The first fixture is the one with a published source oracle.
             luraph_ground_truth=args.luraph_ground_truth if index == 0 else None,
             expect_remote_payload_loader=fixture.resolve() in remote_loader_fixtures,
-            expect_runtime_capture=fixture.resolve() in runtime_capture_fixtures,
         )
     for fixture in args.moonsec_fixture:
         _run_family(
@@ -191,7 +189,6 @@ def main() -> int:
             tools_dir=args.tools_dir,
             work_dir=args.work_dir,
             expect_remote_payload_loader=fixture.resolve() in remote_loader_fixtures,
-            expect_runtime_capture=fixture.resolve() in runtime_capture_fixtures,
         )
     return 0
 
