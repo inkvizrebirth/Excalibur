@@ -10,6 +10,7 @@
 #include <userenv.h>
 #include <aclapi.h>
 #include <objbase.h>
+#include <sddl.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -153,8 +154,13 @@ bool makeWorkerDirectory(const std::wstring& profileName, PSID& appContainerSid,
             return false;
     }
 
+    PWSTR sidText = nullptr;
+    if (!ConvertSidToStringSidW(appContainerSid, &sidText))
+        return false;
+
     PWSTR rawPath = nullptr;
-    result = GetAppContainerFolderPath(profileName.c_str(), &rawPath);
+    result = GetAppContainerFolderPath(sidText, &rawPath);
+    LocalFree(sidText);
     if (FAILED(result) || !rawPath)
         return false;
     profilePath = rawPath;
