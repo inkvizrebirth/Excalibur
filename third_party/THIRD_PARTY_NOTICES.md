@@ -10,3 +10,5 @@
   empty table filled by an open Lua `SETLIST` batch.
 - `luau-mit.txt`: MIT license for Luau tag 0.740, which provides Protez's
   sandbox runtime and AST parser.
+- `luau-decompiler-mit.txt`: MIT license for the pinned PumbaaDev
+  `luau-decompiler` CLI used for Luau bytecode source recovery.

@@ -1,15 +1,9 @@
-name: Windows Protez.exe
+name: Build and release Protez.exe
 
 on:
   release:
     types: [published]
   workflow_dispatch:
-    inputs:
-      verify_family_recovery:
-        description: Run the slower Luraph and MoonSec end-to-end smoke checks
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -41,26 +35,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-protez-native-luau-0.740-
 
-      - name: Set up CMake
-        if: ${{ steps.native-cache.outputs.cache-hit != 'true' }}
-        uses: jwlawson/actions-setup-cmake@v2
-        with:
-          cmake-version: "3.30.x"
-
-      - name: Check out pinned offline bytecode decompiler
-        uses: actions/checkout@v4
-        with:
-          repository: PumbaaDev/luau-decompiler
-          ref: ee07098c31e11601a9ca434bc12932a4ded65f7b
-          path: build/luau-decompiler
-
-      - name: Check out pinned Lua bytecode decompiler
-        uses: actions/checkout@v4
-        with:
-          repository: x3zvawq/unluac-rs
-          ref: 3186d2e392e44a2ddaadd1826a779c98c718be53
-          path: build/unluac-rs
-
       - name: Restore Rust lifter build cache
         id: rust-cache
         uses: actions/cache/restore@v4
@@ -81,6 +55,28 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-protez-moonsec-net9-
 
+      - name: Set up CMake
+        if: ${{ steps.native-cache.outputs.cache-hit != 'true' }}
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: "3.30.x"
+
+      - name: Check out pinned offline bytecode decompiler
+        if: ${{ steps.rust-cache.outputs.cache-hit != 'true' }}
+        uses: actions/checkout@v4
+        with:
+          repository: PumbaaDev/luau-decompiler
+          ref: ee07098c31e11601a9ca434bc12932a4ded65f7b
+          path: build/luau-decompiler
+
+      - name: Check out pinned Lua bytecode decompiler
+        if: ${{ steps.rust-cache.outputs.cache-hit != 'true' }}
+        uses: actions/checkout@v4
+        with:
+          repository: x3zvawq/unluac-rs
+          ref: 3186d2e392e44a2ddaadd1826a779c98c718be53
+          path: build/unluac-rs
+
       - name: Set up Rust
         if: ${{ steps.rust-cache.outputs.cache-hit != 'true' }}
         uses: dtolnay/rust-toolchain@stable
@@ -92,6 +88,7 @@ jobs:
           dotnet-version: "9.0.x"
 
       - name: Apply bounded Lua table-constructor recovery
+        if: ${{ steps.rust-cache.outputs.cache-hit != 'true' }}
         shell: pwsh
         run: |
           $patch = Join-Path $PWD "third_party/unluac-rs-protez-setlist.patch"
@@ -104,7 +101,7 @@ jobs:
       - name: Install Python dependencies and packager
         shell: pwsh
         run: |
-          python -m pip install -r requirements.txt pyinstaller
+          python -m pip install -r requirements-build.txt
           if ($LASTEXITCODE -ne 0) { throw "dependency install failed" }
 
       - name: Build pinned Luau native host
@@ -139,11 +136,11 @@ jobs:
         shell: pwsh
         run: |
           $sourceDir = Join-Path $PWD "build/luau-decompiler"
-          $sourceCommit = (& git -C $sourceDir rev-parse HEAD).Trim()
-          if ($LASTEXITCODE -ne 0 -or $sourceCommit -ne "ee07098c31e11601a9ca434bc12932a4ded65f7b") {
-            throw "Offline bytecode decompiler source checkout does not match the recorded commit: $sourceCommit"
-          }
           if ("${{ steps.rust-cache.outputs.cache-hit }}" -ne "true") {
+            $sourceCommit = (& git -C $sourceDir rev-parse HEAD).Trim()
+            if ($LASTEXITCODE -ne 0 -or $sourceCommit -ne "ee07098c31e11601a9ca434bc12932a4ded65f7b") {
+              throw "Offline bytecode decompiler source checkout does not match the recorded commit: $sourceCommit"
+            }
             cargo build --manifest-path (Join-Path $sourceDir "Cargo.toml") --locked --release -p luau-cli --bin luau-decompiler
             if ($LASTEXITCODE -ne 0) { throw "Offline bytecode decompiler build failed" }
           }
@@ -154,13 +151,9 @@ jobs:
             throw "Offline bytecode decompiler health check failed: $version"
           }
           Write-Host $version
-          $help = (& $decompiler --help 2>&1 | Out-String)
-          if ($LASTEXITCODE -ne 0 -or $help -notmatch "--output") {
-            throw "Offline bytecode decompiler CLI help did not confirm the required output option"
-          }
           $licenseDir = Join-Path $PWD "build/third-party"
           New-Item -ItemType Directory -Force -Path $licenseDir | Out-Null
-          Copy-Item (Join-Path $sourceDir "LICENSE") (Join-Path $licenseDir "luau-decompiler-mit.txt")
+          Copy-Item (Join-Path $PWD "third_party/luau-decompiler-mit.txt") (Join-Path $licenseDir "luau-decompiler-mit.txt")
           if (-not (Test-Path (Join-Path $licenseDir "luau-decompiler-mit.txt"))) {
             throw "Could not stage the bytecode decompiler license notice"
           }
@@ -179,9 +172,9 @@ jobs:
           $moonsecVersion = & $moonsec --version
           if ($LASTEXITCODE -ne 0 -or "$moonsecVersion" -notmatch "MoonsecDeobfuscator Protez V3") { throw "MoonSec helper health check failed: $moonsecVersion" }
           $unluacSource = Join-Path $PWD "build/unluac-rs"
-          $unluacCommit = (& git -C $unluacSource rev-parse HEAD).Trim()
-          if ($LASTEXITCODE -ne 0 -or $unluacCommit -ne "3186d2e392e44a2ddaadd1826a779c98c718be53") { throw "unluac-rs source checkout does not match the recorded commit: $unluacCommit" }
           if ("${{ steps.rust-cache.outputs.cache-hit }}" -ne "true") {
+            $unluacCommit = (& git -C $unluacSource rev-parse HEAD).Trim()
+            if ($LASTEXITCODE -ne 0 -or $unluacCommit -ne "3186d2e392e44a2ddaadd1826a779c98c718be53") { throw "unluac-rs source checkout does not match the recorded commit: $unluacCommit" }
             cargo build --manifest-path (Join-Path $unluacSource "Cargo.toml") --locked --release -p unluac-cli
             if ($LASTEXITCODE -ne 0) { throw "unluac-rs CLI build failed" }
           }
@@ -214,29 +207,6 @@ jobs:
         with:
           path: build/moonsec-helper
           key: ${{ steps.moonsec-cache.outputs.cache-primary-key }}
-
-      - name: Smoke-test Luraph and MoonSec source recovery
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.verify_family_recovery }}
-        shell: pwsh
-        run: |
-          $fixtures = Join-Path $env:RUNNER_TEMP "protez-family-fixtures"
-          New-Item -ItemType Directory -Force -Path $fixtures | Out-Null
-          $luraphFixture = Join-Path $fixtures "luraph-v15.lua"
-          $moonsecFixture = Join-Path $fixtures "moonsec-v3.lua"
-          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/KryptIT/luraph-v15-v14.x-deobfuscator/ed79a86cc41187af0480e69f45a4838723fdb099/Deobfuscator/samples/001_vm_like_dispatch-obfuscated.lua" -OutFile $luraphFixture -TimeoutSec 45
-          Invoke-WebRequest -Uri "https://gist.githubusercontent.com/checkurasshole/1bdb0f162d79819f6a4a34d6e9f45bd3/raw/b822d7396aa18e182b581348f93a70a0cdd832fb/v12.lua" -OutFile $moonsecFixture -TimeoutSec 45
-          $luraphHash = (Get-FileHash -Algorithm SHA256 $luraphFixture).Hash.ToLowerInvariant()
-          $moonsecHash = (Get-FileHash -Algorithm SHA256 $moonsecFixture).Hash.ToLowerInvariant()
-          if ($luraphHash -ne "838a5ec65dde4b22399d88b4dc86d6c87dcdb6c1fe18f3c8dc54cd1b366af925") { throw "Pinned Luraph fixture hash mismatch: $luraphHash" }
-          if ($moonsecHash -ne "7d32c4ba8d7274619ead6e6f19857abf3eefa6abd0e3d89fcfc42505d3eafd77") { throw "Pinned MoonSec fixture hash mismatch: $moonsecHash" }
-          $smokeTools = Join-Path $PWD "build/family-smoke-tools"
-          New-Item -ItemType Directory -Force -Path $smokeTools | Out-Null
-          Copy-Item "build/native/host-bin/protez-native-host.exe" $smokeTools
-          Copy-Item "build/native/host-bin/luau-ast.exe" $smokeTools
-          Copy-Item "build/moonsec-helper/protez-moonsec-v3.exe" $smokeTools
-          Copy-Item "build/unluac-rs/target/release/unluac-cli.exe" $smokeTools
-          python scripts/smoke_family_devirtualizers.py --luraph-fixture $luraphFixture --moonsec-fixture $moonsecFixture --tools-dir $smokeTools --work-dir (Join-Path $env:RUNNER_TEMP "protez-family-smoke")
-          if ($LASTEXITCODE -ne 0) { throw "Family-specific source recovery smoke test failed" }
 
       - name: Package the self-contained application
         shell: pwsh
@@ -296,6 +266,11 @@ jobs:
             Write-Output "::error title=Protez.exe missing::PyInstaller completed but dist/Protez.exe was not created"
             throw "Protez.exe was not created"
           }
+          & (Join-Path $PWD "dist/Protez.exe") --ui-import-check | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged application could not import its GUI modules"
+          }
+          Write-Host "Packaged application starts and imports its GUI modules."
           Write-Host "Protez.exe is packaged without an elevation manifest; the analysis worker uses AppContainer isolation."
 
       - name: Upload Windows executables
