@@ -169,7 +169,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $fixtures | Out-Null
           $luraphFixture = Join-Path $fixtures "luraph-v15.lua"
           $moonsecFixture = Join-Path $fixtures "moonsec-v3.lua"
-          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/KryptIT/Deobfuscator/ed79a86cc41187af0480e69f45a4838723fdb099/Deobfuscator/samples/001_vm_like_dispatch-obfuscated.lua" -OutFile $luraphFixture -TimeoutSec 45
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/KryptIT/luraph-v15-v14.x-deobfuscator/ed79a86cc41187af0480e69f45a4838723fdb099/Deobfuscator/samples/001_vm_like_dispatch-obfuscated.lua" -OutFile $luraphFixture -TimeoutSec 45
           Invoke-WebRequest -Uri "https://gist.githubusercontent.com/checkurasshole/1bdb0f162d79819f6a4a34d6e9f45bd3/raw/b822d7396aa18e182b581348f93a70a0cdd832fb/v12.lua" -OutFile $moonsecFixture -TimeoutSec 45
           $luraphHash = (Get-FileHash -Algorithm SHA256 $luraphFixture).Hash.ToLowerInvariant()
           $moonsecHash = (Get-FileHash -Algorithm SHA256 $moonsecFixture).Hash.ToLowerInvariant()
