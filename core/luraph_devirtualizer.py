@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
-from core.deobfuscator import tokenize
+from core.deobfuscator import count_remote_payload_loaders, tokenize
 from core.runtime_paths import RESOURCE_ROOT
 from core.sandbox import Sandbox, SandboxResult
 
@@ -128,6 +128,7 @@ def _lift_incomplete_reasons(
     unresolved_constant_count: int,
     unresolved_runtime_functions: tuple[str, ...],
     placeholder_counts: dict[str, int],
+    remote_payload_loader_count: int = 0,
 ) -> tuple[str, ...]:
     reasons: list[str] = []
     if stats.get("functions", 0) <= 0:
@@ -144,6 +145,10 @@ def _lift_incomplete_reasons(
         if count:
             label = key.replace("_", " ")
             reasons.append(f"{count} {label} remain in the lifted source")
+    if remote_payload_loader_count:
+        reasons.append(
+            f"{remote_payload_loader_count} remotely fetched Lua payloads are not embedded in the lifted source"
+        )
     if not source.strip():
         reasons.append("the lifter emitted no source statements")
     return tuple(reasons)
@@ -455,6 +460,7 @@ def devirtualize_luraph_v15(
                     unresolved_constant_count=unresolved_constant_count,
                     unresolved_runtime_functions=unresolved_runtime,
                     placeholder_counts=placeholder_counts,
+                    remote_payload_loader_count=count_remote_payload_loaders(lifted),
                 )
                 output_path.write_text(lifted, encoding="utf-8", newline="")
                 trace_source = None

@@ -184,6 +184,60 @@ def tokenize(source: str) -> list[Token]:
     return tokens
 
 
+def count_remote_payload_loaders(source: str) -> int:
+    """Count dynamic code loaders whose argument contains a recognizable HTTP fetch."""
+    tokens = tokenize(source)
+    remote_fetch_names = {
+        "httpget",
+        "httppost",
+        "getasync",
+        "postasync",
+        "request",
+        "http_request",
+        "httprequest",
+        "httprequestasync",
+    }
+    loader_names = {"load", "loadstring"}
+    for index in range(len(tokens) - 3):
+        if (
+            tokens[index].kind == "identifier"
+            and tokens[index].text == "local"
+            and tokens[index + 1].kind == "identifier"
+            and tokens[index + 2].text == "="
+            and tokens[index + 3].kind == "identifier"
+            and tokens[index + 3].text.lower() in loader_names
+        ):
+            loader_names.add(tokens[index + 1].text.lower())
+
+    count = 0
+    for index, token in enumerate(tokens[:-1]):
+        if (
+            token.kind != "identifier"
+            or token.text.lower() not in loader_names
+            or tokens[index + 1].text != "("
+        ):
+            continue
+
+        depth = 0
+        contains_fetch = False
+        for argument_token in tokens[index + 1 :]:
+            if argument_token.text == "(":
+                depth += 1
+            elif argument_token.text == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif (
+                depth > 0
+                and argument_token.kind == "identifier"
+                and argument_token.text.lower() in remote_fetch_names
+            ):
+                contains_fetch = True
+        if contains_fetch:
+            count += 1
+    return count
+
+
 def _decode_string(token: Token) -> bytes | None:
     text = token.text
     if not text:

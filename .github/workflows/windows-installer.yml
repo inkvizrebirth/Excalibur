@@ -335,7 +335,7 @@ jobs:
           Copy-Item "build/release-inputs/native/luau-ast.exe" $smokeTools
           Copy-Item "build/release-inputs/moonsec/protez-moonsec-v3.exe" $smokeTools
           Copy-Item "build/release-inputs/rust/unluac-cli.exe" $smokeTools
-          python scripts/smoke_family_devirtualizers.py --luraph-fixture $luraphFixture --luraph-ground-truth $luraphGroundTruth --luraph-fixture $luraphRepresentative --moonsec-fixture $moonsecFixture --moonsec-fixture $moonsecRepresentative --moonsec-fixture $moonsecSecondVariant --tools-dir $smokeTools --work-dir (Join-Path $env:RUNNER_TEMP "protez-family-smoke")
+          python scripts/smoke_family_devirtualizers.py --luraph-fixture $luraphFixture --luraph-ground-truth $luraphGroundTruth --luraph-fixture $luraphRepresentative --moonsec-fixture $moonsecFixture --moonsec-fixture $moonsecRepresentative --moonsec-fixture $moonsecSecondVariant --remote-payload-loader-fixture $moonsecFixture --remote-payload-loader-fixture $moonsecRepresentative --remote-payload-loader-fixture $moonsecSecondVariant --runtime-capture-fixture $luraphRepresentative --tools-dir $smokeTools --work-dir (Join-Path $env:RUNNER_TEMP "protez-family-smoke")
           if ($LASTEXITCODE -ne 0) { throw "Family-specific source recovery smoke test failed" }
 
       - name: Preserve family smoke diagnostics

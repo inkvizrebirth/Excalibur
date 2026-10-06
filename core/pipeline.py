@@ -21,7 +21,12 @@ from core.bytecode_decompiler import (
     BytecodeDecompilerError,
     LocalBytecodeDecompiler,
 )
-from core.deobfuscator import DeobfuscationResult, deobfuscate_source
+from core.deobfuscator import (
+    DeobfuscationResult,
+    count_remote_payload_loaders,
+    deobfuscate_source,
+    tokenize,
+)
 from core.formatter import format_luau
 from core.luraph_static import (
     LuraphStaticError,
@@ -49,6 +54,7 @@ DEFAULT_TOOLS_DIR = TOOLS_DIR
 MAX_PAYLOAD_LAYERS = 6
 MAX_PAYLOAD_CANDIDATES = 20
 MAX_PIPELINE_SECONDS = 90.0
+MAX_DYNAMIC_CAPTURE_ARTIFACT_BYTES = 16 * 1024 * 1024
 
 
 class PipelineError(RuntimeError):
@@ -728,8 +734,34 @@ class DeobfuscationPipeline:
                 except PipelineError as exc:
                     error = f"Lua 5.1 decompiler output did not pass Luau syntax validation: {exc}"
 
+        diagnostic_markers = tuple(
+            sorted(
+                {
+                    "unluac_error_placeholder"
+                    for token in tokenize(source_candidate or "")
+                    if token.kind == "comment" and "[unluac error]" in token.text.lower()
+                }
+            )
+        )
+        remote_payload_loader_count = count_remote_payload_loaders(source_candidate or "")
+        partial_reasons: list[str] = []
+        if source_candidate is None:
+            partial_reasons.append("lua51_source_not_lifted")
+        elif not source_valid:
+            partial_reasons.append("lua51_source_failed_luau_validation")
+        if diagnostic_markers:
+            partial_reasons.extend(diagnostic_markers)
+        if remote_payload_loader_count:
+            partial_reasons.append("remote_payload_loader_not_embedded")
+        if devirtualized is None:
+            partial_reasons.append("moonsec_v3_bytecode_not_recovered")
+        elif devirtualized.error:
+            partial_reasons.append("moonsec_v3_lifter_reported_error")
+
+        source_recovered = source_valid and not partial_reasons
+
         artifacts: list[tuple[Path, bytes]] = []
-        if source_valid and source_candidate is not None:
+        if source_recovered and source_candidate is not None:
             artifacts.append((output_path, source_candidate.encode("utf-8")))
             primary_path = output_path
         else:
@@ -748,8 +780,9 @@ class DeobfuscationPipeline:
         if devirtualized is not None and devirtualized.disassembly:
             artifacts.append((disassembly_path, devirtualized.disassembly.encode("utf-8")))
 
-        status = "complete" if source_valid else "partial"
+        status = "complete" if source_recovered else "partial"
         duration = time.monotonic() - started
+        diagnostic_error = error or (devirtualized.error if devirtualized else None)
         report = {
             "app_version": VERSION,
             "status": status,
@@ -763,21 +796,25 @@ class DeobfuscationPipeline:
                 "decompiler": devirtualized.decompiler_version if devirtualized else "unluac-rs 1.4.4",
                 "attempted": True,
                 "lua51_bytecode_recovered": bool(devirtualized and devirtualized.bytecode),
-                "source_recovered": source_valid,
+                "source_recovered": source_recovered,
                 "source_parsed_as_luau": source_valid,
+                "source_recovery_complete": source_recovered,
+                "unresolved_placeholder_count": len(diagnostic_markers),
+                "remote_payload_loader_count": remote_payload_loader_count,
+                "partial_reasons": partial_reasons,
                 "semantic_equivalence_verified": False,
                 "elapsed_seconds": round(devirtualized.elapsed_seconds, 3) if devirtualized else None,
                 "lua51_bytecode_bytes": len(devirtualized.bytecode) if devirtualized and devirtualized.bytecode else None,
                 "lua51_bytecode_sha256": hashlib.sha256(devirtualized.bytecode).hexdigest() if devirtualized and devirtualized.bytecode else None,
                 "source_bytes": len(source_candidate.encode("utf-8")) if source_candidate is not None else None,
-                "error": error or (devirtualized.error if devirtualized else None),
+                "error": diagnostic_error,
             },
             "bytecode_executed": False,
             "input_transformations": list(source_analysis.transformations),
             "outputs": {
-                "source": str(output_path) if source_valid else None,
-                "unvalidated_source_candidate": str(candidate_path) if source_candidate is not None and not source_valid else None,
-                "static_preview": str(preview_path) if not source_valid else None,
+                "source": str(output_path) if source_recovered else None,
+                "partial_source_candidate": str(candidate_path) if source_candidate is not None and not source_recovered else None,
+                "static_preview": str(preview_path) if not source_recovered else None,
                 "lua51_bytecode": str(bytecode_path) if devirtualized and devirtualized.bytecode else None,
                 "disassembly": str(disassembly_path) if devirtualized and devirtualized.disassembly else None,
                 "report": str(report_path),
@@ -804,21 +841,23 @@ class DeobfuscationPipeline:
         notice = (
             "MoonSec V3 bytecode was lifted to readable Lua and passed Luau syntax validation; "
             "semantic equivalence is not verified."
-            if source_valid
-            else f"MoonSec V3 analysis is partial. {error or (devirtualized.error if devirtualized else 'No bytecode was recovered.')}"
+            if source_recovered
+            else "MoonSec V3 analysis is partial: "
+            + ", ".join(partial_reasons)
+            + (f". {diagnostic_error}" if diagnostic_error else ".")
         )
         self.logger.info("MoonSec analysis report written to %s", report_path)
-        self._progress(100, "DONE" if source_valid else "PARTIAL")
+        self._progress(100, "DONE" if source_recovered else "PARTIAL")
         return PipelineResult(
             output_path=primary_path,
             report_path=report_path,
             route=str(report["route"]),
             decoded_layers=0,
-            transformations=("MoonSec V3 VM to Lua 5.1 bytecode", "Lua 5.1 bytecode source lifting") if source_valid else (),
+            transformations=("MoonSec V3 VM to Lua 5.1 bytecode", "Lua 5.1 bytecode source lifting") if source_recovered else (),
             sandbox_result=None,
             status=status,
             notice=notice,
-            preview_path=preview_path if not source_valid else None,
+            preview_path=preview_path if not source_recovered else None,
         )
 
     def _format_verified_candidate(
@@ -884,6 +923,69 @@ class DeobfuscationPipeline:
             if text.strip():
                 payloads.append(text)
         return tuple(payloads)
+
+    def _best_luraph_runtime_payload(
+        self,
+        devirtualized: LuraphDevirtualizationResult,
+        *,
+        compiler: _LuauCompiler,
+        deadline: float,
+    ) -> tuple[str | None, dict[str, object] | None]:
+        """Find a substantial, syntax-valid loadstring body captured by the isolated Luraph run."""
+        minimum_bytes = max(512, len(devirtualized.source.encode("utf-8")) * 2)
+        candidates: list[tuple[int, int, int, str, dict[str, object]]] = []
+        inspected = 0
+        for run_index, run in enumerate(devirtualized.run_results, start=1):
+            paths = run.captured_paths or ((run.captured_path,) if run.captured_path else ())
+            for capture_index, capture in enumerate(run.captures, start=1):
+                if capture.kind.lower() not in {"loadstring", "load"}:
+                    continue
+                if inspected >= MAX_PAYLOAD_CANDIDATES or time.monotonic() >= deadline:
+                    break
+                if capture_index > len(paths) or paths[capture_index - 1] is None:
+                    continue
+                path = paths[capture_index - 1]
+                inspected += 1
+                try:
+                    if path.stat().st_size > MAX_DYNAMIC_CAPTURE_ARTIFACT_BYTES:
+                        continue
+                    captured = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                try:
+                    decoded = deobfuscate_source(captured)
+                except Exception as exc:
+                    self.logger.info("Skipped captured Luraph payload %s.%s during static decoding: %s", run_index, capture.index, str(exc)[:400])
+                    continue
+                candidate = decoded.source
+                candidate_bytes = candidate.encode("utf-8")
+                if len(candidate_bytes) < minimum_bytes or inspect_protection(candidate) is not None:
+                    continue
+                if count_remote_payload_loaders(candidate):
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None, None
+                compiler.timeout_seconds = min(self.compiler_timeout_seconds, remaining)
+                try:
+                    compiler.verify_text(candidate, label=f"captured Luraph payload {run_index}.{capture.index}")
+                except PipelineError as exc:
+                    self.logger.info("Skipped captured Luraph payload %s.%s: %s", run_index, capture.index, str(exc)[:400])
+                    continue
+                metadata: dict[str, object] = {
+                    "run": run_index,
+                    "index": capture.index,
+                    "kind": capture.kind,
+                    "source_bytes": len(candidate_bytes),
+                    "source_sha256": hashlib.sha256(candidate_bytes).hexdigest(),
+                    "static_transformations": list(decoded.transformations),
+                }
+                candidates.append((len(candidate_bytes), run_index, capture.index, candidate, metadata))
+        if not candidates:
+            return None, None
+        _size, _run, _capture, source, metadata = max(candidates, key=lambda item: item[:3])
+        metadata["valid_candidate_count"] = len(candidates)
+        return source, metadata
 
     @staticmethod
     def _sandbox_outcome(result: SandboxResult | None) -> str:
@@ -1065,6 +1167,13 @@ class DeobfuscationPipeline:
         started: float,
         deadline: float,
     ) -> PipelineResult:
+        captured_source, captured_source_info = self._best_luraph_runtime_payload(
+            devirtualized,
+            compiler=compiler,
+            deadline=deadline,
+        )
+        source_candidate = captured_source or devirtualized.source
+        source_origin = "runtime-loadstring-capture" if captured_source is not None else "vm-lifter"
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise LuraphDevirtualizationError(
@@ -1072,19 +1181,27 @@ class DeobfuscationPipeline:
             )
         compiler.timeout_seconds = min(self.compiler_timeout_seconds, remaining)
         try:
-            compiler.verify_text(devirtualized.source, label="Luraph v15 lifted source")
+            compiler.verify_text(source_candidate, label=f"Luraph v15 {source_origin} source")
         except PipelineError as exc:
             raise LuraphDevirtualizationError(
-                f"the Luraph v15 lifter output failed Luau syntax validation: {exc}"
+                f"the Luraph v15 {source_origin} output failed Luau syntax validation: {exc}"
             ) from exc
 
         formatted_source, formatting_applied = self._format_verified_candidate(
-            devirtualized.source,
+            source_candidate,
             compiler,
-            label="formatted Luraph v15 source",
+            label=f"formatted Luraph v15 {source_origin} source",
             deadline=deadline,
         )
-        recovery_complete = not devirtualized.incomplete_reasons
+        output_partial_reasons = list(devirtualized.incomplete_reasons)
+        if captured_source is not None:
+            output_partial_reasons = [
+                reason for reason in output_partial_reasons
+                if "remotely fetched Lua payloads are not embedded" not in reason
+            ]
+            if int((captured_source_info or {}).get("valid_candidate_count", 0)) > 1:
+                output_partial_reasons.append("multiple captured Lua payloads were not merged")
+        recovery_complete = not output_partial_reasons
         status = "complete" if recovery_complete else "partial"
         elapsed = time.monotonic() - started
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1110,16 +1227,69 @@ class DeobfuscationPipeline:
             }
             for index, run in enumerate(devirtualized.run_results, start=1)
         ]
+        capture_artifacts: list[dict[str, object]] = []
+        capture_writes: list[tuple[Path, bytes]] = []
+        for run_index, run in enumerate(devirtualized.run_results, start=1):
+            paths = run.captured_paths or ((run.captured_path,) if run.captured_path else ())
+            for capture_index, capture in enumerate(run.captures, start=1):
+                path = paths[capture_index - 1] if capture_index <= len(paths) else None
+                entry: dict[str, object] = {
+                    "run": run_index,
+                    "index": capture.index,
+                    "kind": capture.kind,
+                    "size_bytes": capture.size_bytes,
+                }
+                if (
+                    captured_source_info is not None
+                    and captured_source_info.get("run") == run_index
+                    and captured_source_info.get("index") == capture.index
+                ):
+                    entry["selected_as_recovered_source"] = True
+                if path is not None and path.is_file():
+                    try:
+                        if path.stat().st_size > MAX_DYNAMIC_CAPTURE_ARTIFACT_BYTES:
+                            entry["omitted_reason"] = "capture exceeds Protez's 16 MiB artifact limit"
+                            capture_artifacts.append(entry)
+                            continue
+                        payload = path.read_bytes()
+                        suffix = ".luau"
+                        try:
+                            payload.decode("utf-8")
+                        except UnicodeDecodeError:
+                            suffix = ".bin"
+                        output_capture_path = self.output_dir / (
+                            f"devirtualized_{timestamp}.runtime-{run_index:02d}-{capture_index:02d}{suffix}"
+                        )
+                        entry["output"] = str(output_capture_path)
+                        entry["sha256"] = hashlib.sha256(payload).hexdigest()
+                        capture_artifacts.append(entry)
+                        capture_writes.append((output_capture_path, payload))
+                    except OSError as exc:
+                        entry["error"] = str(exc)
+                        capture_artifacts.append(entry)
+                else:
+                    capture_artifacts.append(entry)
+        if captured_source_info is not None:
+            selected_capture_artifact = next(
+                (
+                    entry.get("output")
+                    for entry in capture_artifacts
+                    if entry.get("selected_as_recovered_source") is True
+                ),
+                None,
+            )
+            captured_source_info["artifact"] = selected_capture_artifact
         transformations = (
             "Luraph v15 VM proto/opcode lifting",
             "offline Roblox API model used during constant recovery",
+        ) + (("sandbox-captured loadstring payload",) if captured_source is not None else ()) + (
             "Luau compile-only syntax verification",
         ) + (("compile-verified whitespace formatting",) if formatting_applied else ())
         report = {
             "app_version": VERSION,
             "status": status,
             "source_name": source_name,
-            "route": devirtualized.route,
+            "route": devirtualized.route + ("+captured-loadstring" if captured_source is not None else ""),
             "duration_seconds": round(elapsed, 3),
             "input_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
             "output_sha256": hashlib.sha256(formatted_source.encode("utf-8")).hexdigest(),
@@ -1138,6 +1308,9 @@ class DeobfuscationPipeline:
                 "provenance": "imnotherfav/deobfuscator-luraph-v15",
                 "source_commit": "5a1ac583b69451f56dd735d2a1de6ab7a513432b",
                 "source_bytes": devirtualized.source_bytes,
+                "recovered_source_bytes": len(formatted_source.encode("utf-8")),
+                "source_origin": source_origin,
+                "runtime_capture_recovery": captured_source_info,
                 "elapsed_seconds": round(devirtualized.elapsed_seconds, 3),
                 "vm_prototypes_lifted": devirtualized.lift_stats.get("functions", 0) > 0,
                 "lift_stats": devirtualized.lift_stats,
@@ -1146,7 +1319,9 @@ class DeobfuscationPipeline:
                 "constant_misses": devirtualized.constant_misses,
                 "unresolved_runtime_functions": list(devirtualized.unresolved_runtime_functions),
                 "placeholder_counts": devirtualized.placeholder_counts,
-                "partial_reasons": list(devirtualized.incomplete_reasons),
+                "remote_payload_loader_count": count_remote_payload_loaders(source_candidate),
+                "partial_reasons": output_partial_reasons,
+                "vm_lift_partial_reasons": list(devirtualized.incomplete_reasons),
                 "readability_status": status,
                 "version_scope": "Luraph v15 wrappers matching the supported VM structure",
             },
@@ -1165,30 +1340,39 @@ class DeobfuscationPipeline:
             "outputs": {
                 "source": str(output_path) if recovery_complete else None,
                 "partial_source_candidate": str(output_path) if not recovery_complete else None,
+                "runtime_captured_source": str(output_path) if captured_source is not None else None,
                 "behavior_trace": str(trace_path) if trace_path else None,
+                "runtime_capture_payloads": capture_artifacts,
                 "report": str(report_path),
             },
             "known_losses": [
                 "Comments and original local names are not recoverable from the VM representation.",
                 "Some control-flow edges and API values may remain approximate when the wrapper structure is unsupported.",
                 "Syntax validation does not prove semantic equivalence to the protected program.",
-            ] + (list(devirtualized.incomplete_reasons) if not recovery_complete else []),
+            ] + (list(output_partial_reasons) if not recovery_complete else []) + (
+                ["Runtime loadstring capture was not independently executed or checked for semantic equivalence."]
+                if captured_source is not None
+                else []
+            ),
         }
         if recovery_complete:
             notice = (
-                "Luraph v15 VM code was lifted into readable Luau and passed a compile-only syntax check. "
+                "Luraph v15 source was recovered from an isolated loadstring capture and passed a compile-only syntax check. "
+                "Original comments/names and semantic equivalence are not recovered or verified."
+                if captured_source is not None
+                else "Luraph v15 VM code was lifted into readable Luau and passed a compile-only syntax check. "
                 "Original comments/names and semantic equivalence are not recovered or verified."
             )
         else:
-            reasons = "; ".join(devirtualized.incomplete_reasons)
+            reasons = "; ".join(output_partial_reasons)
             notice = (
                 "Luraph v15 produced a partial Luau candidate. It is syntax-valid, but the report lists "
-                f"unresolved VM logic: {reasons}. Protez did not mark it as recovered source."
+                f"unresolved source content: {reasons}. Protez did not mark it as fully recovered source."
             )
         writes: list[tuple[Path, bytes]] = [
             (output_path, formatted_source.encode("utf-8")),
             (report_path, (json.dumps(report, indent=2, ensure_ascii=False) + "\n").encode("utf-8")),
-        ]
+        ] + capture_writes
         if trace_path and devirtualized.trace_source is not None:
             writes.append((trace_path, devirtualized.trace_source.encode("utf-8")))
         temporary_paths = [path.with_name(path.name + ".tmp") for path, _ in writes]
@@ -1209,7 +1393,7 @@ class DeobfuscationPipeline:
         return PipelineResult(
             output_path=output_path,
             report_path=report_path,
-            route=devirtualized.route,
+            route=str(report["route"]),
             decoded_layers=0,
             transformations=transformations,
             sandbox_result=last_run,
