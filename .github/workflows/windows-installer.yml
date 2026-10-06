@@ -4,6 +4,12 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      verify_family_recovery:
+        description: Run the slower Luraph and MoonSec end-to-end smoke checks
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -207,6 +213,42 @@ jobs:
         with:
           path: build/moonsec-helper
           key: ${{ steps.moonsec-cache.outputs.cache-primary-key }}
+
+      - name: Smoke-test Luraph and MoonSec source recovery
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.verify_family_recovery }}
+        shell: pwsh
+        run: |
+          $fixtures = Join-Path $env:RUNNER_TEMP "protez-family-fixtures"
+          New-Item -ItemType Directory -Force -Path $fixtures | Out-Null
+          $luraphFixture = Join-Path $fixtures "luraph-v15.lua"
+          $moonsecFixture = Join-Path $fixtures "moonsec-v3.lua"
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/KryptIT/luraph-v15-v14.x-deobfuscator/ed79a86cc41187af0480e69f45a4838723fdb099/Deobfuscator/samples/001_vm_like_dispatch-obfuscated.lua" -OutFile $luraphFixture -TimeoutSec 45
+          Invoke-WebRequest -Uri "https://gist.githubusercontent.com/checkurasshole/1bdb0f162d79819f6a4a34d6e9f45bd3/raw/b822d7396aa18e182b581348f93a70a0cdd832fb/v12.lua" -OutFile $moonsecFixture -TimeoutSec 45
+          $luraphHash = (Get-FileHash -Algorithm SHA256 $luraphFixture).Hash.ToLowerInvariant()
+          $moonsecHash = (Get-FileHash -Algorithm SHA256 $moonsecFixture).Hash.ToLowerInvariant()
+          if ($luraphHash -ne "838a5ec65dde4b22399d88b4dc86d6c87dcdb6c1fe18f3c8dc54cd1b366af925") { throw "Pinned Luraph fixture hash mismatch: $luraphHash" }
+          if ($moonsecHash -ne "7d32c4ba8d7274619ead6e6f19857abf3eefa6abd0e3d89fcfc42505d3eafd77") { throw "Pinned MoonSec fixture hash mismatch: $moonsecHash" }
+          $smokeTools = Join-Path $PWD "build/family-smoke-tools"
+          New-Item -ItemType Directory -Force -Path $smokeTools | Out-Null
+          Copy-Item "build/native/host-bin/protez-native-host.exe" $smokeTools
+          Copy-Item "build/native/host-bin/luau-ast.exe" $smokeTools
+          Copy-Item "build/moonsec-helper/protez-moonsec-v3.exe" $smokeTools
+          Copy-Item "build/unluac-rs/target/release/unluac-cli.exe" $smokeTools
+          python scripts/smoke_family_devirtualizers.py --luraph-fixture $luraphFixture --moonsec-fixture $moonsecFixture --tools-dir $smokeTools --work-dir (Join-Path $env:RUNNER_TEMP "protez-family-smoke")
+          if ($LASTEXITCODE -ne 0) { throw "Family-specific source recovery smoke test failed" }
+
+      - name: Preserve family smoke diagnostics
+        if: ${{ failure() && github.event_name == 'workflow_dispatch' && inputs.verify_family_recovery }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Protez-family-smoke-diagnostics
+          path: |
+            logs/sandbox_*.log
+            logs/trace_*.jsonl
+            ${{ runner.temp }}/protez-family-smoke/**
+            ${{ runner.temp }}/protez-family-fixtures/**
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Package the self-contained application
         shell: pwsh

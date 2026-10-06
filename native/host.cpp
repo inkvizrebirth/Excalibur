@@ -2,6 +2,7 @@
 #include "lualib.h"
 #include "luacode.h"
 #include "lbytecode.h"
+#include "lfunc.h"
 #include "lstate.h"
 #include "Luau/BytecodeDump.h"
 #include "appcontainer_launcher.h"
@@ -84,6 +85,15 @@ struct TraceContext
     bool limitReported = false;
     bool outputFailed = false;
 };
+
+int sandboxClock(lua_State* state)
+{
+    const auto* context = static_cast<const TraceContext*>(lua_callbacks(state)->userdata);
+    const auto started = context ? context->started : std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    lua_pushnumber(state, elapsed);
+    return 1;
+}
 
 std::string base64(std::string_view input)
 {
@@ -310,37 +320,33 @@ void emitTrace(
     std::fflush(stdout);
 }
 
-std::string valueSummary(lua_State* state, int index)
+std::string valueSummary(const TValue* value)
 {
-    switch (lua_type(state, index))
+    switch (ttype(value))
     {
     case LUA_TNIL:
         return "nil";
     case LUA_TBOOLEAN:
-        return lua_toboolean(state, index) ? "true" : "false";
+        return bvalue(value) ? "true" : "false";
     case LUA_TNUMBER:
     {
-        const double value = lua_tonumber(state, index);
-        if (!std::isfinite(value))
+        const double number = nvalue(value);
+        if (!std::isfinite(number))
             return "number(non-finite)";
         std::ostringstream stream;
         stream.imbue(std::locale::classic());
-        stream << std::setprecision(12) << value;
+        stream << std::setprecision(12) << number;
         return stream.str();
     }
     case LUA_TINTEGER:
     {
-        int isInteger = 0;
-        const int64_t value = lua_tointeger64(state, index, &isInteger);
-        return isInteger ? std::to_string(value) : "integer";
+        return std::to_string(lvalue(value));
     }
     case LUA_TSTRING:
     {
-        size_t length = 0;
-        const char* value = lua_tolstring(state, index, &length);
-        if (!value)
-            return "<string>";
-        std::string result(value, std::min(length, kMaxTraceStringBytes));
+        const TString* string = tsvalue(value);
+        const size_t length = string->len;
+        std::string result(getstr(string), std::min(length, kMaxTraceStringBytes));
         if (length > kMaxTraceStringBytes)
             result += "...";
         return result;
@@ -348,7 +354,7 @@ std::string valueSummary(lua_State* state, int index)
     case LUA_TTABLE:
         return "<table>";
     case LUA_TFUNCTION:
-        return lua_iscfunction(state, index) ? "<c-function>" : "<function>";
+        return clvalue(value)->isC ? "<c-function>" : "<function>";
     case LUA_TUSERDATA:
         return "<userdata>";
     case LUA_TLIGHTUSERDATA:
@@ -364,50 +370,38 @@ std::string valueSummary(lua_State* state, int index)
     }
 }
 
-struct LuaStackGuard
-{
-    lua_State* state;
-    int top;
-
-    explicit LuaStackGuard(lua_State* value)
-        : state(value)
-        , top(lua_gettop(value))
-    {
-    }
-
-    ~LuaStackGuard()
-    {
-        lua_settop(state, top);
-    }
-};
-
 std::string snapshotLocals(lua_State* state)
 {
-    if (!lua_checkstack(state, static_cast<int>(kMaxLocalsPerSnapshot + 2)))
+    if (!state || !state->ci || !state->ci->p || !state->ci->savedpc ||
+        !state->ci->p->code || !state->ci->base)
         return "null";
 
-    LuaStackGuard stackGuard(state);
+    const Proto* proto = state->ci->p;
+    const std::ptrdiff_t offset = state->ci->savedpc - proto->code;
+    if (offset < 0 || offset >= proto->sizecode)
+        return "null";
+
     std::string output = "[";
     bool first = true;
     for (int index = 1; index <= static_cast<int>(kMaxLocalsPerSnapshot); ++index)
     {
-        const char* name = lua_getlocal(state, 0, index);
-        if (!name)
+        const LocVar* local = luaF_getlocal(proto, index, static_cast<int>(offset));
+        if (!local)
             break;
 
-        const int valueType = lua_type(state, -1);
+        const TValue* value = state->ci->base + local->reg;
+        const int valueType = ttype(value);
         const char* typeName = lua_typename(state, valueType);
-        const std::string value = valueSummary(state, -1);
-        lua_pop(state, 1);
+        const std::string summary = valueSummary(value);
         if (!first)
             output.push_back(',');
         first = false;
         output += "{\"name\":";
-        output += jsonQuote(name);
+        output += jsonQuote(getstr(local->varname));
         output += ",\"type\":";
         output += jsonQuote(typeName ? typeName : "unknown");
         output += ",\"value\":";
-        output += jsonQuote(value);
+        output += jsonQuote(summary);
         output.push_back('}');
     }
     output.push_back(']');
@@ -431,7 +425,6 @@ void debugStep(lua_State* state, lua_Debug* info)
     if (context->traceStopped || context->outputFailed)
     {
         lua_singlestep(state, 0);
-        lua_callbacks(state)->debugstep = nullptr;
         return;
     }
     if (!context->active)
@@ -453,7 +446,6 @@ void debugStep(lua_State* state, lua_Debug* info)
                 0,
                 "{\"max_steps\":" + std::to_string(context->maxSteps) + "}");
         }
-        lua_callbacks(state)->debugstep = nullptr;
         return;
     }
 
@@ -545,7 +537,6 @@ void debugStep(lua_State* state, lua_Debug* info)
         {
             context->active = false;
             lua_singlestep(state, 0);
-            lua_callbacks(state)->debugstep = nullptr;
         }
     }
     catch (...)
@@ -553,7 +544,6 @@ void debugStep(lua_State* state, lua_Debug* info)
         context->active = false;
         context->traceStopped = true;
         lua_singlestep(state, 0);
-        lua_callbacks(state)->debugstep = nullptr;
     }
 }
 
@@ -577,7 +567,6 @@ void startTrace(lua_State* state, TraceContext& context)
     {
         context.active = false;
         lua_singlestep(state, 0);
-        lua_callbacks(state)->debugstep = nullptr;
     }
 }
 
@@ -814,6 +803,10 @@ int main(int argc, char** argv)
     if (!captureToken.empty())
         trace.capturePrefix = "__PROTEZ_CAPTURE_" + captureToken + "|";
     lua_callbacks(state)->userdata = &trace;
+    lua_newtable(state);
+    lua_pushcfunction(state, sandboxClock, "clock");
+    lua_setfield(state, -2, "clock");
+    lua_setglobal(state, "os");
     lua_pushcfunction(state, protectedLoadString, "loadstring");
     lua_setglobal(state, "loadstring");
     lua_pushcfunction(state, protectedLoad, "load");
