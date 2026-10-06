@@ -7,7 +7,10 @@ code and logs.
 
 from __future__ import annotations
 
-import tkinter.font as tkfont
+try:  # Tk is optional for headless tooling (preview rendering, tests)
+    import tkinter.font as tkfont
+except Exception:  # noqa: BLE001 - no display or no Tk build
+    tkfont = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Palette — deep slate grid, mint accent, amber warning.
@@ -76,6 +79,8 @@ _UI_CANDIDATES = (
 
 
 def _pick_family(candidates: tuple[str, ...]) -> str:
+    if tkfont is None:
+        return candidates[-1]
     try:
         available = {name.lower() for name in tkfont.families()}
     except Exception:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from gui import highlight
 from gui.pixelfont import (
@@ -88,6 +89,59 @@ class HighlightTests(unittest.TestCase):
         counts = highlight.summarize("local a = 1 -- c\n")
         self.assertEqual(counts.get(highlight.TAG_KEYWORD), 1)
         self.assertEqual(counts.get(highlight.TAG_COMMENT), 1)
+
+
+class PixelLabelCoverageTests(unittest.TestCase):
+    """Every string drawn by the bitmap font must have a real glyph."""
+
+    _PIXEL_WIDGETS = (
+        "PixelLabel",
+        "PixelButton",
+        "PixelToggle",
+        "PixelProgress",
+        "PixelDropdown",
+        "PixelEntry",
+        "PixelTextArea",
+        "PixelPanel",
+    )
+
+    def _label_strings(self) -> list[tuple[str, str]]:
+        import ast
+
+        found: list[tuple[str, str]] = []
+        gui = Path(__file__).resolve().parent.parent / "gui"
+        for path in sorted(gui.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+                if name not in self._PIXEL_WIDGETS:
+                    continue
+                for argument in node.args[1:]:
+                    if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                        found.append((f"{path.name}:{node.lineno}", argument.value))
+        return found
+
+    def test_no_label_falls_back_to_the_placeholder_glyph(self) -> None:
+        placeholder = glyph("?")
+        labels = self._label_strings()
+        self.assertTrue(labels, "no pixel-font labels were found in gui/")
+        for location, label in labels:
+            for character in label:
+                if character == " ":
+                    continue
+                with self.subTest(label=label, character=character, location=location):
+                    self.assertNotEqual(
+                        glyph(character),
+                        placeholder,
+                        f"{location} renders {character!r} as the placeholder",
+                    )
+
+    def test_known_accents_and_symbols_render(self) -> None:
+        for character in "\u2212\u2014\u2026\u2192\u2190\u25bc\u2713\u00b7":
+            with self.subTest(character=character):
+                self.assertNotEqual(glyph(character), glyph("?"))
 
 
 if __name__ == "__main__":
