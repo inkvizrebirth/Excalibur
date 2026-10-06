@@ -330,10 +330,12 @@ class Sandbox:
         trace: bool = False,
         trace_token: str | None = None,
         output_line_callback: Callable[[bytes], None] | None = None,
+        prelude: str | None = None,
     ) -> SandboxResult:
         if not isinstance(source, str):
             raise TypeError("source must be text")
-        source_bytes = source.encode("utf-8")
+        worker_source = f"{prelude}\n{source}" if prelude else source
+        source_bytes = worker_source.encode("utf-8")
         if len(source_bytes) > self.max_input_bytes:
             raise SandboxError(
                 f"Input is {len(source_bytes):,} bytes; limit is {self.max_input_bytes:,} bytes"
@@ -345,10 +347,11 @@ class Sandbox:
 
         with self._run_lock:
             return self._run_once(
-                source,
+                worker_source,
                 source_name,
                 len(source_bytes),
                 trace=trace,
+                prelude=prelude,
                 trace_token=trace_token,
                 output_line_callback=output_line_callback,
             )
@@ -359,6 +362,7 @@ class Sandbox:
         source_name: str,
         source_size: int,
         *,
+        prelude: str | None = None,
         trace: bool,
         trace_token: str | None,
         output_line_callback: Callable[[bytes], None] | None,
@@ -387,6 +391,12 @@ class Sandbox:
         started = time.monotonic()
 
         self.logger.info("Deobfuscation input: %s (%s bytes)", source_name, f"{source_size:,}")
+        if prelude:
+            self.logger.info(
+                "Executor environment prelude attached (%s bytes): %s",
+                f"{len(prelude.encode('utf-8')):,}",
+                (prelude.splitlines()[0] if prelude.splitlines() else "").strip()[:120],
+            )
         self.logger.info("Starting Luau in a networkless operating-system sandbox")
 
         with tempfile.TemporaryDirectory(prefix="protez-sandbox-", dir=self.logs_dir) as temp_dir:

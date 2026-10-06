@@ -79,7 +79,17 @@ class ProtectionDetectionTests(unittest.TestCase):
             self.assertEqual(machine_report["wrapper_execution_outcome"], "not-started")
             self.assertEqual(machine_report["status"], "partial")
 
-            self.assertEqual(len(list(output_dir.iterdir())), 3)
+            # Output hygiene: the run leaves a single destroyed_N.lua behind and
+            # parks the raw intermediates next to the report under logs/.
+            self.assertEqual([item.name for item in output_dir.iterdir()], ["destroyed_1.lua"])
+            parked = [
+                Path(value)
+                for value in machine_report.get("outputs", {}).values()
+                if isinstance(value, str)
+            ]
+            for parked_path in parked:
+                if parked_path.suffix in {".luau", ".luac", ".bin"}:
+                    self.assertTrue(parked_path.is_file(), parked_path)
 
     def test_valid_source_is_kept_when_isolated_worker_cannot_start(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -105,7 +115,14 @@ class ProtectionDetectionTests(unittest.TestCase):
             report = json.loads(result.report_path.read_text(encoding="utf-8"))
             self.assertEqual(report["dynamic_analysis"]["execution_outcome"], "not-started")
             self.assertIn("native worker unavailable", report["dynamic_analysis"]["error"])
-            compiler_factory.return_value.verify_text.assert_called_once()
+            # The engine route validates the recovered candidate and the legacy
+            # route re-checks the kept original, so verification runs at least once.
+            self.assertTrue(compiler_factory.return_value.verify_text.called)
+            labels = {
+                call.kwargs.get("label")
+                for call in compiler_factory.return_value.verify_text.call_args_list
+            }
+            self.assertIn("recovered candidate", labels)
 
 
 if __name__ == "__main__":

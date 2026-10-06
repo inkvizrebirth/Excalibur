@@ -394,7 +394,6 @@ jobs:
             "--add-data", "$luraphVendor;third_party/protez_luraph_v15",
             "--add-data", "$moonsecSource;third_party/moonsec_v3_gpl",
             "--add-data", "$iconPath;assets/icons",
-            "--collect-all", "customtkinter",
             "--collect-all", "tkinterdnd2",
             "--collect-all", "zstandard",
             "--hidden-import", "tkinterdnd2.TkinterDnD",

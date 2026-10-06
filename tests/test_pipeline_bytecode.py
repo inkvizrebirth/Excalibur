@@ -7,6 +7,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 from core.pipeline import DeobfuscationPipeline, InvalidLuauPayload
+def artifact_body(path: Path) -> str:
+    """Return the recovered code without the Protez banner comment block."""
+    text = Path(path).read_text(encoding="utf-8")
+    marker = "--" + "=" * 72
+    if text.startswith(marker):
+        closing = text.find(marker, len(marker))
+        if closing != -1:
+            return text[closing + len(marker):].strip("\n")
+    return text
+
 
 
 class BytecodePipelineTests(unittest.TestCase):
@@ -55,7 +65,9 @@ class BytecodePipelineTests(unittest.TestCase):
         result, verified, original, formatted = self._run_pipeline()
 
         self.assertEqual(result.status, "complete")
-        self.assertEqual(result.output_path.read_text(encoding="utf-8"), formatted)
+        self.assertEqual(result.output_path.name, "destroyed_1.lua")
+        self.assertEqual(artifact_body(result.output_path), formatted)
+        self.assertEqual([item.name for item in self.output.iterdir()], ["destroyed_1.lua"])
         self.assertEqual(verified, [
             (original, "decompiled bytecode output"),
             (formatted, "formatted decompiled bytecode"),
@@ -81,7 +93,7 @@ class BytecodePipelineTests(unittest.TestCase):
     def test_keeps_original_decompiler_output_when_formatted_candidate_fails(self) -> None:
         result, verified, original, formatted = self._run_pipeline(reject_formatted=True)
 
-        self.assertEqual(result.output_path.read_text(encoding="utf-8"), original)
+        self.assertEqual(artifact_body(result.output_path), original)
         self.assertEqual(verified[-1][0], formatted)
         report = json.loads(result.report_path.read_text(encoding="utf-8"))
         self.assertFalse(report["formatting_applied"])
@@ -103,13 +115,13 @@ class BytecodePipelineTests(unittest.TestCase):
         ):
             result = pipeline.run(source, source_name="input.luau")
 
-        self.assertEqual(
-            result.output_path.read_text(encoding="utf-8"),
-            "local x = 1;\nreturn 1",
-        )
+        self.assertEqual(result.output_path.name, "destroyed_1.lua")
+        self.assertEqual(artifact_body(result.output_path), "local x = 1;\nreturn 1")
+        self.assertEqual([item.name for item in self.output.iterdir()], ["destroyed_1.lua"])
         report = json.loads(result.report_path.read_text(encoding="utf-8"))
-        self.assertTrue(report["formatting_applied"])
-        self.assertIn("compile-verified whitespace formatting", report["selected_transformations"])
+        self.assertEqual(report["route"], "recovery engine")
+        self.assertIn("output_sha256", report)
+        self.assertTrue(report["notes"] or report["layers"] is not None)
 
 
 if __name__ == "__main__":

@@ -78,6 +78,28 @@ def _needs_space(previous: Token | None, current: Token, current_index: int, tok
     return False
 
 
+_LINE_BREAK_JOINERS = _OPERATOR_TOKENS | {
+    "(", "[", "{", "=", ",", ";", "then", "do", "else", "and", "or", "not", "#",
+    "return", "in", "::",
+}
+_LINE_BREAK_CLOSERS = {")", "]", "}", ",", ";", ".", ":", "::", "(", "[", "{",
+                        "then", "do", "end", "else", "elseif", "until"}
+
+
+def _line_break_between(source: str, previous: Token | None, current: Token) -> bool:
+    """True when the input had a line break between two code tokens."""
+    if previous is None or current.start <= previous.end:
+        return False
+    return "\n" in source[previous.end:current.start]
+
+
+def _joins_across_lines(previous: Token | None, current: Token) -> bool:
+    """True when the pair is a continuation that reads better on one line."""
+    if previous is None:
+        return True
+    return previous.text in _LINE_BREAK_JOINERS or current.text in _LINE_BREAK_CLOSERS
+
+
 def _function_parameter_closers(tokens: list[Token]) -> dict[int, int]:
     closers: dict[int, int] = {}
     for index, token in enumerate(tokens):
@@ -166,6 +188,7 @@ def format_luau(source: str) -> str:
             output.append(" ")
         output.append(text)
 
+    bracket_depth = 0
     for index, token in enumerate(tokens):
         if token.kind == "comment":
             if line_open:
@@ -179,6 +202,10 @@ def format_luau(source: str) -> str:
             continue
 
         text = token.text
+        if text in {"(", "[", "{"}:
+            bracket_depth += 1
+        elif text in {")", "]", "}"}:
+            bracket_depth = max(0, bracket_depth - 1)
         next_index = _next_code_index(tokens, index)
         next_text = tokens[next_index].text if next_index < len(tokens) else ""
 
@@ -300,6 +327,17 @@ def format_luau(source: str) -> str:
             newline()
             previous = token
             continue
+
+        if (
+            line_open
+            and bracket_depth == 0
+            and _line_break_between(source, previous, token)
+            and not _joins_across_lines(previous, token)
+        ):
+            # Newlines are trivia in Lua, so keeping the author's line breaks
+            # never changes behaviour — it only stops two statements from
+            # being glued into one unreadable line.
+            newline()
 
         unary = _is_unary(tokens, index)
         needs_space = _needs_space(previous, token, index, tokens)

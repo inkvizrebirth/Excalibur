@@ -1,0 +1,1508 @@
+"""Executor/injector environment emulation for isolated analysis.
+
+Scripts that are protected for Roblox executers routinely bootstrap themselves
+from the *injector* globals, not from the script body:
+
+    local executor = identifyexecutor()
+    local env = getgenv()
+    if syn and syn.protect_gui then syn.protect_gui(ui) end
+    local body = game:HttpGet("https://example.invalid/payload.lua")
+
+When those names are missing, a static or dynamic run stops at the first
+lookup with "attempt to index nil" or "attempt to call a nil value", and the
+payload stays locked.  This module describes real executor profiles (Synapse X,
+Krnl, Fluxus, Solara, Delta, Wave, Xeno, ...) and synthesises both a static
+evaluator environment and a Lua prelude that presents the same globals inside
+the isolated Luau worker or the portable Lua backend.
+
+Nothing here grants real powers: file, process and hooking APIs are inert
+stubs, and network access only happens when the caller wires up a fetch bridge.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Iterable, Mapping
+
+__all__ = [
+    "ExecutorProfile",
+    "EXECUTOR_PROFILES",
+    "DEFAULT_PROFILE_KEY",
+    "get_profile",
+    "profile_choices",
+    "profile_keys",
+    "detect_executor_keys",
+    "static_call",
+    "build_static_environment",
+    "build_lua_prelude",
+    "build_http_stub_prelude",
+    "FETCH_FUNCTION_NAMES",
+    "PREFETCH_FUNCTION_NAMES",
+]
+
+
+# ---------------------------------------------------------------------------
+# Profiles
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExecutorProfile:
+    """A named injector environment.
+
+    ``markers`` are globals a protected script can test for (``if Krnl then``),
+    ``features`` are the capability keys used by feature probes
+    (``if syn.protect_gui then``), and ``aliases`` are extra global names that
+    resolve to the same executor table.
+    """
+
+    key: str
+    label: str
+    executor_name: str
+    version: str = "1.0.0"
+    markers: tuple[str, ...] = ()
+    aliases: tuple[str, ...] = ()
+    features: tuple[str, ...] = ()
+    universal: bool = False
+    notes: str = ""
+
+
+_BASE_FEATURES = (
+    "getgenv",
+    "getrenv",
+    "getgc",
+    "getreg",
+    "identifyexecutor",
+    "loadstring",
+    "request",
+    "http_get",
+    "base64",
+    "cloneref",
+    "checkcaller",
+    "getrawmetatable",
+    "setreadonly",
+    "islclosure",
+    "is_sirhurt_closure",
+    "getscriptbytecode",
+    "getscripthash",
+    "getinstances",
+    "getnilinstances",
+    "getloadedmodules",
+    "getcallingscript",
+    "fireclickdetector",
+    "firetouchinterest",
+    "fireproximityprompt",
+    "getthreadidentity",
+    "setthreadidentity",
+    "queue_on_teleport",
+    "setclipboard",
+    "writefile",
+    "readfile",
+    "appendfile",
+    "listfiles",
+    "isfile",
+    "delfile",
+    "makefolder",
+    "delfolder",
+    "getcustomasset",
+    "cache_replace",
+    "decompile",
+)
+
+_FILE_FEATURES = (
+    "writefile",
+    "readfile",
+    "appendfile",
+    "listfiles",
+    "isfile",
+    "delfile",
+    "makefolder",
+    "delfolder",
+    "getcustomasset",
+)
+
+_HOOK_FEATURES = (
+    "hookfunction",
+    "hookmetamethod",
+    "getconnections",
+    "getupvalues",
+    "getupvalue",
+    "setupvalue",
+    "getconstants",
+    "getprotos",
+    "getinfo",
+    "newcclosure",
+    "iscclosure",
+    "replaceclosure",
+    "getscripts",
+)
+
+
+def _features(*extra: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys((*_BASE_FEATURES, *extra)))
+
+
+EXECUTOR_PROFILES: tuple[ExecutorProfile, ...] = (
+    ExecutorProfile(
+        key="universal",
+        label="Auto — all executors (recommended)",
+        executor_name="Synapse X",
+        version="3.0.0",
+        markers=(
+            "syn",
+            "KRNL_LOADED",
+            "krnl",
+            "fluxus",
+            "FLUXUS_LOADED",
+            "is_solara",
+            "solara",
+            "Delta",
+            "is_delta",
+            "delta",
+            "wave",
+            "is_wave",
+            "xeno",
+            "is_xeno",
+            "hydrogen",
+            "is_hydrogen",
+            "swift",
+            "is_swift",
+            "nihon",
+            "macsploit",
+            "SW",
+            "SW_M",
+            "sirhurt",
+            "protosmasher",
+            "WeAreDevs",
+            "sentinel",
+            "AWP",
+            "zorara",
+            "evon",
+            "codex",
+            "Arceus",
+            "Electron",
+            "trigon",
+            "OxygenU",
+            "JJSploit",
+        ),
+        features=_features(*_FILE_FEATURES, *_HOOK_FEATURES, "protect_gui", "unprotect_gui"),
+        universal=True,
+        notes=(
+            "Every known executor marker is exposed at once. Feature probes "
+            "succeed and identifyexecutor() reports a common name, which keeps "
+            "executor-specific branches reachable instead of erroring."
+        ),
+    ),
+    ExecutorProfile(
+        key="synapse",
+        label="Synapse X",
+        executor_name="Synapse X",
+        version="3.0.0",
+        markers=("syn",),
+        aliases=("Synapse", "synapse"),
+        features=_features(
+            *_HOOK_FEATURES,
+            *_FILE_FEATURES,
+            "protect_gui",
+            "unprotect_gui",
+            "getspecialinfo",
+        ),
+        notes="syn.protect_gui / syn.request / syn.queue_on_teleport style probes.",
+    ),
+    ExecutorProfile(
+        key="krnl",
+        label="Krnl",
+        executor_name="Krnl",
+        markers=("KRNL_LOADED", "krnl"),
+        aliases=("KRNL",),
+        features=_features(*_FILE_FEATURES, "protect_gui"),
+    ),
+    ExecutorProfile(
+        key="fluxus",
+        label="Fluxus",
+        executor_name="Fluxus",
+        version="2.0.0",
+        markers=("fluxus", "FLUXUS_LOADED", "Fluxus"),
+        features=_features(*_FILE_FEATURES, "protect_gui"),
+    ),
+    ExecutorProfile(
+        key="solara",
+        label="Solara",
+        executor_name="Solara",
+        version="3.0.0",
+        markers=("solara", "is_solara", "Solara"),
+        features=_features(*_FILE_FEATURES, "protect_gui"),
+    ),
+    ExecutorProfile(
+        key="delta",
+        label="Delta",
+        executor_name="Delta",
+        markers=("Delta", "delta", "is_delta", "DELTA_LOADED"),
+        aliases=("DeltaExecutor",),
+        features=_features(*_FILE_FEATURES, "protect_gui"),
+    ),
+    ExecutorProfile(
+        key="wave",
+        label="Wave",
+        executor_name="Wave",
+        markers=("wave", "Wave", "is_wave"),
+        features=_features(*_FILE_FEATURES, "protect_gui"),
+    ),
+    ExecutorProfile(
+        key="xeno",
+        label="Xeno",
+        executor_name="Xeno",
+        markers=("xeno", "Xeno", "is_xeno"),
+        features=_features(*_FILE_FEATURES, "protect_gui"),
+    ),
+    ExecutorProfile(
+        key="hydrogen",
+        label="Hydrogen",
+        executor_name="Hydrogen",
+        markers=("hydrogen", "Hydrogen", "is_hydrogen"),
+        features=_features(*_FILE_FEATURES, "protect_gui"),
+    ),
+    ExecutorProfile(
+        key="swift",
+        label="Swift",
+        executor_name="Swift",
+        markers=("swift", "Swift", "is_swift"),
+        features=_features(*_FILE_FEATURES, "protect_gui"),
+    ),
+    ExecutorProfile(
+        key="scriptware",
+        label="Script-Ware",
+        executor_name="Script-Ware",
+        markers=("SW", "SW_M", "sw"),
+        aliases=("scriptware",),
+        features=_features(*_FILE_FEATURES, "protect_gui"),
+    ),
+    ExecutorProfile(
+        key="sirhurt",
+        label="SirHurt",
+        executor_name="SirHurt V4",
+        version="4.0.0",
+        markers=("sirhurt", "SirHurt", "is_sirhurt_closure"),
+        features=_features(*_FILE_FEATURES),
+    ),
+    ExecutorProfile(
+        key="wearedevs",
+        label="WeAreDevs API",
+        executor_name="WeAreDevs API",
+        version="2.4.0",
+        markers=("WeAreDevs", "servercontrol"),
+        features=_features(*_FILE_FEATURES),
+        notes="The WeAreDevs v2.4 API exposes identifyexecutor() and a compact global set.",
+    ),
+    ExecutorProfile(
+        key="nihon",
+        label="Nihon",
+        executor_name="Nihon",
+        markers=("nihon", "Nihon"),
+        features=_features(*_FILE_FEATURES),
+    ),
+    ExecutorProfile(
+        key="macsploit",
+        label="Macsploit",
+        executor_name="Macsploit",
+        markers=("macsploit", "Macsploit"),
+        features=_features(*_FILE_FEATURES),
+    ),
+    ExecutorProfile(
+        key="protosmasher",
+        label="ProtoSmasher",
+        executor_name="ProtoSmasher",
+        markers=("protosmasher", "PS_LOADED", "proto"),
+        features=_features(*_FILE_FEATURES),
+    ),
+    ExecutorProfile(
+        key="sentinel",
+        label="Sentinel",
+        executor_name="Sentinel",
+        markers=("sentinel", "Sentinel"),
+        features=_features(*_FILE_FEATURES),
+    ),
+    ExecutorProfile(
+        key="awp",
+        label="AWP.GG",
+        executor_name="AWP",
+        markers=("AWP", "AWPGG"),
+        features=_features(*_FILE_FEATURES),
+    ),
+    ExecutorProfile(
+        key="zorara",
+        label="Zorara",
+        executor_name="Zorara",
+        markers=("zorara", "Zorara"),
+        features=_features(*_FILE_FEATURES),
+    ),
+    ExecutorProfile(
+        key="evon",
+        label="Evon",
+        executor_name="Evon",
+        markers=("evon", "Evon"),
+        features=_features(*_FILE_FEATURES),
+    ),
+    ExecutorProfile(
+        key="codex",
+        label="Codex",
+        executor_name="Codex",
+        markers=("codex", "Codex"),
+        features=_features(*_FILE_FEATURES),
+    ),
+    ExecutorProfile(
+        key="arceus",
+        label="Arceus X",
+        executor_name="Arceus X",
+        markers=("Arceus", "arceus"),
+        features=_features(*_FILE_FEATURES),
+    ),
+    ExecutorProfile(
+        key="electron",
+        label="Electron",
+        executor_name="Electron",
+        markers=("Electron", "electron"),
+        features=_features(*_FILE_FEATURES),
+    ),
+    ExecutorProfile(
+        key="trigon",
+        label="Trigon Evo",
+        executor_name="Trigon Evo",
+        markers=("trigon", "Trigon"),
+        features=_features(*_FILE_FEATURES),
+    ),
+    ExecutorProfile(
+        key="oxygen",
+        label="Oxygen U",
+        executor_name="Oxygen U",
+        markers=("OxygenU", "Oxygen"),
+        features=_features(*_FILE_FEATURES),
+    ),
+    ExecutorProfile(
+        key="jjsploit",
+        label="JJSploit",
+        executor_name="JJSploit",
+        markers=("JJSploit", "jjsploit"),
+        features=_features(*_FILE_FEATURES),
+    ),
+    ExecutorProfile(
+        key="plain",
+        label="No injector (raw Lua environment)",
+        executor_name="Protez",
+        markers=(),
+        features=("loadstring", "http_get"),
+        notes="Only the plain Lua/Luau standard library; useful for unprotected scripts.",
+    ),
+)
+
+DEFAULT_PROFILE_KEY = "universal"
+
+_PROFILE_BY_KEY = {profile.key: profile for profile in EXECUTOR_PROFILES}
+
+
+def get_profile(key: str | None) -> ExecutorProfile:
+    """Return a profile by key, falling back to the default profile."""
+    if not key:
+        return _PROFILE_BY_KEY[DEFAULT_PROFILE_KEY]
+    return _PROFILE_BY_KEY.get(str(key).strip().lower(), _PROFILE_BY_KEY[DEFAULT_PROFILE_KEY])
+
+
+def profile_keys() -> tuple[str, ...]:
+    return tuple(profile.key for profile in EXECUTOR_PROFILES)
+
+
+def profile_choices() -> tuple[tuple[str, str], ...]:
+    """(key, label) pairs ready for a dropdown."""
+    return tuple((profile.key, profile.label) for profile in EXECUTOR_PROFILES)
+
+
+# ---------------------------------------------------------------------------
+# Detection
+# ---------------------------------------------------------------------------
+
+
+def _iter_identifiers(source: str) -> Iterable[str]:
+    import re
+
+    for match in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", source):
+        yield match.group(0)
+
+
+def detect_executor_keys(source: str) -> tuple[str, ...]:
+    """Report executor profiles referenced by name in ``source``.
+
+    A cheap lexical probe used for logging and auto-selection; it never
+    executes anything.
+    """
+    if not isinstance(source, str):
+        raise TypeError("source must be text")
+    if not source:
+        return ()
+    identifiers = set(_iter_identifiers(source))
+    lowered = {name.lower() for name in identifiers}
+    found: list[str] = []
+    for profile in EXECUTOR_PROFILES:
+        if profile.key in {"universal", "plain"}:
+            continue
+        markers = {*profile.markers, *profile.aliases}
+        if any(marker in identifiers for marker in markers) or any(
+            marker.lower() in lowered for marker in markers
+        ):
+            found.append(profile.key)
+    return tuple(found)
+
+
+# ---------------------------------------------------------------------------
+# Static evaluator environment
+# ---------------------------------------------------------------------------
+
+
+def static_call(
+    name: str,
+    arguments: list[Any],
+    *,
+    profile: ExecutorProfile | None = None,
+) -> tuple[bool, Any]:
+    """Resolve an injector-related call for the static constant folder.
+
+    Returns ``(handled, value)``; ``handled`` is False when the name is not an
+    injector function, in which case the caller keeps the original expression.
+    """
+    active = profile or get_profile(None)
+
+    if name in {"identifyexecutor", "getexecutorname", "getexecutor", "get_exploit", "getexploit"}:
+        return True, active.executor_name.encode("utf-8")
+    if name in {"getexecutorversion", "getversion"}:
+        return True, active.version.encode("utf-8")
+    if name in {"is_sirhurt_closure", "issirhurt"}:
+        return True, active.key == "sirhurt"
+    if name in {"iskrnl", "is_krnl"}:
+        return True, active.key in {"krnl", "universal"}
+    if name in {"checkcaller", "iscclosure"}:
+        return True, True
+    if name in {"islclosure", "isfile", "isfolder"}:
+        return True, False
+    if name in {"getthreadidentity", "getidentity", "getthreadcontext"}:
+        return True, 8
+    if name in {"getgenv", "getrenv"}:
+        return True, None
+    if name in {"getscriptbytecode", "getscripthash"}:
+        return True, b""
+    if name in {"base64_encode", "base64encode"}:
+        if len(arguments) == 1 and isinstance(arguments[0], bytes):
+            import base64
+
+            return True, base64.b64encode(arguments[0])
+        return True, None
+    if name in {"base64_decode", "base64decode"}:
+        if len(arguments) == 1 and isinstance(arguments[0], bytes):
+            import base64
+
+            try:
+                return True, base64.b64decode(arguments[0], validate=False)
+            except Exception:  # noqa: BLE001
+                return True, None
+        return True, None
+    if name in {"typeof"} and len(arguments) == 1:
+        value = arguments[0]
+        if value is None:
+            return True, b"nil"
+        if isinstance(value, bool):
+            return True, b"boolean"
+        if isinstance(value, (int, float)):
+            return True, b"number"
+        if isinstance(value, bytes):
+            return True, b"string"
+        return True, b"table"
+    if name == "tick":
+        return True, 0.0
+    if name in {"time", "os.time", "os.clock"}:
+        return True, 0.0
+    if name in {"warn", "print", "debug.getinfo"}:
+        return True, None
+    return False, None
+
+
+def build_static_environment(
+    profile: ExecutorProfile | None = None,
+    *,
+    script_key: str | None = None,
+) -> dict[str, Any]:
+    """Values the static token evaluator can fold safely."""
+    active = profile or get_profile(None)
+    environment: dict[str, Any] = {
+        "identifyexecutor": lambda *_: active.executor_name.encode("utf-8"),
+        "getexecutorname": lambda *_: active.executor_name.encode("utf-8"),
+        "getexecutor": lambda *_: active.executor_name.encode("utf-8"),
+        "getversion": lambda *_: active.version.encode("utf-8"),
+        "getgenv": lambda *_: None,
+        "getrenv": lambda *_: None,
+        "checkcaller": lambda *_: True,
+        "is_sirhurt_closure": lambda *_: active.key == "sirhurt",
+        "getthreadidentity": lambda *_: 8,
+    }
+    if script_key:
+        environment["script_key"] = script_key
+    return environment
+
+
+# ---------------------------------------------------------------------------
+# Lua prelude
+# ---------------------------------------------------------------------------
+
+FETCH_FUNCTION_NAMES = (
+    "HttpGet",
+    "HttpGetAsync",
+    "httpget",
+    "http_get",
+    "httpgetasync",
+    "request",
+    "http_request",
+)
+
+PREFETCH_FUNCTION_NAMES = ("game.HttpGet", "game:HttpGet", "HttpGet")
+
+
+def _lua_string(value: str) -> str:
+    escaped = (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+    )
+    return f'"{escaped}"'
+
+
+def _feature_flags(profile: ExecutorProfile) -> str:
+    features = sorted({*profile.features})
+    if profile.key == "plain":
+        features = ["loadstring", "http_get"]
+    return ", ".join(f"[{_lua_string(name)}] = true" for name in features)
+
+
+def build_lua_prelude(
+    profile: ExecutorProfile | None = None,
+    *,
+    roblox: bool = True,
+    script_key: str | None = None,
+    fetch_hook: str = "__protez_http",
+    extra_globals: Mapping[str, str] | None = None,
+    marker: str = "protez-env",
+) -> str:
+    """Return a Lua prelude that installs an injector/Roblox environment.
+
+    Conservative Lua 5.1 syntax keeps the same prelude usable in the bundled
+    Luau worker and in the optional portable backend.  No real file, process,
+    hooking or network power is granted: the HTTP helpers call ``fetch_hook``,
+    which the caller decides how to wire.
+    """
+    active = profile or get_profile(None)
+    body = _PRELUDE_HEADER.replace("@@MARKER@@", marker)
+    body = body.replace("@@PROFILE_KEY@@", _lua_string(active.key))
+    body = body.replace("@@PROFILE_NAME@@", _lua_string(active.label))
+    body = body.replace("@@EXECUTOR_NAME@@", _lua_string(active.executor_name))
+    body = body.replace("@@EXECUTOR_VERSION@@", _lua_string(active.version))
+    body = body.replace("@@IS_UNIVERSAL@@", "true" if active.universal else "false")
+    body = body.replace("@@FEATURES@@", _feature_flags(active))
+    body = body.replace("@@FETCH_HOOK@@", _lua_string(fetch_hook))
+    if active.key == "plain":
+        body = body.replace("@@EXECUTOR_SURFACE@@", _PLAIN_SURFACE)
+    else:
+        body = body.replace("@@EXECUTOR_SURFACE@@", _EXECUTOR_SURFACE)
+    if roblox:
+        body = body.replace("@@ROBLOX_SURFACE@@", _ROBLOX_SURFACE)
+    else:
+        body = body.replace("@@ROBLOX_SURFACE@@", "-- Roblox surface disabled for this run.")
+
+    if active.universal:
+        markers = sorted(
+            {
+                marker
+                for profile in EXECUTOR_PROFILES
+                for marker in (*profile.markers, *profile.aliases)
+            }
+        )
+    else:
+        markers = sorted({*active.markers, *active.aliases})
+    body = body.replace("@@MARKERS@@", "\n".join(f"  {_lua_string(name)}," for name in markers))
+    trailing: list[str] = []
+    if script_key:
+        trailing.extend(
+            [
+                f"script_key = {_lua_string(script_key)}",
+                "if type(getgenv) == 'function' and script_key then",
+                "  local __protez_env = getgenv()",
+                "  if type(__protez_env) == 'table' and __protez_env.script_key == nil then",
+                "    __protez_env.script_key = script_key",
+                "  end",
+                "end",
+            ]
+        )
+    for name, value in (extra_globals or {}).items():
+        trailing.append(
+            f"if rawget(_G, {_lua_string(name)}) == nil then rawset(_G, {_lua_string(name)}, {value}) end"
+        )
+    if trailing:
+        body = body + "\n".join(trailing) + "\n"
+    return body
+
+
+_PRELUDE_HEADER = r"""--[[ @@MARKER@@: injector + Roblox environment shim. Inert stubs only. ]]
+local __protez_profile = {
+  key = @@PROFILE_KEY@@,
+  name = @@PROFILE_NAME@@,
+  executor = @@EXECUTOR_NAME@@,
+  version = @@EXECUTOR_VERSION@@,
+  universal = @@IS_UNIVERSAL@@,
+  features = {@@FEATURES@@},
+}
+local function __protez_has(feature)
+  return __protez_profile.features[feature] == true
+end
+local function __protez_noop() return nil end
+local function __protez_empty() return '' end
+local function __protez_false() return false end
+local function __protez_true() return true end
+local function __protez_zero() return 0 end
+local function __protez_table() return {} end
+
+-- Base64 without host support: several obfuscators call these.
+local __protez_b64_alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+local function __protez_b64_encode(value)
+  if type(value) ~= 'string' then value = tostring(value) end
+  local output = {}
+  for index = 1, #value, 3 do
+    local first, second, third = value:byte(index, index + 2)
+    local group = first * 65536 + (second or 0) * 256 + (third or 0)
+    local a = math.floor(group / 262144) % 64
+    local b = math.floor(group / 4096) % 64
+    local c = math.floor(group / 64) % 64
+    local d = group % 64
+    output[#output + 1] = __protez_b64_alphabet:sub(a + 1, a + 1)
+    output[#output + 1] = __protez_b64_alphabet:sub(b + 1, b + 1)
+    output[#output + 1] = second and __protez_b64_alphabet:sub(c + 1, c + 1) or '='
+    output[#output + 1] = third and __protez_b64_alphabet:sub(d + 1, d + 1) or '='
+  end
+  return table.concat(output)
+end
+local function __protez_b64_decode(value)
+  if type(value) ~= 'string' then return '' end
+  value = value:gsub('%s', '')
+  local output = {}
+  local index = 1
+  while index <= #value do
+    local chunk = value:sub(index, index + 3)
+    local a = __protez_b64_alphabet:find(chunk:sub(1, 1), 1, true) or 1
+    local b = __protez_b64_alphabet:find(chunk:sub(2, 2), 1, true) or 1
+    local c = __protez_b64_alphabet:find(chunk:sub(3, 3), 1, true) or 1
+    local d = __protez_b64_alphabet:find(chunk:sub(4, 4), 1, true) or 1
+    local group = (a - 1) * 262144 + (b - 1) * 4096 + (c - 1) * 64 + (d - 1)
+    output[#output + 1] = string.char(math.floor(group / 65536) % 256)
+    if #chunk > 2 and chunk:sub(3, 3) ~= '=' then
+      output[#output + 1] = string.char(math.floor(group / 256) % 256)
+    end
+    if #chunk > 3 and chunk:sub(4, 4) ~= '=' then
+      output[#output + 1] = string.char(group % 256)
+    end
+    index = index + 4
+  end
+  return table.concat(output)
+end
+
+-- Luau/Roblox compatibility: bit32, utf8 and the Luau additions to the
+-- standard library that loader stubs routinely call.
+if rawget(_G, 'bit32') == nil then
+  local function __protez_to_unsigned(value)
+    value = value % 4294967296
+    if value < 0 then value = value + 4294967296 end
+    return math.floor(value)
+  end
+  local function __protez_to_signed(value)
+    value = __protez_to_unsigned(value)
+    if value >= 2147483648 then value = value - 4294967296 end
+    return value
+  end
+  local function __protez_bitop(left, right, mode)
+    local a = __protez_to_unsigned(left)
+    local b = __protez_to_unsigned(right)
+    local out = 0
+    local bit = 1
+    while a > 0 or b > 0 do
+      local abit = a % 2
+      local bbit = b % 2
+      local keep
+      if mode == 'and' then keep = (abit == 1 and bbit == 1)
+      elseif mode == 'or' then keep = (abit == 1 or bbit == 1)
+      else keep = (abit ~= bbit) end
+      if keep then out = out + bit end
+      a = math.floor(a / 2)
+      b = math.floor(b / 2)
+      bit = bit * 2
+    end
+    return out
+  end
+  local bit32_table = {}
+  bit32_table.band = function(...)
+    local arguments = { ... }
+    local result = __protez_to_unsigned(arguments[1] or 0)
+    for index = 2, #arguments do result = __protez_bitop(result, arguments[index], 'and') end
+    return __protez_to_signed(result)
+  end
+  bit32_table.bor = function(...)
+    local arguments = { ... }
+    local result = __protez_to_unsigned(arguments[1] or 0)
+    for index = 2, #arguments do result = __protez_bitop(result, arguments[index], 'or') end
+    return __protez_to_signed(result)
+  end
+  bit32_table.bxor = function(...)
+    local arguments = { ... }
+    local result = __protez_to_unsigned(arguments[1] or 0)
+    for index = 2, #arguments do result = __protez_bitop(result, arguments[index], 'xor') end
+    return __protez_to_signed(result)
+  end
+  bit32_table.bnot = function(value) return __protez_to_signed(4294967295 - __protez_to_unsigned(value)) end
+  bit32_table.btest = function(...)
+    local arguments = { ... }
+    local result = __protez_to_unsigned(arguments[1] or 0)
+    for index = 2, #arguments do result = __protez_bitop(result, arguments[index], 'and') end
+    return result ~= 0
+  end
+  bit32_table.lshift = function(value, count)
+    count = __protez_to_unsigned(count) % 32
+    return __protez_to_signed(__protez_to_unsigned(value) * (2 ^ count))
+  end
+  bit32_table.rshift = function(value, count)
+    count = __protez_to_unsigned(count) % 32
+    return __protez_to_signed(math.floor(__protez_to_unsigned(value) / (2 ^ count)))
+  end
+  bit32_table.arshift = function(value, count)
+    count = __protez_to_unsigned(count) % 32
+    local unsigned = __protez_to_unsigned(value)
+    if unsigned >= 2147483648 then
+      return __protez_to_signed(math.floor((unsigned - 4294967296) / (2 ^ count)))
+    end
+    return __protez_to_signed(math.floor(unsigned / (2 ^ count)))
+  end
+  bit32_table.rol = function(value, count)
+    count = __protez_to_unsigned(count) % 32
+    local unsigned = __protez_to_unsigned(value)
+    if count == 0 then return __protez_to_signed(unsigned) end
+    return __protez_to_signed((unsigned * (2 ^ count)) % 4294967296 + math.floor(unsigned / (2 ^ (32 - count))))
+  end
+  bit32_table.ror = function(value, count)
+    count = __protez_to_unsigned(count) % 32
+    local unsigned = __protez_to_unsigned(value)
+    if count == 0 then return __protez_to_signed(unsigned) end
+    return __protez_to_signed(math.floor(unsigned / (2 ^ count)) + (unsigned * (2 ^ (32 - count))) % 4294967296)
+  end
+  bit32_table.extract = function(value, field, width)
+    width = width or 1
+    local mask = 2 ^ width - 1
+    return math.floor(__protez_to_unsigned(value) / (2 ^ field)) % (mask + 1)
+  end
+  bit32_table.replace = function(value, field, width, replacement)
+    width = width or 1
+    local unsigned = __protez_to_unsigned(value)
+    local base = unsigned - (unsigned % (2 ^ field))
+    return __protez_to_signed(base + (replacement % (2 ^ width)) * (2 ^ field) + unsigned % (2 ^ field))
+  end
+  bit32_table.countlz = function(value)
+    local unsigned = __protez_to_unsigned(value)
+    for index = 0, 31 do
+      if math.floor(unsigned / (2 ^ (31 - index))) % 2 == 1 then return index end
+    end
+    return 32
+  end
+  bit32_table.countrz = function(value)
+    local unsigned = __protez_to_unsigned(value)
+    for index = 0, 31 do
+      if math.floor(unsigned / (2 ^ index)) % 2 == 1 then return index end
+    end
+    return 32
+  end
+  rawset(_G, 'bit32', bit32_table)
+  rawset(_G, 'bit', bit32_table)
+end
+if rawget(_G, 'utf8') == nil then
+  rawset(_G, 'utf8', {
+    char = function(...)
+      local output = {}
+      for index = 1, select('#', ...) do
+        local code = select(index, ...)
+        if code < 128 then
+          output[#output + 1] = string.char(code)
+        elseif code < 2048 then
+          output[#output + 1] = string.char(192 + math.floor(code / 64), 128 + code % 64)
+        else
+          output[#output + 1] = string.char(224 + math.floor(code / 4096), 128 + math.floor(code / 64) % 64, 128 + code % 64)
+        end
+      end
+      return table.concat(output)
+    end,
+    len = function(value) return #value end,
+    codepoint = function(value, index) return value:byte(index or 1) end,
+    offset = function(value, count) return (count or 1) + 1 end,
+  })
+end
+if type(table.create) ~= 'function' then
+  rawset(table, 'create', function(count, value)
+    local result = {}
+    for index = 1, count do result[index] = value end
+    return result
+  end)
+end
+if type(table.find) ~= 'function' then
+  rawset(table, 'find', function(haystack, needle, start)
+    for index = start or 1, #haystack do
+      if haystack[index] == needle then return index end
+    end
+    return nil
+  end)
+end
+if type(table.clear) ~= 'function' then
+  rawset(table, 'clear', function(target)
+    for key in pairs(target) do target[key] = nil end
+    return target
+  end)
+end
+if type(table.pack) ~= 'function' then
+  rawset(table, 'pack', function(...) return { n = select('#', ...), ... } end)
+end
+if type(table.unpack) ~= 'function' and type(unpack) == 'function' then
+  rawset(table, 'unpack', unpack)
+end
+if type(string.split) ~= 'function' then
+  rawset(string, 'split', function(value, separator)
+    if separator == nil or separator == '' then return { value } end
+    local parts = {}
+    local start = 1
+    while true do
+      local position = string.find(value, separator, start, true)
+      if position == nil then
+        parts[#parts + 1] = string.sub(value, start)
+        break
+      end
+      parts[#parts + 1] = string.sub(value, start, position - 1)
+      start = position + #separator
+    end
+    return parts
+  end)
+end
+if type(math.round) ~= 'function' then
+  rawset(math, 'round', function(value) return math.floor(value + 0.5) end)
+end
+if type(math.clamp) ~= 'function' then
+  rawset(math, 'clamp', function(value, low, high)
+    if value < low then return low end
+    if value > high then return high end
+    return value
+  end)
+end
+if type(math.sign) ~= 'function' then
+  rawset(math, 'sign', function(value)
+    if value > 0 then return 1 end
+    if value < 0 then return -1 end
+    return 0
+  end)
+end
+if rawget(_G, 'unpack') == nil and type(table.unpack) == 'function' then rawset(_G, 'unpack', table.unpack) end
+if rawget(_G, 'printidentity') == nil then rawset(_G, 'printidentity', __protez_noop) end
+
+@@ROBLOX_SURFACE@@
+
+@@EXECUTOR_SURFACE@@
+
+-- Scripts that re-sandbox themselves with setfenv() must keep seeing the
+-- executor surface; otherwise the payload dies on its first environment probe.
+local __protez_real_setfenv = rawget(_G, 'setfenv')
+local __protez_real_getfenv = rawget(_G, 'getfenv')
+if type(__protez_real_setfenv) == 'function' and rawget(_G, '__PROTEZ_SETFENV_WRAPPED') == nil then
+  rawset(_G, '__PROTEZ_SETFENV_WRAPPED', true)
+  local __protez_stub_table = rawget(_G, '__protez_globals_table') or {}
+  rawset(_G, 'setfenv', function(target, environment)
+    if type(environment) == 'table' and rawequal(environment, _G) == false then
+      local wrapper = setmetatable(environment, {
+        __index = function(_, key)
+          local value = __protez_stub_table[key]
+          if value ~= nil then return value end
+          return _G[key]
+        end,
+      })
+      return __protez_real_setfenv(target, wrapper)
+    end
+    return __protez_real_setfenv(target, environment)
+  end)
+end
+if type(__protez_real_getfenv) == 'function' then
+  rawset(_G, 'getfenv', function(target)
+    local environment = __protez_real_getfenv(target)
+    if type(environment) == 'table' then
+      return setmetatable(environment, { __index = rawget(_G, '__protez_globals_table') })
+    end
+    return environment
+  end)
+end
+"""
+
+
+def _profile_features(profile: ExecutorProfile) -> frozenset[str]:
+    return frozenset(profile.features)
+
+
+_ROBLOX_SURFACE = r"""-- ---------------------------------------------------------------------------
+-- Roblox surface.  Objects are proxy tables: reading an unknown member or
+-- calling an unknown method yields another proxy instead of nil, which is what
+-- keeps a Roblox script alive long enough to reveal its payload.  Nothing is
+-- networked unless the fetch hook is wired by the caller.
+-- ---------------------------------------------------------------------------
+rawset(_G, '__protez_globals', rawget(_G, '__protez_globals') or {})
+
+local __protez_fetch
+local function __protez_new_proxy(label, fields)
+  local store = fields or {}
+  local cache = {}
+  local proxy
+  proxy = setmetatable(store, {
+    __index = function(self, key)
+      local value = rawget(cache, key)
+      if value ~= nil then return value end
+      if key == 'ClassName' or key == 'Name' then return label end
+      if key == 'HttpGet' or key == 'HttpGetAsync' or key == 'GetAsync' then
+        local fetcher = function(_, url, ...) return __protez_fetch(url, ...) end
+        rawset(cache, key, fetcher)
+        return fetcher
+      end
+      if key == 'PostAsync' or key == 'RequestAsync' or key == 'GetObjects' then
+        local fetcher = function(_, url, ...) return __protez_fetch(url, ...) end
+        rawset(cache, key, fetcher)
+        return fetcher
+      end
+      if key == 'WaitForChild' or key == 'FindFirstChild' or key == 'FindFirstChildOfClass' or key == 'FindFirstAncestor' then
+        local finder = function(_, ...) return __protez_new_proxy(label .. '.' .. tostring(key)) end
+        rawset(cache, key, finder)
+        return finder
+      end
+      if key == 'IsA' then
+        local isa = function(_, ...) return true end
+        rawset(cache, key, isa)
+        return isa
+      end
+      if key == 'GetChildren' or key == 'GetDescendants' then
+        local children = function() return {} end
+        rawset(cache, key, children)
+        return children
+      end
+      if key == 'Connect' or key == 'connect' or key == 'Once' then
+        local connect = function() return { Disconnect = function() end, disconnect = function() end, Connected = true } end
+        rawset(cache, key, connect)
+        return connect
+      end
+      local child = __protez_new_proxy(label .. '.' .. tostring(key))
+      rawset(cache, key, child)
+      return child
+    end,
+    __newindex = function(self, key, value)
+      rawset(cache, key, value)
+      rawset(self, key, value)
+    end,
+    __call = function(self, ...)
+      return __protez_new_proxy(label .. '()')
+    end,
+    __tostring = function() return label end,
+    __len = function() return 0 end,
+    __eq = function(left, right) return rawequal(left, right) end,
+    __add = function() return 0 end,
+    __sub = function() return 0 end,
+    __mul = function() return 0 end,
+  })
+  return proxy
+end
+rawset(_G, '__protez_new_proxy', __protez_new_proxy)
+
+local __protez_players = __protez_new_proxy('Players', {
+  Name = 'Players',
+  ClassName = 'Players',
+  LocalPlayer = __protez_new_proxy('Player', {
+    Name = 'Protez',
+    DisplayName = 'Protez',
+    UserId = 1,
+    AccountAge = 1,
+  }),
+  MaxPlayers = 12,
+  NumPlayers = 1,
+})
+
+local function __protez_service(name)
+  if name == 'Players' then return __protez_players end
+  return __protez_new_proxy(tostring(name), { Name = tostring(name), ClassName = tostring(name) })
+end
+
+local __protez_game = __protez_new_proxy('game', {
+  PlaceId = 0,
+  GameId = 0,
+  JobId = '',
+  PlaceVersion = 1,
+  Workspace = __protez_new_proxy('Workspace', { Name = 'Workspace', ClassName = 'Workspace' }),
+  GetService = function(self, name) return __protez_service(name) end,
+  FindService = function(self, name) return __protez_service(name) end,
+  IsLoaded = function() return true end,
+  GetObjects = function() return {} end,
+  BindToClose = function() end,
+})
+
+local function __protez_is_host_callable(value)
+  local kind = type(value)
+  return kind == 'function' or kind == 'userdata'
+end
+function __protez_fetch(url, options)
+  if type(url) == 'table' and url.Url then
+    options = url
+    url = url.Url
+  end
+  if type(__protez_http_bridge) == 'function' then
+    local ok, body = pcall(__protez_http_bridge, tostring(url), options)
+    if ok and type(body) == 'string' then return body end
+  end
+  local host_http = rawget(_G, '__protez_http')
+  if __protez_is_host_callable(host_http) then
+    local ok, body = pcall(host_http, tostring(url), 'GET')
+    if ok and type(body) == 'string' then return body end
+  end
+  return ''
+end
+rawset(_G, '__protez_fetch', __protez_fetch)
+
+__protez_game.__protez_fetch = __protez_fetch
+
+rawset(_G, 'game', __protez_game)
+rawset(_G, 'Game', __protez_game)
+rawset(_G, 'workspace', __protez_game.Workspace)
+rawset(_G, 'Workspace', __protez_game.Workspace)
+rawset(_G, 'script', __protez_new_proxy('Script', { Name = 'ProtezScript', ClassName = 'Script' }))
+rawset(_G, 'shared', rawget(_G, '__protez_globals'))
+if rawget(_G, 'settings') == nil then
+  rawset(_G, 'settings', function() return __protez_new_proxy('Settings') end)
+end
+
+if rawget(_G, 'Instance') == nil then
+  rawset(_G, 'Instance', {
+    new = function(className, parent)
+      local instance = __protez_new_proxy(tostring(className), {
+        Name = tostring(className),
+        ClassName = tostring(className),
+        Parent = parent,
+      })
+      return instance
+    end,
+    fromExisting = function(value) return value end,
+  })
+end
+if rawget(_G, 'Enum') == nil then
+  rawset(_G, 'Enum', __protez_new_proxy('Enum'))
+end
+if rawget(_G, 'Color3') == nil then
+  rawset(_G, 'Color3', {
+    new = function(red, green, blue)
+      return { R = red or 0, G = green or 0, B = blue or 0, __protez_type = 'Color3' }
+    end,
+    fromRGB = function(red, green, blue)
+      return { R = (red or 0) / 255, G = (green or 0) / 255, B = (blue or 0) / 255, __protez_type = 'Color3' }
+    end,
+    fromHSV = function() return { R = 0, G = 0, B = 0, __protez_type = 'Color3' } end,
+  })
+end
+if rawget(_G, 'UDim2') == nil then
+  rawset(_G, 'UDim2', { new = function(...) return { __protez_type = 'UDim2' } end, fromScale = function() return {} end, fromOffset = function() return {} end })
+end
+if rawget(_G, 'UDim') == nil then
+  rawset(_G, 'UDim', { new = function(...) return { __protez_type = 'UDim' } end })
+end
+if rawget(_G, 'Vector2') == nil then
+  rawset(_G, 'Vector2', { new = function(x, y) return { X = x or 0, Y = y or 0, __protez_type = 'Vector2' } end, zero = { X = 0, Y = 0 } })
+end
+if rawget(_G, 'Vector3') == nil then
+  rawset(_G, 'Vector3', {
+    new = function(x, y, z) return { X = x or 0, Y = y or 0, Z = z or 0, __protez_type = 'Vector3' } end,
+    zero = { X = 0, Y = 0, Z = 0 },
+    one = { X = 1, Y = 1, Z = 1 },
+  })
+end
+if rawget(_G, 'CFrame') == nil then
+  rawset(_G, 'CFrame', {
+    new = function(...) return __protez_new_proxy('CFrame', { __protez_type = 'CFrame' }) end,
+    Angles = function() return __protez_new_proxy('CFrame') end,
+    fromEulerAnglesXYZ = function() return __protez_new_proxy('CFrame') end,
+  })
+end
+if rawget(_G, 'Random') == nil then
+  rawset(_G, 'Random', { new = function() return __protez_new_proxy('Random') end })
+end
+if rawget(_G, 'Ray') == nil then
+  rawset(_G, 'Ray', { new = function() return __protez_new_proxy('Ray') end })
+end
+if rawget(_G, 'Region3') == nil then
+  rawset(_G, 'Region3', { new = function() return __protez_new_proxy('Region3') end })
+end
+if rawget(_G, 'TweenInfo') == nil then
+  rawset(_G, 'TweenInfo', { new = function() return {} end })
+end
+if rawget(_G, 'BrickColor') == nil then
+  rawset(_G, 'BrickColor', {
+    new = function(value) return __protez_new_proxy('BrickColor', { Number = 1, Name = tostring(value or 'Medium stone grey') }) end,
+    random = function() return __protez_new_proxy('BrickColor') end,
+    Red = function() return __protez_new_proxy('BrickColor') end,
+  })
+end
+if rawget(_G, 'TaskScheduler') == nil then
+  rawset(_G, 'TaskScheduler', __protez_new_proxy('TaskScheduler'))
+end
+if rawget(_G, 'typeof') == nil or type(rawget(_G, 'typeof')) ~= 'function' then
+  rawset(_G, 'typeof', function(value)
+    if type(value) == 'table' and rawget(value, '__protez_type') then return rawget(value, '__protez_type') end
+    return type(value)
+  end)
+end
+
+-- Scheduler shims.  Everything runs inline; protected calls keep a failing
+-- task from taking the whole analysis down.
+if rawget(_G, 'wait') == nil or type(rawget(_G, 'wait')) ~= 'function' then
+  rawset(_G, 'wait', function() return 0.0 end)
+end
+local function __protez_run_task(callback, ...)
+  if type(callback) == 'function' then
+    local ok, err = pcall(callback, ...)
+    if not ok then return nil, err end
+    return true
+  end
+  return true
+end
+if rawget(_G, 'spawn') == nil or type(rawget(_G, 'spawn')) ~= 'function' then
+  rawset(_G, 'spawn', function(callback, ...) return __protez_run_task(callback, ...) end)
+end
+if rawget(_G, 'delay') == nil or type(rawget(_G, 'delay')) ~= 'function' then
+  rawset(_G, 'delay', function(_, callback, ...) return __protez_run_task(callback, ...) end)
+end
+if rawget(_G, 'tick') == nil or type(rawget(_G, 'tick')) ~= 'function' then
+  rawset(_G, 'tick', function() return 0.0 end)
+end
+if rawget(_G, 'time') == nil or type(rawget(_G, 'time')) ~= 'function' then
+  rawset(_G, 'time', function() return 0.0 end)
+end
+if rawget(_G, 'task') == nil then
+  rawset(_G, 'task', {
+    wait = function() return 0.0 end,
+    spawn = function(callback, ...) return __protez_run_task(callback, ...) end,
+    defer = function(callback, ...) return __protez_run_task(callback, ...) end,
+    delay = function(_, callback, ...) return __protez_run_task(callback, ...) end,
+    desynchronize = function(callback, ...)
+      if type(callback) == 'function' then return __protez_run_task(callback, ...) end
+      return nil
+    end,
+    synchronize = function(callback, ...)
+      if type(callback) == 'function' then return __protez_run_task(callback, ...) end
+      return nil
+    end,
+    cancel = function() end,
+  })
+end
+if rawget(_G, 'require') == nil then
+  rawset(_G, 'require', function(module)
+    if type(module) == 'table' then return module end
+    return __protez_new_proxy('ModuleScript' .. tostring(module))
+  end)
+end
+if rawget(_G, 'debug') == nil then rawset(_G, 'debug', {}) end
+if type(rawget(_G, 'debug').getinfo) ~= 'function' then
+  rawget(_G, 'debug').getinfo = function() return { source = '@Protez', short_src = '@Protez', currentline = 1, what = 'Lua' } end
+end
+if type(rawget(_G, 'debug').traceback) ~= 'function' then
+  rawget(_G, 'debug').traceback = function() return 'protez stub traceback' end
+end
+if type(rawget(_G, 'debug').sethook) ~= 'function' then
+  rawget(_G, 'debug').sethook = function() end
+end
+if type(rawget(_G, 'debug').getregistry) ~= 'function' then
+  rawget(_G, 'debug').getregistry = function() return {} end
+end
+if type(rawget(_G, 'os')) ~= 'table' then rawset(_G, 'os', {}) end
+if type(rawget(_G, 'os').clock) ~= 'function' then rawget(_G, 'os').clock = function() return 0.0 end end
+if type(rawget(_G, 'os').time) ~= 'function' then rawget(_G, 'os').time = function() return 0 end end
+if type(rawget(_G, 'os').date) ~= 'function' then rawget(_G, 'os').date = function() return '1970-01-01' end end
+if type(rawget(_G, 'os').getenv) ~= 'function' then rawget(_G, 'os').getenv = function() return nil end end
+"""
+
+
+_EXECUTOR_SURFACE = r"""-- ---------------------------------------------------------------------------
+-- Executor surface.  getgenv() returns a live table backed by the globals, so
+-- libraries written as `getgenv().lib = {}` behave the same as direct global
+-- writes.  File and hooking APIs are inert: they answer with plausible values
+-- and remember nothing outside this table.
+-- ---------------------------------------------------------------------------
+local __protez_globals = rawget(_G, '__protez_globals') or {}
+setmetatable(__protez_globals, {
+  __index = _G,
+  __newindex = function(self, key, value)
+    rawset(self, key, value)
+    rawset(_G, key, value)
+  end,
+})
+rawset(_G, '__protez_globals', __protez_globals)
+rawset(_G, 'shared', __protez_globals)
+rawset(_G, '__protez_globals_table', __protez_globals)
+
+local function __protez_noop() return nil end
+local function __protez_empty() return '' end
+local function __protez_true() return true end
+local function __protez_false() return false end
+local function __protez_zero() return 0 end
+local function __protez_table() return {} end
+local function __protez_pass_first(value) return value end
+
+local __protez_executor = {}
+local executor_table = __protez_executor
+
+local function __protez_declare(key, value)
+  if rawget(_G, key) == nil then rawset(_G, key, value) end
+  __protez_globals[key] = value
+end
+
+local __protez_host_http = rawget(_G, '__protez_http')
+local function __protez_http(url, options)
+  if type(url) == 'table' and url.Url then
+    options = url
+    url = url.Url
+  end
+  if type(__protez_http_bridge) == 'function' then
+    local ok, body = pcall(__protez_http_bridge, tostring(url), options)
+    if ok and type(body) == 'string' then return body end
+  end
+  if __protez_is_host_callable(__protez_host_http) then
+    local ok, body = pcall(__protez_host_http, tostring(url), 'GET')
+    if ok and type(body) == 'string' then return body end
+  end
+  return ''
+end
+if not __protez_is_host_callable(__protez_host_http) then
+  rawset(_G, '__protez_http', __protez_http)
+end
+rawset(_G, '__protez_fetch', __protez_http)
+
+local function __protez_request(options)
+  local body = __protez_http(options)
+  return {
+    StatusCode = 200,
+    StatusMessage = 'OK',
+    Body = body,
+    Headers = {},
+    Success = true,
+  }
+end
+
+local __protez_request_functions = {
+  request = __protez_request,
+  http_request = __protez_request,
+  httpget = __protez_http,
+  HttpGet = __protez_http,
+  HttpGetAsync = __protez_http,
+  httpgetasync = __protez_http,
+  requestasync = function(options) return __protez_request(options) end,
+}
+for name, fn in pairs(__protez_request_functions) do
+  __protez_declare(name, fn)
+end
+
+__protez_declare('identifyexecutor', function() return __protez_profile.executor end)
+__protez_declare('getexecutorname', function() return __protez_profile.executor end)
+__protez_declare('getexecutor', function() return __protez_profile.executor end)
+__protez_declare('getexploit', function() return __protez_profile.executor end)
+__protez_declare('getversion', function() return __protez_profile.version end)
+__protez_declare('getexecutorversion', function() return __protez_profile.version end)
+__protez_declare('getgenv', function() return __protez_globals end)
+__protez_declare('getrenv', function() return _G end)
+__protez_declare('getgc', __protez_table)
+__protez_declare('getreg', __protez_table)
+__protez_declare('getinstances', __protez_table)
+__protez_declare('getnilinstances', __protez_table)
+__protez_declare('getloadedmodules', __protez_table)
+__protez_declare('getscripts', __protez_table)
+__protez_declare('getcallingscript', function() return __protez_new_proxy('Script') end)
+__protez_declare('getscripthash', __protez_empty)
+__protez_declare('getscriptbytecode', __protez_empty)
+__protez_declare('decompile', function(chunk) return '-- protez: decompilation requirement is not reachable here\n' end)
+__protez_declare('checkcaller', __protez_true)
+__protez_declare('is_sirhurt_closure', function() return __protez_profile.key == 'sirhurt' end)
+__protez_declare('issirhurt', function() return __protez_profile.key == 'sirhurt' end)
+__protez_declare('iskrnl', function() return __protez_profile.key == 'krnl' or __protez_profile.universal end)
+__protez_declare('islclosure', __protez_false)
+__protez_declare('iscclosure', __protez_true)
+__protez_declare('isfunction', function(value) return type(value) == 'function' end)
+__protez_declare('newcclosure', function(fn) return fn end)
+__protez_declare('hookfunction', function(original, replacement) return original end)
+__protez_declare('replaceclosure', function(original, replacement) return original end)
+__protez_declare('hookmetamethod', function(object, method, hook) return function() return nil end end)
+__protez_declare('getconnections', __protez_table)
+__protez_declare('getrawmetatable', function(value) return getmetatable(value) end)
+__protez_declare('setreadonly', __protez_true)
+__protez_declare('isreadonly', __protez_false)
+__protez_declare('getupvalue', function(fn, index) return nil end)
+__protez_declare('getupvalues', __protez_table)
+__protez_declare('setupvalue', __protez_pass_first)
+__protez_declare('getconstants', __protez_table)
+__protez_declare('getprotos', __protez_table)
+__protez_declare('getinfo', __protez_table)
+__protez_declare('getnamecallmethod', __protez_empty)
+__protez_declare('setnamecallmethod', __protez_noop)
+__protez_declare('getsenv', function() return __protez_globals end)
+__protez_declare('getthreadidentity', function() return 8 end)
+__protez_declare('getidentity', function() return 8 end)
+__protez_declare('setthreadidentity', __protez_noop)
+__protez_declare('getheap', __protez_table)
+__protez_declare('queue_on_teleport', __protez_noop)
+__protez_declare('setclipboard', __protez_true)
+__protez_declare('writefile', __protez_true)
+__protez_declare('readfile', __protez_empty)
+__protez_declare('appendfile', __protez_true)
+__protez_declare('listfiles', __protez_table)
+__protez_declare('isfile', __protez_false)
+__protez_declare('isfolder', __protez_false)
+__protez_declare('delfile', __protez_true)
+__protez_declare('makefolder', __protez_true)
+__protez_declare('delfolder', __protez_true)
+__protez_declare('getcustomasset', function(path) return 'rbxasset://' .. tostring(path) end)
+__protez_declare('cache_replace', __protez_pass_first)
+__protez_declare('cache_invalidate', __protez_noop)
+__protez_declare('fireclickdetector', __protez_noop)
+__protez_declare('firetouchinterest', __protez_noop)
+__protez_declare('fireproximityprompt', __protez_noop)
+__protez_declare('sethiddenproperty', __protez_true)
+__protez_declare('gethiddenproperty', function() return nil, false end)
+__protez_declare('setscriptable', __protez_true)
+__protez_declare('getcallbackvalue', __protez_noop)
+__protez_declare('setfpscap', __protez_noop)
+__protez_declare('getfpscap', function() return 60 end)
+__protez_declare('setrenderproperty', __protez_noop)
+__protez_declare('getrenderproperty', __protez_noop)
+__protez_declare('protect_gui', __protez_pass_first)
+__protez_declare('unprotect_gui', __protez_pass_first)
+__protez_declare('cloneref', __protez_pass_first)
+__protez_declare('compareinstances', function(left, right) return rawequal(left, right) end)
+__protez_declare('getconnections', __protez_table)
+__protez_declare('getcustomasset', function(path) return 'rbxasset://' .. tostring(path) end)
+
+local function __protez_b64(value, encode)
+  if encode then return __protez_b64_encode(value) end
+  return __protez_b64_decode(value)
+end
+__protez_declare('base64_encode', function(value) return __protez_b64_encode(value) end)
+__protez_declare('base64_decode', function(value) return __protez_b64_decode(value) end)
+__protez_declare('base64encode', function(value) return __protez_b64_encode(value) end)
+__protez_declare('base64decode', function(value) return __protez_b64_decode(value) end)
+__protez_declare('crypt', __protez_noop)
+__protez_declare('hash', __protez_empty)
+
+-- Per-executor namespaces (syn.request, krnl.loadstring, ...).  In universal
+-- mode every marker exists at once so any executor probe succeeds.
+local __protez_marker_names = {
+@@MARKERS@@
+}
+for _, name in ipairs(__protez_marker_names) do
+  if rawget(_G, name) == nil then
+    rawset(_G, name, setmetatable({}, { __index = __protez_globals, __call = function() return nil end }))
+  end
+  local namespace = rawget(_G, name)
+  if type(namespace) == 'table' and getmetatable(namespace) ~= nil then
+    namespace.request = __protez_request
+    namespace.http_request = __protez_request
+    namespace.HttpGet = __protez_http
+    namespace.HttpGetAsync = __protez_http
+    namespace.protect_gui = __protez_pass_first
+    namespace.unprotect_gui = __protez_pass_first
+    namespace.queue_on_teleport = __protez_noop
+    namespace.setclipboard = __protez_true
+    namespace.writefile = __protez_true
+    namespace.readfile = __protez_empty
+    namespace.getgenv = function() return __protez_globals end
+    namespace.getversions = function() return { version = __protez_profile.version } end
+    namespace.is_beta = __protez_false
+    namespace.loadstring = loadstring or load
+    namespace.crypt = __protez_noop
+    namespace.setthreadidentity = __protez_noop
+    namespace.getthreadidentity = __protez_zero
+    namespace.getscriptbytecode = __protez_empty
+    namespace.decompile = function() return '-- protez stub\n' end
+    namespace.getcallingscript = function() return __protez_new_proxy('Script') end
+    namespace.version = __protez_profile.version
+    namespace.name = __protez_profile.executor
+  end
+end
+rawset(_G, '__protez_executor_namespace', __protez_executor)
+rawset(_G, '__protez_profile_table', __protez_profile)
+"""
+
+
+_PLAIN_SURFACE = r"""-- No injector emulation requested: only the plain Lua/Luau environment.
+if rawget(_G, 'getgenv') == nil then
+  local __protez_plain_globals = rawget(_G, '__protez_globals') or {}
+  setmetatable(__protez_plain_globals, { __index = _G })
+  rawset(_G, '__protez_globals', __protez_plain_globals)
+  rawset(_G, 'shared', __protez_plain_globals)
+  rawset(_G, '__protez_globals_table', __protez_plain_globals)
+  rawset(_G, 'getgenv', function() return __protez_plain_globals end)
+  rawset(_G, 'getrenv', function() return _G end)
+end
+if type(rawget(_G, '__protez_http')) ~= 'function' and type(rawget(_G, '__protez_http')) ~= 'userdata' then
+  rawset(_G, '__protez_http', function(url, options)
+    if type(url) == 'table' and url.Url then url = url.Url end
+    if type(__protez_http_bridge) == 'function' then
+      local ok, body = pcall(__protez_http_bridge, tostring(url), options)
+      if ok and type(body) == 'string' then return body end
+    end
+    return ''
+  end)
+end
+if rawget(_G, '__protez_fetch') == nil then
+  rawset(_G, '__protez_fetch', rawget(_G, '__protez_http'))
+end
+"""
+
+
+__all__.append("EXECUTOR_GLOBAL_TABLE")
+
+
+def build_http_stub_prelude(
+    responses: Mapping[str, str] | None = None,
+    *,
+    fallback: str | None = None,
+) -> str:
+    """Install a canned response table as the HTTP bridge.
+
+    ``responses`` maps a URL (or a URL prefix) to a body.  The second pass of
+    the two-pass native analysis calls this with whatever the first pass
+    captured, so a payload that needs a live fetch still gets executed.
+    """
+    lines = ["-- Canned HTTP responses from the capture pass."]
+    lines.append("__protez_http_responses = {}")
+    for url, body in (responses or {}).items():
+        lines.append(
+            f"__protez_http_responses[{_lua_string(str(url))}] = {_lua_string(str(body))}"
+        )
+    lines.append(
+        "local __protez_http_lookup = function(url)\n"
+        "  url = tostring(url)\n"
+        "  if __protez_http_responses[url] ~= nil then return __protez_http_responses[url] end\n"
+        "  for pattern, body in pairs(__protez_http_responses) do\n"
+        "    if #pattern > 0 and url:sub(1, #pattern) == pattern then return body end\n"
+        "  end\n"
+        "  return nil\n"
+        "end"
+    )
+    lines.append(
+        "rawset(_G, '__protez_http_bridge', function(url, options)\n"
+        "  local body = __protez_http_lookup(url)\n"
+        "  if body ~= nil then return body end\n"
+        + (f"  return {_lua_string(fallback)}" if fallback is not None else "  return nil")
+        + "\nend)"
+    )
+    return "\n".join(lines) + "\n"
+

@@ -1,0 +1,4 @@
+# Optional: in-process Lua 5.1 runtime used by the portable backend
+# (core.emulator).  The bundled native Luau worker stays the preferred
+# backend; install this only when the OS sandbox is unavailable.
+lupa>=2.0

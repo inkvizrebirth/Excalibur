@@ -18,6 +18,18 @@ from core.luraph_static import (
     unpack_luraph_static,
 )
 from core.pipeline import DeobfuscationPipeline
+
+def artifact_body(path: Path) -> str:
+    """Return the recovered code without the Protez banner comment block."""
+    text = Path(path).read_text(encoding="utf-8")
+    marker = "--" + "=" * 72
+    if text.startswith(marker):
+        closing = text.find(marker, len(marker))
+        if closing != -1:
+            return text[closing + len(marker):].strip("\n")
+    return text
+
+
 from core.protection import inspect_protection
 
 
@@ -204,7 +216,13 @@ class LuraphStaticDecoderTests(unittest.TestCase):
             self.assertIn("ORIGINAL SOURCE NOT RECONSTRUCTED", summary)
             self.assertIn("not Luau bytecode", summary)
             self.assertIn("wrapper did not run", summary.lower())
-            self.assertEqual(len(list(output_dir.iterdir())), 5)
+            # Output hygiene: one destroyed_N.lua per run, intermediates under logs.
+            self.assertEqual([item.name for item in output_dir.iterdir()], ["destroyed_1.lua"])
+            vm_path = Path(report["outputs"]["luraph_vm_interpreter"])
+            bytecode_path = Path(report["outputs"]["luraph_custom_bytecode"])
+            self.assertTrue(vm_path.is_file(), vm_path)
+            self.assertTrue(bytecode_path.is_file(), bytecode_path)
+            self.assertIn("logs", str(vm_path))
 
     def test_pipeline_reports_unsupported_single_legacy_stream_as_partial(self) -> None:
         source = "-- Luraph Obfuscator v14.7\nlocal x = [====[LPH&" + "B" * 64 + "]====]"
@@ -227,7 +245,7 @@ class LuraphStaticDecoderTests(unittest.TestCase):
             self.assertFalse(report["static_unpack"]["success"])
             self.assertEqual(report["wrapper_execution_outcome"], "not-started")
             self.assertIsNone(report["outputs"]["luraph_custom_bytecode"])
-            self.assertEqual(len(list(output_dir.iterdir())), 3)
+            self.assertEqual([item.name for item in output_dir.iterdir()], ["destroyed_1.lua"])
 
 
 def _two_stream_source_from_encoded(vm_stream: bytes, bytecode_stream: bytes) -> str:

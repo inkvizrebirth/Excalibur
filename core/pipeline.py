@@ -27,7 +27,16 @@ from core.deobfuscator import (
     deobfuscate_source,
     tokenize,
 )
+from core.engine import RecoveryEngine, RecoveryResult, static_decode_is_useful
+from core.families import family_report
 from core.formatter import format_luau
+from core.injector_env import (
+    DEFAULT_PROFILE_KEY,
+    ExecutorProfile,
+    build_lua_prelude,
+    get_profile,
+    profile_choices,
+)
 from core.luraph_static import (
     LuraphStaticError,
     LuraphStaticUnpackResult,
@@ -43,8 +52,17 @@ from core.moonsec_devirtualizer import (
     MoonSecV3Result,
     devirtualize_moonsec_v3,
 )
+from core.output import (
+    clean_result_header,
+    next_output_path,
+    existing_outputs,
+    prune_legacy_artifacts,
+    report_path as logs_report_path,
+    write_report,
+    write_text_atomic,
+)
 from core.protection import ProtectionProfile, inspect_protection
-from core.runtime_paths import LOGS_DIR, OUTPUT_DIR, TOOLS_DIR
+from core.runtime_paths import SOURCE_ROOT, LOGS_DIR, OUTPUT_DIR, TOOLS_DIR
 from core.sandbox import Sandbox, SandboxError, SandboxResult
 from core.tracer import TraceError, TraceResult, Tracer
 from core.version import VERSION
@@ -156,6 +174,11 @@ class _LuauCompiler:
             host_names = ("protez-native-host", "protez-native-host.exe")
             compiler_names = ("luau-compile", "luau-compile.exe")
         candidates = [self.tools_dir / name for name in (*host_names, *compiler_names)]
+        # Developer checkouts build the host into native/build/host-bin; the
+        # packaged application keeps it in tools/.
+        for relative in ("native/build/host-bin", "build/host-bin"):
+            for name in (*host_names, *compiler_names):
+                candidates.append(SOURCE_ROOT / relative / name)
         for command_name in ("protez-native-host", "luau-compile"):
             path_from_env = shutil.which(command_name)
             if path_from_env:
@@ -252,6 +275,12 @@ class DeobfuscationPipeline:
         max_payload_layers: int = MAX_PAYLOAD_LAYERS,
         max_payload_candidates: int = MAX_PAYLOAD_CANDIDATES,
         max_pipeline_seconds: float = MAX_PIPELINE_SECONDS,
+        injector_profile: str = DEFAULT_PROFILE_KEY,
+        allow_network: bool = True,
+        script_key: str | None = None,
+        use_emulator: bool = True,
+        use_native_worker: bool = True,
+        logs_dir: Path | str | None = None,
     ):
         if (
             compiler_timeout_seconds <= 0
@@ -270,8 +299,377 @@ class DeobfuscationPipeline:
         self.max_payload_layers = max_payload_layers
         self.max_payload_candidates = max_payload_candidates
         self.max_pipeline_seconds = max_pipeline_seconds
+        self.profile: ExecutorProfile = get_profile(injector_profile)
+        self.allow_network = bool(allow_network)
+        self.script_key = script_key or None
+        self.use_emulator = bool(use_emulator)
+        self.use_native_worker = bool(use_native_worker)
+        self.logs_dir = Path(logs_dir) if logs_dir else LOGS_DIR
 
     def run(self, source: str | bytes, *, source_name: str = "input") -> PipelineResult:
+        if isinstance(source, bytes):
+            return self._adopt_legacy_outputs(
+                self._run_bytecode(source, source_name=source_name),
+                source_name=source_name,
+                method="offline bytecode decompilation",
+                partial=True,
+            )
+
+        protection = inspect_protection(source)
+        if protection is not None:
+            # The vendored lifters stay in charge for the two families they
+            # actually reconstruct. Every other recognised container gets a
+            # dynamic attempt first, because executing the loader usually
+            # recovers far more than a static container scan.
+            if not self._family_route_is_authoritative(protection):
+                result = self._recover_with_engine(source, source_name=source_name)
+                if result is not None and result.source.strip() and result.strong:
+                    return self._write_engine_result(
+                        source=source, source_name=source_name, result=result
+                    )
+            return self._adopt_legacy_outputs(
+                self._run_legacy(source, source_name=source_name),
+                source_name=source_name,
+                method=f"{protection.display_name} family route",
+                partial=True,
+            )
+
+        result = self._recover_with_engine(source, source_name=source_name)
+        if result is not None and result.source.strip() and not self._engine_was_inconclusive(result):
+            return self._write_engine_result(source=source, source_name=source_name, result=result)
+        return self._adopt_legacy_outputs(
+            self._run_legacy(source, source_name=source_name),
+            source_name=source_name,
+            method="bounded dynamic analysis",
+            partial=True,
+        )
+
+    @staticmethod
+    def _family_route_is_authoritative(protection: ProtectionProfile) -> bool:
+        """True when a bundled family lifter reconstructs source by itself."""
+        if protection.family == "MoonSec":
+            return True
+        if protection.family == "Luraph Obfuscator" and protection.version:
+            return protection.version.split(".", maxsplit=1)[0] == "15"
+        return False
+
+    def _engine_was_inconclusive(self, result: RecoveryResult) -> bool:
+        """True when the engine only echoed the input back.
+
+        A lifted bytecode listing or any decoded layer is real work even when
+        no text layer was appended, so those results are never discarded.
+        """
+        if result.layers or result.strong or result.bytecode_source:
+            return False
+        return result.direct
+
+    def _recover_with_engine(self, source: str, *, source_name: str) -> RecoveryResult | None:
+        self._progress(6, "DETECT")
+        families = family_report(source)
+        if families:
+            label = families[0].get("family")
+            version = families[0].get("version")
+            self.logger.info(
+                "Likely family: %s%s (confidence %.2f)",
+                label,
+                f" v{version}" if version else "",
+                float(families[0].get("confidence", 0.0)),
+            )
+        else:
+            self.logger.info("No known obfuscator signature; running the generic recovery engine")
+        compiler = _LuauCompiler(
+            tools_dir=self.tools_dir,
+            timeout_seconds=self.compiler_timeout_seconds,
+            logger=self.logger,
+        )
+        deadline = time.monotonic() + self.max_pipeline_seconds
+
+        def format_source(candidate: str) -> str:
+            try:
+                formatted, _applied = self._format_verified_candidate(
+                    candidate,
+                    compiler,
+                    label="formatted recovered source",
+                    deadline=deadline,
+                )
+            except Exception as exc:  # noqa: BLE001 - formatting is best effort
+                self.logger.debug("Formatting skipped: %s", exc)
+                return candidate
+            return formatted
+
+        def validate_source(candidate: str) -> bool:
+            try:
+                compiler.verify_text(candidate, label="recovered candidate")
+            except Exception:  # noqa: BLE001
+                return False
+            return True
+
+        engine = RecoveryEngine(
+            logger=self.logger,
+            progress=self._progress,
+            profile=self.profile,
+            allow_network=self.allow_network,
+            script_key=self.script_key,
+            use_emulator=self.use_emulator,
+            use_native=self.use_native_worker,
+            sandbox=Sandbox(
+                tools_dir=self.tools_dir,
+                timeout_seconds=self.sandbox_timeout_seconds,
+                logger=self.logger,
+            ),
+            tools_dir=self.tools_dir,
+            logs_dir=self.logs_dir,
+            format_source=format_source,
+            validate_source=validate_source,
+            max_layers=self.max_payload_layers,
+            max_seconds=max(5.0, self.max_pipeline_seconds * 0.8),
+        )
+        try:
+            return engine.recover(source, source_name=source_name)
+        except Exception as exc:  # noqa: BLE001 - fall back to the legacy route
+            self.logger.warning("Recovery engine stopped early: %s", exc)
+            self.logger.debug("Recovery engine failure detail", exc_info=True)
+            return None
+
+    def _write_engine_result(
+        self,
+        *,
+        source: str,
+        source_name: str,
+        result: RecoveryResult,
+    ) -> PipelineResult:
+        script_path = next_output_path(self.output_dir)
+        header = clean_result_header(
+            source_name=source_name,
+            family_label=result.family if not result.version else f"{result.family} v{result.version}",
+            method=result.method,
+            partial=result.partial,
+            notes=result.notes,
+            profile_label=self.profile.label,
+            layers=result.layer_count,
+        )
+        write_text_atomic(script_path, header + result.source.rstrip() + "\n")
+        removed = prune_legacy_artifacts(self.output_dir)
+        if removed:
+            self.logger.info("Removed %s stale artifact(s) from output/", len(removed))
+        report_file = logs_report_path(self.logs_dir, source_name=source_name)
+        report = {
+            "app_version": VERSION,
+            "source_name": source_name,
+            "route": "recovery engine",
+            "family": result.family,
+            "family_version": result.version,
+            "method": result.method,
+            "partial": result.partial,
+            "injector_profile": result.profile,
+            "layers": [
+                {
+                    "index": layer.index,
+                    "kind": layer.kind,
+                    "method": layer.method,
+                    "source_bytes": layer.source_bytes,
+                    "sha256_prefix": layer.sha256,
+                }
+                for layer in result.layers
+            ],
+            "notes": list(result.notes),
+            "remote_fetches": list(result.fetches),
+            "emulator": (
+                {
+                    "runtime": result.emulator.runtime,
+                    "status": result.emulator.status,
+                    "error": result.emulator.error,
+                    "captures": [
+                        {"kind": capture.kind, "size_bytes": capture.size_bytes, "binary": capture.binary}
+                        for capture in result.emulator.captures
+                    ],
+                }
+                if result.emulator is not None
+                else None
+            ),
+            "native_runs": [
+                {
+                    "returncode": sandbox.returncode,
+                    "timed_out": sandbox.timed_out,
+                    "isolation_backend": sandbox.isolation_backend,
+                    "captures": [capture.kind for capture in sandbox.captures],
+                }
+                for sandbox in result.sandbox_results
+            ],
+            "input_sha256": hashlib.sha256(source.encode("utf-8", "replace")).hexdigest(),
+            "output_sha256": hashlib.sha256(result.source.encode("utf-8", "replace")).hexdigest(),
+            "output_path": str(script_path),
+            "safety_notes": [
+                "Dynamic layers run either in an in-process Lua interpreter without filesystem, "
+                "process or network access of its own, or in the isolated native Luau worker.",
+                "Remote payloads are fetched as data with size limits and are never executed by the host.",
+                "Recovered source is an approximation of the original script.",
+            ],
+        }
+        try:
+            write_report(report_file, report)
+        except OSError as exc:
+            self.logger.warning("Could not write the analysis report: %s", exc)
+        self.logger.info("Recovered source written to %s", script_path)
+        self.logger.info("Analysis report written to %s", report_file)
+        self._progress(100, "DONE")
+        return PipelineResult(
+            output_path=script_path,
+            report_path=report_file,
+            route=result.method,
+            decoded_layers=result.layer_count,
+            transformations=result.notes,
+            sandbox_result=result.sandbox_results[0] if result.sandbox_results else None,
+            status="partial" if result.partial else "complete",
+            trace_files=(),
+            trace_event_count=0,
+        )
+
+    def _adopt_legacy_outputs(
+        self,
+        result: PipelineResult,
+        *,
+        source_name: str,
+        method: str,
+        partial: bool,
+    ) -> PipelineResult:
+        """Rename a legacy-route artifact to the single destroyed_N.lua form."""
+        script_path = Path(result.output_path)
+        if not script_path.is_file():
+            return result
+        try:
+            body = script_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return result
+        target = next_output_path(self.output_dir)
+        header = clean_result_header(
+            source_name=source_name,
+            family_label=(result.route or "unknown family"),
+            method=method,
+            partial=partial,
+            notes=tuple(result.transformations)[:6],
+            profile_label=self.profile.label,
+            layers=result.decoded_layers,
+        )
+        if not body.lstrip().startswith("--" + "=" * 72):
+            write_text_atomic(target, header + body)
+        else:
+            write_text_atomic(target, body)
+        report_target = result.report_path
+        if report_target is not None and Path(report_target).is_file():
+            destination = logs_report_path(self.logs_dir, source_name=source_name)
+            try:
+                shutil.move(str(report_target), str(destination))
+                report_target = destination
+            except OSError:
+                pass
+        if target != script_path:
+            try:
+                script_path.unlink()
+            except OSError:
+                pass
+        attachments = self._park_legacy_attachments(source_name=source_name)
+        if attachments:
+            self.logger.info(
+                "Moved %s intermediate artifact(s) to the logs directory", len(attachments)
+            )
+            self._remap_parked_paths(report_target, attachments)
+        prune_legacy_artifacts(self.output_dir)
+        return PipelineResult(
+            output_path=target,
+            report_path=report_target,
+            route=result.route,
+            decoded_layers=result.decoded_layers,
+            transformations=result.transformations,
+            sandbox_result=result.sandbox_result,
+            status=result.status,
+            notice=result.notice,
+            preview_path=self._remap_path(result.preview_path, attachments),
+            trace_files=tuple(
+                mapped
+                for mapped in (self._remap_path(item, attachments) for item in result.trace_files)
+                if mapped is not None
+            ),
+            trace_event_count=result.trace_event_count,
+        )
+
+    @staticmethod
+    def _remap_path(
+        path: Path | None, attachments: tuple[Path, ...]
+    ) -> Path | None:
+        """Follow a parked artifact to its new location under logs/."""
+        if path is None:
+            return None
+        candidate = Path(path)
+        if candidate.is_file():
+            return candidate
+        for parked in attachments:
+            if parked.name == candidate.name and parked.is_file():
+                return parked
+        return candidate
+
+    def _remap_parked_paths(
+        self, report_path: Path | None, attachments: tuple[Path, ...]
+    ) -> None:
+        """Rewrite report entries that point at artifacts moved into logs/."""
+        if report_path is None or not Path(report_path).is_file():
+            return
+        import json as _json
+
+        try:
+            raw = Path(report_path).read_text(encoding="utf-8")
+            payload = _json.loads(raw)
+        except (OSError, ValueError):
+            return
+        by_name = {parked.name: str(parked) for parked in attachments}
+
+        def walk(value):
+            if isinstance(value, dict):
+                return {key: walk(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [walk(item) for item in value]
+            if isinstance(value, str):
+                name = Path(value).name
+                if name in by_name and value not in by_name.values():
+                    return by_name[name]
+            return value
+
+        try:
+            Path(report_path).write_text(
+                _json.dumps(walk(payload), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            return
+
+    def _park_legacy_attachments(self, *, source_name: str) -> tuple[Path, ...]:
+        """Move raw legacy artifacts out of output/ so only destroyed_N.lua remains."""
+        try:
+            entries = [
+                entry
+                for entry in sorted(self.output_dir.iterdir())
+                if entry.is_file() and not entry.name.lower().startswith("destroyed_")
+            ]
+        except OSError:
+            return ()
+        if not entries:
+            return ()
+        destination = logs_report_path(self.logs_dir, source_name=source_name).with_suffix("")
+        destination = destination.parent / (destination.name + "_attachments")
+        try:
+            destination.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return ()
+        moved: list[Path] = []
+        for entry in entries:
+            try:
+                shutil.move(str(entry), str(destination / entry.name))
+                moved.append(destination / entry.name)
+            except OSError:
+                continue
+        return tuple(moved)
+
+    def _run_legacy(self, source: str, *, source_name: str = "input") -> PipelineResult:
         if isinstance(source, bytes):
             return self._run_bytecode(source, source_name=source_name)
         if not isinstance(source, str):
@@ -393,6 +791,13 @@ class DeobfuscationPipeline:
             )
         else:
             decoded_is_valid = original_is_valid
+        analysis_is_useful = decoded_is_valid and (
+            source_analysis.changed
+            and (
+                not original_is_valid
+                or static_decode_is_useful(source, source_analysis.source)
+            )
+        )
         if decoded_is_valid:
             self.logger.info("A valid source layer is available as a fallback")
         else:
@@ -417,7 +822,7 @@ class DeobfuscationPipeline:
                 dynamic_attempted = True
                 initial_trace = self._trace_source(
                     sandbox,
-                    runtime_source,
+                    self._with_environment(runtime_source),
                     source_name=source_name,
                     label="input",
                     timeout_seconds=min(self.sandbox_timeout_seconds, remaining),
@@ -442,13 +847,19 @@ class DeobfuscationPipeline:
             )
 
         best_source: str | None = (
-            source_analysis.source if decoded_is_valid else source if original_is_valid else None
+            source_analysis.source
+            if analysis_is_useful
+            else source
+            if original_is_valid
+            else source_analysis.source
+            if decoded_is_valid
+            else None
         )
         best_depth = 0 if best_source is not None else -1
         best_transformations = (
-            source_analysis.transformations if decoded_is_valid else ()
+            source_analysis.transformations if analysis_is_useful else ()
         )
-        best_route = "static-source" if decoded_is_valid and source_analysis.changed else "direct-source"
+        best_route = "static-source" if analysis_is_useful else "direct-source"
         candidate_count = 0
         seen: set[str] = set()
         layer_report: list[dict[str, object]] = []
@@ -529,7 +940,7 @@ class DeobfuscationPipeline:
             try:
                 nested_trace = self._trace_source(
                     sandbox,
-                    runtime_candidate,
+                    self._with_environment(runtime_candidate),
                     source_name=f"{source_name} [{candidate_name}]",
                     label=candidate_name,
                     timeout_seconds=min(self.sandbox_timeout_seconds, remaining),
@@ -1084,6 +1495,33 @@ class DeobfuscationPipeline:
                 "crypt.base64",
             )
         )
+
+    def _environment_prelude(self) -> str:
+        """Return the executor/Roblox shim prepended to dynamic runs.
+
+        Scripts that bootstrap from ``identifyexecutor``, ``getgenv``,
+        ``syn.protect_gui`` or ``game:GetService`` abort on the first missing
+        global, which used to hide every layer behind the probe. The shim
+        defines those globals with inert values; it is plain Lua text, so it
+        works in both the native worker and the portable backend.
+        """
+        try:
+            prelude = build_lua_prelude(self.profile, script_key=self.script_key)
+        except Exception as exc:  # noqa: BLE001 - the shim is best effort
+            self.logger.debug("Executor environment prelude skipped: %s", exc)
+            return ""
+        if not prelude:
+            return ""
+        self.logger.debug(
+            "Executor environment prelude attached for profile %s (%s bytes)",
+            self.profile.key,
+            f"{len(prelude.encode('utf-8')):,}",
+        )
+        return prelude + "\n"
+
+    def _with_environment(self, source: str) -> str:
+        prelude = self._environment_prelude()
+        return f"{prelude}{source}" if prelude else source
 
     def _trace_source(
         self,

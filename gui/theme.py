@@ -1,82 +1,132 @@
+"""Pixel-art theme: palette, metrics and font stacks.
+
+The interface is built from bitmap text and 1px frames on a dark grid, so the
+theme file only carries colours, spacings and the monospace stacks used for
+code and logs.
+"""
+
 from __future__ import annotations
 
-import customtkinter as ctk
+import tkinter.font as tkfont
 
-# Near-black surfaces with restrained icy accents. The animated outline carries
-# the color; controls and code remain high-contrast and calm.
-BG = "#08090b"
-PANEL = "#111318"
-INPUT_BG = "#07080a"
-BORDER = "#282c34"
-NEON = "#f5f7fb"
-ACID = "#ffffff"
-TEXT = "#f7f8fc"
-MUTED = "#a7adba"
-WARN = "#f4cb7a"
-ERROR = "#ff8792"
-RED_BG = "#f2f4f8"
-ACCENT = "#a4eaff"
+# ---------------------------------------------------------------------------
+# Palette — deep slate grid, mint accent, amber warning.
+# ---------------------------------------------------------------------------
+
+BG = "#0a0d12"
+BG_SUNKEN = "#070a10"
+PANEL = "#121822"
+PANEL_ALT = "#161e2a"
+PANEL_RAISED = "#1b2534"
+BORDER = "#26313f"
+BORDER_BRIGHT = "#3a4c63"
+GRID_LINE = "#18202c"
+
+TEXT = "#e6eefc"
+TEXT_DIM = "#9fb0c7"
+MUTED = "#66788f"
+DISABLED = "#465468"
+
+ACCENT = "#3fe0a5"
+ACCENT_DARK = "#187a58"
+ACCENT_SOFT = "#123a2e"
+CYAN = "#57c8ff"
+CYAN_SOFT = "#12303f"
+WARN = "#ffc463"
+WARN_SOFT = "#3a2f14"
+ERROR = "#ff6b81"
+ERROR_SOFT = "#3a1a22"
+SELECT = "#1d3247"
+SELECT_ALT = "#16283a"
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+PIXEL = 1
+FRAME_PAD = 2
+PANEL_PAD = 10
+ROW_GAP = 8
+SECTION_GAP = 12
+MIN_WIDTH = 720
+MIN_HEIGHT = 520
+DEFAULT_WIDTH = 820
+DEFAULT_HEIGHT = 620
+
+# ---------------------------------------------------------------------------
+# Fonts
+# ---------------------------------------------------------------------------
+
+_CODE_CANDIDATES = (
+    "Cascadia Mono",
+    "JetBrains Mono",
+    "Consolas",
+    "DejaVu Sans Mono",
+    "Menlo",
+    "Courier New",
+    "TkFixedFont",
+)
+_UI_CANDIDATES = (
+    "Segoe UI",
+    "Inter",
+    "DejaVu Sans",
+    "Helvetica",
+    "TkDefaultFont",
+)
 
 
-class TerminalButton(ctk.CTkButton):
-    """Square monochrome utility button with a clear inverse hover state."""
+def _pick_family(candidates: tuple[str, ...]) -> str:
+    try:
+        available = {name.lower() for name in tkfont.families()}
+    except Exception:
+        return candidates[-1]
+    for name in candidates:
+        if name.lower() in available:
+            return name
+    return candidates[-1]
 
-    def __init__(
-        self,
-        master,
-        *,
-        accent: str = NEON,
-        base_bg: str = BG,
-        base_text: str | None = None,
-        active: bool = False,
-        **kwargs,
-    ):
-        self._accent = accent
-        self._base_bg = base_bg
-        self._base_text = base_text or accent
-        self._active = active
-        self._enabled = True
-        super().__init__(
-            master,
-            corner_radius=0,
-            border_width=1,
-            border_color=BORDER if not active else accent,
-            fg_color=accent if active else base_bg,
-            text_color=BG if active else self._base_text,
-            hover=False,
-            **kwargs,
-        )
-        self.bind("<Enter>", self._on_enter, add="+")
-        self.bind("<Leave>", self._on_leave, add="+")
-        self._apply_palette(hover=False)
 
-    def _apply_palette(self, *, hover: bool) -> None:
-        if not self._enabled:
-            background = self._base_bg
-            foreground = MUTED
-            border = BORDER
-        elif self._active or hover:
-            background = self._accent
-            foreground = BG
-            border = self._accent
-        else:
-            background = self._base_bg
-            foreground = self._base_text
-            border = BORDER
-        self.configure(fg_color=background, text_color=foreground, border_color=border)
+def code_family() -> str:
+    return _pick_family(_CODE_CANDIDATES)
 
-    def _on_enter(self, _event=None) -> None:
-        if self._enabled:
-            self._apply_palette(hover=True)
 
-    def _on_leave(self, _event=None) -> None:
-        self._apply_palette(hover=False)
+def ui_family() -> str:
+    return _pick_family(_UI_CANDIDATES)
 
-    def set_active(self, active: bool) -> None:
-        self._active = active
-        self._apply_palette(hover=False)
 
-    def set_enabled(self, enabled: bool) -> None:
-        self._enabled = enabled
-        self.configure(state="normal" if enabled else "disabled")
-        self._apply_palette(hover=False)
+def font(family: str, size: int, *, bold: bool = False) -> tuple:
+    return (family, size, "bold") if bold else (family, size)
+
+
+# ---------------------------------------------------------------------------
+# Log levels
+# ---------------------------------------------------------------------------
+
+LEVEL_COLORS = {
+    "DEBUG": MUTED,
+    "INFO": TEXT_DIM,
+    "WARNING": WARN,
+    "ERROR": ERROR,
+    "CRITICAL": ERROR,
+}
+
+# ---------------------------------------------------------------------------
+# Syntax colours (viewer)
+# ---------------------------------------------------------------------------
+
+SYNTAX_COLORS = {
+    "keyword": "#ff8ec7",
+    "constant": "#ffd479",
+    "builtin": "#7fe1ff",
+    "standard": "#a9c2ff",
+    "executor": "#3fe0a5",
+    "string": "#b7f5c9",
+    "number": "#ffc463",
+    "comment": "#5d6c81",
+    "operator": "#8fa3bd",
+    "function": "#ffe08a",
+    "property": "#c9d6ea",
+    "label": "#e6eefc",
+    "search": "#2a4a63",
+    "active_match": "#3fe0a5",
+}

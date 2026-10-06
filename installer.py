@@ -44,10 +44,14 @@ MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024
 DOWNLOAD_TIMEOUT_SECONDS = 45
 
 DISTRIBUTIONS = (
-    "customtkinter",
     "tkinterdnd2",
     "zstandard",
 )
+
+# Installed on a best-effort basis: the portable backend in core.emulator
+# needs lupa, but the bundled native worker does not.
+OPTIONAL_REQUIREMENTS_FILE = ROOT / "requirements-portable.txt"
+OPTIONAL_DISTRIBUTIONS = ("lupa",)
 
 TOOL_NAMES = {
     "luau",
@@ -301,6 +305,55 @@ def _run_logged(
                 del tail[:-32]
 
     return process.wait(), "\n".join(tail)
+
+
+def install_optional_dependencies() -> bool:
+    """Install the portable-backend runtime without failing the setup.
+
+    Returns True when every optional distribution is importable afterwards.
+    """
+    if _optional_dependencies_available():
+        LOGGER.info("Optional portable-backend dependencies are already installed")
+        return True
+    if not OPTIONAL_REQUIREMENTS_FILE.is_file():
+        return False
+    code, output = _run_logged(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--retries",
+            "2",
+            "--timeout",
+            "20",
+            "-r",
+            str(OPTIONAL_REQUIREMENTS_FILE),
+        ],
+        label="optional portable-backend install",
+        cwd=ROOT,
+        timeout_seconds=600,
+    )
+    if code == 0 and _optional_dependencies_available():
+        LOGGER.info("Portable backend runtime installed")
+        return True
+    LOGGER.warning(
+        "The portable backend stays unavailable (pip exit code %s); "
+        "the bundled native worker keeps working", code,
+    )
+    if output:
+        LOGGER.debug("Optional dependency output: %s", output[-2000:])
+    return False
+
+
+def _optional_dependencies_available() -> bool:
+    for distribution in OPTIONAL_DISTRIBUTIONS:
+        try:
+            importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            return False
+    return True
 
 
 def install_dependencies() -> None:
@@ -914,6 +967,7 @@ def ensure_installed(*, force: bool = False) -> None:
         return
 
     install_dependencies()
+    install_optional_dependencies()
     available_tools, missing_tools = download_luau_tools()
     install_moonsec_tools()
     native_host_available = build_native_host()

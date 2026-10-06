@@ -69,5 +69,30 @@ class FormatterTests(unittest.TestCase):
         self.assertIs(format_luau(source), source)
 
 
+class LineBreakTests(unittest.TestCase):
+    """Statement-level line breaks must survive formatting."""
+
+    def test_two_statements_stay_on_separate_lines(self) -> None:
+        source = "local greeting = 'hi'\nprint(greeting)\n"
+        self.assertEqual(format_luau(source), source)
+
+    def test_calls_are_not_glued_to_the_next_statement(self) -> None:
+        source = "local total = add(1, 2)\nprint(total)\n"
+        formatted = format_luau(source)
+        self.assertIn("add(1, 2)\nprint(total)", formatted)
+
+    def test_continuation_lines_are_joined(self) -> None:
+        source = "local value = 1 +\n  2\nprint(value)\n"
+        formatted = format_luau(source)
+        self.assertIn("1 + 2", formatted)
+        self.assertIn("\nprint(value)", formatted)
+
+    def test_block_bodies_are_reindented(self) -> None:
+        source = "if ready then\nprint('go')\nend\n"
+        formatted = format_luau(source)
+        self.assertIn("    print('go')", formatted)
+        self.assertTrue(formatted.endswith("end\n"))
+
+
 if __name__ == "__main__":
     unittest.main()
