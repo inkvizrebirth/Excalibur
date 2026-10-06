@@ -154,7 +154,7 @@ def _run_family(
 
     semantic_note = "; matched pinned original behavior" if semantic_match else ""
     print(
-        f"{family} ({fixture.name}): recovered {result.output_path.stat().st_size} source bytes "
+        f"{family} ({fixture.name}): recovered {source_path.stat().st_size} source bytes "
         f"through {result.route}; output passed Luau syntax validation{semantic_note}."
     )
 
