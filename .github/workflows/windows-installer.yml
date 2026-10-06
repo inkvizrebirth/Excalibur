@@ -15,22 +15,12 @@ permissions:
   contents: read
 
 jobs:
-  build-windows-x64:
-    permissions:
-      contents: write
+  build-native:
     runs-on: windows-2022
-    timeout-minutes: 50
+    timeout-minutes: 30
     steps:
       - name: Check out source
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          architecture: x64
-          cache: pip
-          cache-dependency-path: requirements.txt
 
       - name: Restore native Luau executables
         id: native-cache
@@ -41,74 +31,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-protez-native-luau-0.740-
 
-      - name: Restore Rust lifter build cache
-        id: rust-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            build/luau-decompiler/target/release/luau-decompiler.exe
-            build/unluac-rs/target/release/unluac-cli.exe
-          key: ${{ runner.os }}-protez-rust-ee07098-3186d2e-${{ hashFiles('third_party/unluac-rs-protez-setlist.patch') }}
-          restore-keys: |
-            ${{ runner.os }}-protez-rust-ee07098-3186d2e-
-
-      - name: Restore MoonSec helper build cache
-        id: moonsec-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: build/moonsec-helper
-          key: ${{ runner.os }}-protez-moonsec-net9-${{ hashFiles('third_party/moonsec_v3_gpl/**') }}
-          restore-keys: |
-            ${{ runner.os }}-protez-moonsec-net9-
-
       - name: Set up CMake
         if: ${{ steps.native-cache.outputs.cache-hit != 'true' }}
         uses: jwlawson/actions-setup-cmake@v2
         with:
           cmake-version: "3.30.x"
-
-      - name: Check out pinned offline bytecode decompiler
-        if: ${{ steps.rust-cache.outputs.cache-hit != 'true' }}
-        uses: actions/checkout@v4
-        with:
-          repository: PumbaaDev/luau-decompiler
-          ref: ee07098c31e11601a9ca434bc12932a4ded65f7b
-          path: build/luau-decompiler
-
-      - name: Check out pinned Lua bytecode decompiler
-        if: ${{ steps.rust-cache.outputs.cache-hit != 'true' }}
-        uses: actions/checkout@v4
-        with:
-          repository: x3zvawq/unluac-rs
-          ref: 3186d2e392e44a2ddaadd1826a779c98c718be53
-          path: build/unluac-rs
-
-      - name: Set up Rust
-        if: ${{ steps.rust-cache.outputs.cache-hit != 'true' }}
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up .NET SDK
-        if: ${{ steps.moonsec-cache.outputs.cache-hit != 'true' }}
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "9.0.x"
-
-      - name: Apply bounded Lua table-constructor recovery
-        if: ${{ steps.rust-cache.outputs.cache-hit != 'true' }}
-        shell: pwsh
-        run: |
-          $patch = Join-Path $PWD "third_party/unluac-rs-protez-setlist.patch"
-          git -C build/unluac-rs apply --check --unidiff-zero $patch
-          if ($LASTEXITCODE -ne 0) { throw "The pinned Lua decompiler recovery patch no longer applies cleanly" }
-          git -C build/unluac-rs apply --unidiff-zero $patch
-          if ($LASTEXITCODE -ne 0) { throw "Could not apply the Lua decompiler recovery patch" }
-          Write-Host "Applied Protez's bounded fresh-table SETLIST source recovery."
-
-      - name: Install Python dependencies and packager
-        shell: pwsh
-        run: |
-          python -m pip install -r requirements-build.txt
-          if ($LASTEXITCODE -ne 0) { throw "dependency install failed" }
 
       - name: Build pinned Luau native host
         shell: pwsh
@@ -132,64 +59,11 @@ jobs:
             }
           }
           $native = Join-Path $PWD "build/native/host-bin/protez-native-host.exe"
-          if (-not (Test-Path $native)) { throw "Native host output is missing: $native" }
           $ast = Join-Path $PWD "build/native/host-bin/luau-ast.exe"
+          if (-not (Test-Path $native)) { throw "Native host output is missing: $native" }
           if (-not (Test-Path $ast)) { throw "Pinned Luau AST parser output is missing: $ast" }
           & $native --version
           if ($LASTEXITCODE -ne 0) { throw "Native host health check failed" }
-
-      - name: Build offline Luau bytecode decompiler
-        shell: pwsh
-        run: |
-          $sourceDir = Join-Path $PWD "build/luau-decompiler"
-          if ("${{ steps.rust-cache.outputs.cache-hit }}" -ne "true") {
-            $sourceCommit = (& git -C $sourceDir rev-parse HEAD).Trim()
-            if ($LASTEXITCODE -ne 0 -or $sourceCommit -ne "ee07098c31e11601a9ca434bc12932a4ded65f7b") {
-              throw "Offline bytecode decompiler source checkout does not match the recorded commit: $sourceCommit"
-            }
-            cargo build --manifest-path (Join-Path $sourceDir "Cargo.toml") --locked --release -p luau-cli --bin luau-decompiler
-            if ($LASTEXITCODE -ne 0) { throw "Offline bytecode decompiler build failed" }
-          }
-          $decompiler = Join-Path $sourceDir "target/release/luau-decompiler.exe"
-          if (-not (Test-Path $decompiler)) { throw "Built Luau bytecode decompiler is missing: $decompiler" }
-          $version = & $decompiler --version
-          if ($LASTEXITCODE -ne 0 -or "$version" -notmatch "luau-decompiler") {
-            throw "Offline bytecode decompiler health check failed: $version"
-          }
-          Write-Host $version
-          $licenseDir = Join-Path $PWD "build/third-party"
-          New-Item -ItemType Directory -Force -Path $licenseDir | Out-Null
-          Copy-Item (Join-Path $PWD "third_party/luau-decompiler-mit.txt") (Join-Path $licenseDir "luau-decompiler-mit.txt")
-          if (-not (Test-Path (Join-Path $licenseDir "luau-decompiler-mit.txt"))) {
-            throw "Could not stage the bytecode decompiler license notice"
-          }
-          Copy-Item (Join-Path $PWD "third_party/luau-mit.txt") (Join-Path $licenseDir "luau-mit.txt")
-
-      - name: Build MoonSec V3 and Lua 5.1 source lifters
-        shell: pwsh
-        run: |
-          $moonsecProject = Join-Path $PWD "third_party/moonsec_v3_gpl/MoonsecDeobfuscator.csproj"
-          if ("${{ steps.moonsec-cache.outputs.cache-hit }}" -ne "true") {
-            dotnet publish $moonsecProject -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o build/moonsec-helper
-            if ($LASTEXITCODE -ne 0) { throw "MoonSec V3 helper build failed" }
-          }
-          $moonsec = Join-Path $PWD "build/moonsec-helper/protez-moonsec-v3.exe"
-          if (-not (Test-Path $moonsec)) { throw "MoonSec V3 helper executable is missing: $moonsec" }
-          $moonsecVersion = & $moonsec --version
-          if ($LASTEXITCODE -ne 0 -or "$moonsecVersion" -notmatch "MoonsecDeobfuscator Protez V3") { throw "MoonSec helper health check failed: $moonsecVersion" }
-          $unluacSource = Join-Path $PWD "build/unluac-rs"
-          if ("${{ steps.rust-cache.outputs.cache-hit }}" -ne "true") {
-            $unluacCommit = (& git -C $unluacSource rev-parse HEAD).Trim()
-            if ($LASTEXITCODE -ne 0 -or $unluacCommit -ne "3186d2e392e44a2ddaadd1826a779c98c718be53") { throw "unluac-rs source checkout does not match the recorded commit: $unluacCommit" }
-            cargo build --manifest-path (Join-Path $unluacSource "Cargo.toml") --locked --release -p unluac-cli
-            if ($LASTEXITCODE -ne 0) { throw "unluac-rs CLI build failed" }
-          }
-          $unluac = Join-Path $unluacSource "target/release/unluac-cli.exe"
-          if (-not (Test-Path $unluac)) { throw "unluac-rs CLI executable is missing: $unluac" }
-          $toolDir = Join-Path $PWD "build/third-party"
-          New-Item -ItemType Directory -Force -Path $toolDir | Out-Null
-          Copy-Item (Join-Path $PWD "third_party/moonsec_v3_gpl/LICENSE") (Join-Path $toolDir "moonsec-gpl-3.0.txt")
-          Copy-Item (Join-Path $PWD "third_party/unluac-rs-mit.txt") (Join-Path $toolDir "unluac-rs-mit.txt")
 
       - name: Save native Luau build cache
         if: ${{ steps.native-cache.outputs.cache-hit != 'true' }}
@@ -197,6 +71,102 @@ jobs:
         with:
           path: build/native/host-bin
           key: ${{ steps.native-cache.outputs.cache-primary-key }}
+
+      - name: Stage native tools
+        shell: pwsh
+        run: |
+          $stage = Join-Path $PWD "build/release-inputs/native"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "build/native/host-bin/protez-native-host.exe" $stage
+          Copy-Item "build/native/host-bin/luau-ast.exe" $stage
+
+      - name: Upload native tools
+        uses: actions/upload-artifact@v4
+        with:
+          name: Protez-native-tools
+          path: build/release-inputs/native/*
+          if-no-files-found: error
+          retention-days: 1
+
+  build-rust:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Restore Rust lifter build cache
+        id: rust-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/luau-decompiler/target/release/luau-decompiler.exe
+            build/unluac-rs/target/release/unluac-cli.exe
+          key: ${{ runner.os }}-protez-rust-ee07098-3186d2e-${{ hashFiles('third_party/unluac-rs-protez-setlist.patch') }}
+          restore-keys: |
+            ${{ runner.os }}-protez-rust-ee07098-3186d2e-
+
+      - name: Check out pinned offline bytecode decompiler
+        if: ${{ steps.rust-cache.outputs.cache-hit != 'true' }}
+        uses: actions/checkout@v4
+        with:
+          repository: PumbaaDev/luau-decompiler
+          ref: ee07098c31e11601a9ca434bc12932a4ded65f7b
+          path: build/luau-decompiler
+
+      - name: Check out pinned Lua bytecode decompiler
+        if: ${{ steps.rust-cache.outputs.cache-hit != 'true' }}
+        uses: actions/checkout@v4
+        with:
+          repository: x3zvawq/unluac-rs
+          ref: 3186d2e392e44a2ddaadd1826a779c98c718be53
+          path: build/unluac-rs
+
+      - name: Set up Rust
+        if: ${{ steps.rust-cache.outputs.cache-hit != 'true' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Apply bounded Lua table-constructor recovery
+        if: ${{ steps.rust-cache.outputs.cache-hit != 'true' }}
+        shell: pwsh
+        run: |
+          $patch = Join-Path $PWD "third_party/unluac-rs-protez-setlist.patch"
+          git -C build/unluac-rs apply --check --unidiff-zero $patch
+          if ($LASTEXITCODE -ne 0) { throw "The pinned Lua decompiler recovery patch no longer applies cleanly" }
+          git -C build/unluac-rs apply --unidiff-zero $patch
+          if ($LASTEXITCODE -ne 0) { throw "Could not apply the Lua decompiler recovery patch" }
+          Write-Host "Applied Protez's bounded fresh-table SETLIST source recovery."
+
+      - name: Build offline Luau and Lua bytecode decompilers
+        shell: pwsh
+        run: |
+          if ("${{ steps.rust-cache.outputs.cache-hit }}" -ne "true") {
+            $luauSource = Join-Path $PWD "build/luau-decompiler"
+            $luauCommit = (& git -C $luauSource rev-parse HEAD).Trim()
+            if ($LASTEXITCODE -ne 0 -or $luauCommit -ne "ee07098c31e11601a9ca434bc12932a4ded65f7b") {
+              throw "Offline bytecode decompiler source checkout does not match the recorded commit: $luauCommit"
+            }
+            cargo build --manifest-path (Join-Path $luauSource "Cargo.toml") --locked --release -p luau-cli --bin luau-decompiler
+            if ($LASTEXITCODE -ne 0) { throw "Offline Luau bytecode decompiler build failed" }
+
+            $luaSource = Join-Path $PWD "build/unluac-rs"
+            $luaCommit = (& git -C $luaSource rev-parse HEAD).Trim()
+            if ($LASTEXITCODE -ne 0 -or $luaCommit -ne "3186d2e392e44a2ddaadd1826a779c98c718be53") {
+              throw "Lua bytecode decompiler source checkout does not match the recorded commit: $luaCommit"
+            }
+            cargo build --manifest-path (Join-Path $luaSource "Cargo.toml") --locked --release -p unluac-cli
+            if ($LASTEXITCODE -ne 0) { throw "Lua bytecode decompiler build failed" }
+          }
+
+          $luau = Join-Path $PWD "build/luau-decompiler/target/release/luau-decompiler.exe"
+          $lua = Join-Path $PWD "build/unluac-rs/target/release/unluac-cli.exe"
+          if (-not (Test-Path $luau)) { throw "Offline bytecode decompiler is missing: $luau" }
+          if (-not (Test-Path $lua)) { throw "Lua bytecode decompiler is missing: $lua" }
+          $version = & $luau --version
+          if ($LASTEXITCODE -ne 0 -or "$version" -notmatch "luau-decompiler") {
+            throw "Offline bytecode decompiler health check failed: $version"
+          }
+          Write-Host $version
 
       - name: Save Rust lifter build cache
         if: ${{ steps.rust-cache.outputs.cache-hit != 'true' }}
@@ -207,12 +177,127 @@ jobs:
             build/unluac-rs/target/release/unluac-cli.exe
           key: ${{ steps.rust-cache.outputs.cache-primary-key }}
 
+      - name: Stage Rust tools and notices
+        shell: pwsh
+        run: |
+          $stage = Join-Path $PWD "build/release-inputs/rust"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "build/luau-decompiler/target/release/luau-decompiler.exe" $stage
+          Copy-Item "build/unluac-rs/target/release/unluac-cli.exe" $stage
+          Copy-Item "third_party/luau-decompiler-mit.txt" (Join-Path $stage "luau-decompiler-mit.txt")
+          Copy-Item "third_party/luau-mit.txt" (Join-Path $stage "luau-mit.txt")
+          Copy-Item "third_party/unluac-rs-mit.txt" (Join-Path $stage "unluac-rs-mit.txt")
+
+      - name: Upload Rust tools
+        uses: actions/upload-artifact@v4
+        with:
+          name: Protez-rust-tools
+          path: build/release-inputs/rust/*
+          if-no-files-found: error
+          retention-days: 1
+
+  build-moonsec:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Restore MoonSec helper build cache
+        id: moonsec-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build/moonsec-helper
+          key: ${{ runner.os }}-protez-moonsec-net9-${{ hashFiles('third_party/moonsec_v3_gpl/**') }}
+          restore-keys: |
+            ${{ runner.os }}-protez-moonsec-net9-
+
+      - name: Set up .NET SDK
+        if: ${{ steps.moonsec-cache.outputs.cache-hit != 'true' }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Build MoonSec V3 lifter
+        shell: pwsh
+        run: |
+          $project = Join-Path $PWD "third_party/moonsec_v3_gpl/MoonsecDeobfuscator.csproj"
+          if ("${{ steps.moonsec-cache.outputs.cache-hit }}" -ne "true") {
+            dotnet publish $project -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o build/moonsec-helper
+            if ($LASTEXITCODE -ne 0) { throw "MoonSec V3 helper build failed" }
+          }
+          $helper = Join-Path $PWD "build/moonsec-helper/protez-moonsec-v3.exe"
+          if (-not (Test-Path $helper)) { throw "MoonSec V3 helper executable is missing: $helper" }
+          $version = & $helper --version
+          if ($LASTEXITCODE -ne 0 -or "$version" -notmatch "MoonsecDeobfuscator Protez V3") {
+            throw "MoonSec helper health check failed: $version"
+          }
+          Write-Host $version
+
       - name: Save MoonSec helper build cache
         if: ${{ steps.moonsec-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: build/moonsec-helper
           key: ${{ steps.moonsec-cache.outputs.cache-primary-key }}
+
+      - name: Stage MoonSec tool and notice
+        shell: pwsh
+        run: |
+          $stage = Join-Path $PWD "build/release-inputs/moonsec"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "build/moonsec-helper/protez-moonsec-v3.exe" $stage
+          Copy-Item "third_party/moonsec_v3_gpl/LICENSE" (Join-Path $stage "moonsec-gpl-3.0.txt")
+
+      - name: Upload MoonSec tool
+        uses: actions/upload-artifact@v4
+        with:
+          name: Protez-moonsec-tool
+          path: build/release-inputs/moonsec/*
+          if-no-files-found: error
+          retention-days: 1
+
+  build-exe:
+    needs: [build-native, build-rust, build-moonsec]
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Download native tools
+        uses: actions/download-artifact@v4
+        with:
+          name: Protez-native-tools
+          path: build/release-inputs/native
+
+      - name: Download Rust tools
+        uses: actions/download-artifact@v4
+        with:
+          name: Protez-rust-tools
+          path: build/release-inputs/rust
+
+      - name: Download MoonSec tool
+        uses: actions/download-artifact@v4
+        with:
+          name: Protez-moonsec-tool
+          path: build/release-inputs/moonsec
+
+      - name: Install Python dependencies and packager
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements-build.txt
+          if ($LASTEXITCODE -ne 0) { throw "dependency install failed" }
 
       - name: Smoke-test Luraph and MoonSec source recovery
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.verify_family_recovery }}
@@ -221,20 +306,24 @@ jobs:
           $fixtures = Join-Path $env:RUNNER_TEMP "protez-family-fixtures"
           New-Item -ItemType Directory -Force -Path $fixtures | Out-Null
           $luraphFixture = Join-Path $fixtures "luraph-v15.lua"
+          $luraphGroundTruth = Join-Path $fixtures "luraph-v15-ground-truth.lua"
           $moonsecFixture = Join-Path $fixtures "moonsec-v3.lua"
           Invoke-WebRequest -Uri "https://raw.githubusercontent.com/KryptIT/luraph-v15-v14.x-deobfuscator/ed79a86cc41187af0480e69f45a4838723fdb099/Deobfuscator/samples/001_vm_like_dispatch-obfuscated.lua" -OutFile $luraphFixture -TimeoutSec 45
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/KryptIT/luraph-v15-v14.x-deobfuscator/ed79a86cc41187af0480e69f45a4838723fdb099/Deobfuscator/samples/001_vm_like_dispatch.lua" -OutFile $luraphGroundTruth -TimeoutSec 45
           Invoke-WebRequest -Uri "https://gist.githubusercontent.com/checkurasshole/1bdb0f162d79819f6a4a34d6e9f45bd3/raw/b822d7396aa18e182b581348f93a70a0cdd832fb/v12.lua" -OutFile $moonsecFixture -TimeoutSec 45
           $luraphHash = (Get-FileHash -Algorithm SHA256 $luraphFixture).Hash.ToLowerInvariant()
+          $luraphGroundTruthHash = (Get-FileHash -Algorithm SHA256 $luraphGroundTruth).Hash.ToLowerInvariant()
           $moonsecHash = (Get-FileHash -Algorithm SHA256 $moonsecFixture).Hash.ToLowerInvariant()
           if ($luraphHash -ne "838a5ec65dde4b22399d88b4dc86d6c87dcdb6c1fe18f3c8dc54cd1b366af925") { throw "Pinned Luraph fixture hash mismatch: $luraphHash" }
+          if ($luraphGroundTruthHash -ne "e8501de9bf9aef35a0142b965408e171e82ec11fddc1b0f810e7f3240d72584a") { throw "Pinned Luraph ground-truth hash mismatch: $luraphGroundTruthHash" }
           if ($moonsecHash -ne "7d32c4ba8d7274619ead6e6f19857abf3eefa6abd0e3d89fcfc42505d3eafd77") { throw "Pinned MoonSec fixture hash mismatch: $moonsecHash" }
-          $smokeTools = Join-Path $PWD "build/family-smoke-tools"
+          $smokeTools = Join-Path $env:RUNNER_TEMP "protez-smoke-tools"
           New-Item -ItemType Directory -Force -Path $smokeTools | Out-Null
-          Copy-Item "build/native/host-bin/protez-native-host.exe" $smokeTools
-          Copy-Item "build/native/host-bin/luau-ast.exe" $smokeTools
-          Copy-Item "build/moonsec-helper/protez-moonsec-v3.exe" $smokeTools
-          Copy-Item "build/unluac-rs/target/release/unluac-cli.exe" $smokeTools
-          python scripts/smoke_family_devirtualizers.py --luraph-fixture $luraphFixture --moonsec-fixture $moonsecFixture --tools-dir $smokeTools --work-dir (Join-Path $env:RUNNER_TEMP "protez-family-smoke")
+          Copy-Item "build/release-inputs/native/protez-native-host.exe" $smokeTools
+          Copy-Item "build/release-inputs/native/luau-ast.exe" $smokeTools
+          Copy-Item "build/release-inputs/moonsec/protez-moonsec-v3.exe" $smokeTools
+          Copy-Item "build/release-inputs/rust/unluac-cli.exe" $smokeTools
+          python scripts/smoke_family_devirtualizers.py --luraph-fixture $luraphFixture --luraph-ground-truth $luraphGroundTruth --moonsec-fixture $moonsecFixture --tools-dir $smokeTools --work-dir (Join-Path $env:RUNNER_TEMP "protez-family-smoke")
           if ($LASTEXITCODE -ne 0) { throw "Family-specific source recovery smoke test failed" }
 
       - name: Preserve family smoke diagnostics
@@ -259,42 +348,36 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Package the self-contained application
+      - name: Package Protez.exe
         shell: pwsh
         run: |
-          $native = Join-Path $PWD "build/native/host-bin/protez-native-host.exe"
-          $ast = Join-Path $PWD "build/native/host-bin/luau-ast.exe"
-          $decompiler = Join-Path $PWD "build/luau-decompiler/target/release/luau-decompiler.exe"
-          $moonsec = Join-Path $PWD "build/moonsec-helper/protez-moonsec-v3.exe"
-          $unluac = Join-Path $PWD "build/unluac-rs/target/release/unluac-cli.exe"
-          $decompilerLicense = Join-Path $PWD "build/third-party/luau-decompiler-mit.txt"
-          $luauLicense = Join-Path $PWD "build/third-party/luau-mit.txt"
+          $native = Join-Path $PWD "build/release-inputs/native/protez-native-host.exe"
+          $ast = Join-Path $PWD "build/release-inputs/native/luau-ast.exe"
+          $decompiler = Join-Path $PWD "build/release-inputs/rust/luau-decompiler.exe"
+          $unluac = Join-Path $PWD "build/release-inputs/rust/unluac-cli.exe"
+          $moonsec = Join-Path $PWD "build/release-inputs/moonsec/protez-moonsec-v3.exe"
+          $thirdParty = Join-Path $PWD "build/release-inputs/rust"
+          $moonsecLicense = Join-Path $PWD "build/release-inputs/moonsec/moonsec-gpl-3.0.txt"
           $luraphVendor = Join-Path $PWD "third_party/protez_luraph_v15"
           $moonsecSource = Join-Path $PWD "third_party/moonsec_v3_gpl"
-          $moonsecLicense = Join-Path $PWD "build/third-party/moonsec-gpl-3.0.txt"
-          $unluacLicense = Join-Path $PWD "build/third-party/unluac-rs-mit.txt"
           $thirdPartyNotices = Join-Path $PWD "third_party/THIRD_PARTY_NOTICES.md"
           $iconPath = (Resolve-Path "assets/icons/protez.ico").Path
-          $appDist = Join-Path $PWD "dist"
-          $appWork = Join-Path $PWD "build/pyinstaller-app"
-          $appSpec = Join-Path $PWD "build/spec-app"
-          $entryPoint = Join-Path $PWD "main.py"
           $arguments = @(
             "--noconfirm", "--onefile", "--windowed",
             "--icon", $iconPath,
             "--name", "Protez",
-            "--distpath", $appDist,
-            "--workpath", $appWork,
-            "--specpath", $appSpec,
+            "--distpath", (Join-Path $PWD "dist"),
+            "--workpath", (Join-Path $PWD "build/pyinstaller-app"),
+            "--specpath", (Join-Path $PWD "build/spec-app"),
             "--add-data", "$native;tools",
             "--add-data", "$ast;tools",
             "--add-data", "$decompiler;tools",
             "--add-data", "$moonsec;tools",
             "--add-data", "$unluac;tools",
-            "--add-data", "$decompilerLicense;licenses",
-            "--add-data", "$luauLicense;licenses",
+            "--add-data", "$(Join-Path $thirdParty 'luau-decompiler-mit.txt');licenses",
+            "--add-data", "$(Join-Path $thirdParty 'luau-mit.txt');licenses",
             "--add-data", "$moonsecLicense;licenses",
-            "--add-data", "$unluacLicense;licenses",
+            "--add-data", "$(Join-Path $thirdParty 'unluac-rs-mit.txt');licenses",
             "--add-data", "$thirdPartyNotices;licenses",
             "--add-data", "$luraphVendor;third_party/protez_luraph_v15",
             "--add-data", "$moonsecSource;third_party/moonsec_v3_gpl",
@@ -303,7 +386,7 @@ jobs:
             "--collect-all", "tkinterdnd2",
             "--collect-all", "zstandard",
             "--hidden-import", "tkinterdnd2.TkinterDnD",
-            $entryPoint
+            (Join-Path $PWD "main.py")
           )
           $packageOutput = & python -m PyInstaller @arguments 2>&1
           $packageExit = $LASTEXITCODE
@@ -313,18 +396,12 @@ jobs:
             Write-Output "::error title=PyInstaller app build failed::$diagnostic"
             throw "Protez.exe packaging failed with exit code $packageExit"
           }
-          if (-not (Test-Path "dist/Protez.exe")) {
-            Write-Output "::error title=Protez.exe missing::PyInstaller completed but dist/Protez.exe was not created"
-            throw "Protez.exe was not created"
-          }
+          if (-not (Test-Path "dist/Protez.exe")) { throw "PyInstaller completed without creating dist/Protez.exe" }
           & (Join-Path $PWD "dist/Protez.exe") --ui-import-check | Out-Null
-          if ($LASTEXITCODE -ne 0) {
-            throw "Packaged application could not import its GUI modules"
-          }
+          if ($LASTEXITCODE -ne 0) { throw "Packaged application could not import its GUI modules" }
           Write-Host "Packaged application starts and imports its GUI modules."
-          Write-Host "Protez.exe is packaged without an elevation manifest; the analysis worker uses AppContainer isolation."
 
-      - name: Upload Windows executables
+      - name: Upload Protez.exe artifact
         uses: actions/upload-artifact@v4
         with:
           name: Protez-Windows-x64
@@ -332,7 +409,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Attach standalone application to GitHub Release
+      - name: Attach Protez.exe to GitHub Release
         if: github.event_name == 'release' && github.event.action == 'published'
         shell: pwsh
         env:

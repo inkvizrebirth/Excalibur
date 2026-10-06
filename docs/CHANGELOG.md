@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-06 — 0.6.2
+
+- Report incomplete Luraph lifts when generated output still contains unresolved constants, missing VM values, closures, iterators, tail calls, or runtime helpers. Remove unused generated error stubs from candidate source.
+- Build the native, Rust, and MoonSec Windows support tools in parallel, then package and publish only `Protez.exe`.
+
 ## 2026-10-06 — 0.6.1
 
 - Fixed the sandbox runtime for the supported Luraph v15 VM layout by exposing a monotonic, side-effect-free `os.clock()` and reading trace locals without mutating the active Luau stack. The instruction hook no longer changes Luau's callback table while code is running. Windows AppContainer smoke recovery now produces syntax-checked source for the pinned Luraph v15 and MoonSec V3 samples.

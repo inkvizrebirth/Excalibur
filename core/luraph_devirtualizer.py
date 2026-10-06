@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
+from core.deobfuscator import tokenize
 from core.runtime_paths import RESOURCE_ROOT
 from core.sandbox import Sandbox, SandboxResult
 
@@ -37,6 +38,115 @@ class LuraphDevirtualizationResult:
     trace_source: str | None
     source_bytes: int
     elapsed_seconds: float
+    lift_stats: dict[str, int]
+    unresolved_constant_count: int
+    unresolved_constant_samples: tuple[str, ...]
+    constant_misses: dict[str, int]
+    unresolved_runtime_functions: tuple[str, ...]
+    placeholder_counts: dict[str, int]
+    incomplete_reasons: tuple[str, ...]
+
+
+_SHARED_STUB = re.compile(
+    r'(?m)^local function (?P<name>luraph_runtime\d+)\(\.\.\.\)\r?\n'
+    r'[ \t]*error\("Luraph runtime function, not devirtualized"\)\r?\n'
+    r'end(?:\r?\n)?'
+)
+
+
+def _prepare_lifted_source(source: str) -> tuple[str, tuple[str, ...], dict[str, int]]:
+    """Remove generated error stubs and report actual unresolved lifter markers."""
+    tokens = tokenize(source)
+    stub_matches = list(_SHARED_STUB.finditer(source))
+    unresolved_runtime: list[str] = []
+    replacements: list[tuple[int, int, str]] = []
+    for match in stub_matches:
+        name = match.group("name")
+        used_outside_stub = any(
+            token.kind == "identifier"
+            and token.text == name
+            and not (match.start() <= token.start < match.end())
+            for token in tokens
+        )
+        if used_outside_stub:
+            unresolved_runtime.append(name)
+            replacement = f"-- Unresolved Luraph runtime function {name} was omitted."
+        else:
+            replacement = ""
+        replacements.append((match.start(), match.end(), replacement))
+
+    for start, end, replacement in reversed(replacements):
+        source = source[:start] + replacement + source[end:]
+
+    output_tokens = tokenize(source)
+    comments = [token.text.lower() for token in output_tokens if token.kind == "comment"]
+    opaque_nil_values = 0
+    generic_iterator_markers = 0
+    unlifted_closure_markers = 0
+    unresolved_tail_markers = 0
+    for index, token in enumerate(output_tokens):
+        following = output_tokens[index + 1] if index + 1 < len(output_tokens) else None
+        if (
+            token.kind == "identifier"
+            and token.text == "nil"
+            and following is not None
+            and following.kind == "comment"
+            and following.text.startswith("--[[")
+            and "constant not decoded" not in following.text.lower()
+            and "the caller's registers" not in following.text.lower()
+        ):
+            opaque_nil_values += 1
+        if token.kind == "identifier" and token.text == "geniter" and following is not None:
+            generic_iterator_markers += following.kind == "symbol" and following.text == "("
+        if token.kind == "comment" and "tail?" in token.text.lower():
+            unresolved_tail_markers += 1
+        if (
+            token.kind == "identifier"
+            and token.text == "function"
+            and index + 4 < len(output_tokens)
+            and [item.text for item in output_tokens[index + 1 : index + 4]] == ["(", "...", ")"]
+            and output_tokens[index + 4].kind == "comment"
+            and "closure" in output_tokens[index + 4].text.lower()
+        ):
+            unlifted_closure_markers += 1
+    placeholder_counts = {
+        "undecoded_constants": sum("constant not decoded" in comment for comment in comments),
+        "missing_caller_registers": sum("the caller's registers" in comment for comment in comments),
+        "opaque_expression_markers": sum(bool(re.search(r"--\[\[\?[^]]+\]\]", comment)) for comment in comments),
+        "opaque_nil_values": opaque_nil_values,
+        "unlifted_closures": unlifted_closure_markers,
+        "generic_iterator_markers": generic_iterator_markers,
+        "unresolved_tail_markers": unresolved_tail_markers,
+    }
+    return source, tuple(sorted(set(unresolved_runtime))), placeholder_counts
+
+
+def _lift_incomplete_reasons(
+    *,
+    source: str,
+    stats: dict[str, int],
+    unresolved_constant_count: int,
+    unresolved_runtime_functions: tuple[str, ...],
+    placeholder_counts: dict[str, int],
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if stats.get("functions", 0) <= 0:
+        reasons.append("no payload VM functions were lifted")
+    if stats.get("errors", 0) > 0:
+        reasons.append(f"{stats['errors']} VM blocks could not be lifted")
+    if unresolved_constant_count:
+        reasons.append(f"{unresolved_constant_count} lazy constants remain unresolved")
+    if unresolved_runtime_functions:
+        reasons.append(
+            "unresolved Luraph runtime functions: " + ", ".join(unresolved_runtime_functions[:8])
+        )
+    for key, count in placeholder_counts.items():
+        if count:
+            label = key.replace("_", " ")
+            reasons.append(f"{count} {label} remain in the lifted source")
+    if not source.strip():
+        reasons.append("the lifter emitted no source statements")
+    return tuple(reasons)
 
 
 class _Job:
@@ -151,17 +261,20 @@ def _import_vendor():
     try:
         harness = importlib.import_module("harness")
         driver = importlib.import_module("obfuscators.luraph_v15.driver")
+        devirt = importlib.import_module("obfuscators.luraph_v15.devirt")
         backend = importlib.import_module("backend")
     except Exception as exc:
         raise LuraphDevirtualizationError(
             f"could not load the Luraph v15 analysis engine: {type(exc).__name__}: {exc}"
         ) from exc
-    return harness, driver, backend
+    return harness, driver, devirt, backend
 
 
 def _install_analysis_deadline(backend, deadline: float) -> None:
     """Interrupt the lifter's large-stack worker at the pipeline deadline."""
     def run_big_stack(fn, *args):
+        previous_recursion_limit = sys.getrecursionlimit()
+        previous_stack_size = threading.stack_size()
         sys.setrecursionlimit(200_000)
         threading.stack_size(256 * 1024 * 1024 - 4096)
         result = {}
@@ -181,8 +294,14 @@ def _install_analysis_deadline(backend, deadline: float) -> None:
                 sys.settrace(None)
 
         worker = threading.Thread(target=target, name="protez-luraph-lifter")
-        worker.start()
-        worker.join(max(0.0, deadline - time.monotonic()) + 1.0)
+        try:
+            try:
+                worker.start()
+            finally:
+                threading.stack_size(previous_stack_size)
+            worker.join(max(0.0, deadline - time.monotonic()) + 1.0)
+        finally:
+            sys.setrecursionlimit(previous_recursion_limit)
         if worker.is_alive():
             raise TimeoutError("Luraph VM lifting exceeded Protez's analysis time limit")
         if "error" in result:
@@ -218,8 +337,36 @@ def devirtualize_luraph_v15(
     started = time.monotonic()
     deadline = started + total_budget_seconds
     vendor_source = source_bytes.decode("latin-1")
-    harness, driver, backend = _import_vendor()
+    harness, driver, devirt, backend = _import_vendor()
+    previous_backend_big_stack = backend.run_big_stack
+    previous_big_stack = devirt.run_big_stack
+    previous_lift_program = devirt.lift_program
+    lift_observations: list[dict[str, object]] = []
+
     _install_analysis_deadline(backend, deadline)
+
+    def record_lift(*args, **kwargs):
+        result = previous_lift_program(*args, **kwargs)
+        if isinstance(result, tuple) and len(result) == 4:
+            _text, stats, requests, _buffer_patches = result
+            dump = devirt.LAST_DUMP[-1] if devirt.LAST_DUMP else None
+            lift_observations.append(
+                {
+                    "stats": {str(key): int(value) for key, value in stats.items()},
+                    "request_count": len(requests),
+                    "request_samples": tuple(sorted(str(item) for item in requests)[:32]),
+                    "misses": {
+                        str(key): int(value)
+                        for key, value in (dump.misses.items() if dump is not None else ())
+                    },
+                }
+            )
+        return result
+
+    # devirt cached backend.run_big_stack at import time, so patch its alias as
+    # well as backend's implementation to enforce Protez's per-input deadline.
+    devirt.run_big_stack = backend.run_big_stack
+    devirt.lift_program = record_lift
 
     run_results: list[SandboxResult] = []
     sandbox = Sandbox(
@@ -294,7 +441,22 @@ def devirtualize_luraph_v15(
                 try:
                     lifted = output_path.read_text(encoding="utf-8")
                 except (OSError, UnicodeDecodeError) as exc:
-                    raise LuraphDevirtualizationError(f"could not read lifted Luau source: {exc}") from exc
+                    raise LuraphDevirtualizationError(
+                        f"could not read lifted Luau source: {exc}"
+                    ) from exc
+                lifted, unresolved_runtime, placeholder_counts = _prepare_lifted_source(lifted)
+                observation = lift_observations[-1] if lift_observations else {}
+                lift_stats = dict(observation.get("stats", {}))
+                unresolved_constant_count = int(observation.get("request_count", 0))
+                unresolved_constant_samples = tuple(observation.get("request_samples", ()))
+                incomplete_reasons = _lift_incomplete_reasons(
+                    source=lifted,
+                    stats=lift_stats,
+                    unresolved_constant_count=unresolved_constant_count,
+                    unresolved_runtime_functions=unresolved_runtime,
+                    placeholder_counts=placeholder_counts,
+                )
+                output_path.write_text(lifted, encoding="utf-8", newline="")
                 trace_source = None
                 if trace_path.is_file():
                     try:
@@ -308,12 +470,22 @@ def devirtualize_luraph_v15(
                     trace_source=trace_source,
                     source_bytes=len(source_bytes),
                     elapsed_seconds=time.monotonic() - started,
+                    lift_stats=lift_stats,
+                    unresolved_constant_count=unresolved_constant_count,
+                    unresolved_constant_samples=unresolved_constant_samples,
+                    constant_misses=dict(observation.get("misses", {})),
+                    unresolved_runtime_functions=unresolved_runtime,
+                    placeholder_counts=placeholder_counts,
+                    incomplete_reasons=incomplete_reasons,
                 )
             raise LuraphDevirtualizationError(
                 "the wrapper ran, but the family lifter recovered only a behavior trace, not VM source"
             )
     finally:
         harness.Runner = previous_runner
+        devirt.lift_program = previous_lift_program
+        devirt.run_big_stack = previous_big_stack
+        backend.run_big_stack = previous_backend_big_stack
         for key, previous in (
             ("PROTEZ_LUAU_AST", previous_ast),
             ("PROTEZ_ANALYSIS_DEADLINE", previous_deadline),

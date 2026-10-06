@@ -1084,10 +1084,13 @@ class DeobfuscationPipeline:
             label="formatted Luraph v15 source",
             deadline=deadline,
         )
+        recovery_complete = not devirtualized.incomplete_reasons
+        status = "complete" if recovery_complete else "partial"
         elapsed = time.monotonic() - started
         self.output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        output_path = self.output_dir / f"devirtualized_{timestamp}.luau"
+        source_name_suffix = "" if recovery_complete else ".candidate"
+        output_path = self.output_dir / f"devirtualized_{timestamp}{source_name_suffix}.luau"
         report_path = self.output_dir / f"devirtualized_{timestamp}.report.json"
         trace_path = (
             self.output_dir / f"devirtualized_{timestamp}.behavior-trace.luau"
@@ -1114,7 +1117,7 @@ class DeobfuscationPipeline:
         ) + (("compile-verified whitespace formatting",) if formatting_applied else ())
         report = {
             "app_version": VERSION,
-            "status": "complete",
+            "status": status,
             "source_name": source_name,
             "route": devirtualized.route,
             "duration_seconds": round(elapsed, 3),
@@ -1127,7 +1130,7 @@ class DeobfuscationPipeline:
                 "raw_payload_streams": profile.raw_payload_streams,
                 "valid_payload_streams": profile.valid_payload_streams,
             },
-            "source_reconstructed": True,
+            "source_reconstructed": devirtualized.lift_stats.get("functions", 0) > 0,
             "original_source_recovered": False,
             "semantic_equivalence_verified": False,
             "family_specific_analysis": {
@@ -1136,7 +1139,15 @@ class DeobfuscationPipeline:
                 "source_commit": "5a1ac583b69451f56dd735d2a1de6ab7a513432b",
                 "source_bytes": devirtualized.source_bytes,
                 "elapsed_seconds": round(devirtualized.elapsed_seconds, 3),
-                "vm_prototypes_lifted": True,
+                "vm_prototypes_lifted": devirtualized.lift_stats.get("functions", 0) > 0,
+                "lift_stats": devirtualized.lift_stats,
+                "unresolved_lazy_constant_count": devirtualized.unresolved_constant_count,
+                "unresolved_lazy_constant_samples": list(devirtualized.unresolved_constant_samples),
+                "constant_misses": devirtualized.constant_misses,
+                "unresolved_runtime_functions": list(devirtualized.unresolved_runtime_functions),
+                "placeholder_counts": devirtualized.placeholder_counts,
+                "partial_reasons": list(devirtualized.incomplete_reasons),
+                "readability_status": status,
                 "version_scope": "Luraph v15 wrappers matching the supported VM structure",
             },
             "formatting_applied": formatting_applied,
@@ -1152,7 +1163,8 @@ class DeobfuscationPipeline:
                 "error": None,
             },
             "outputs": {
-                "source": str(output_path),
+                "source": str(output_path) if recovery_complete else None,
+                "partial_source_candidate": str(output_path) if not recovery_complete else None,
                 "behavior_trace": str(trace_path) if trace_path else None,
                 "report": str(report_path),
             },
@@ -1160,12 +1172,19 @@ class DeobfuscationPipeline:
                 "Comments and original local names are not recoverable from the VM representation.",
                 "Some control-flow edges and API values may remain approximate when the wrapper structure is unsupported.",
                 "Syntax validation does not prove semantic equivalence to the protected program.",
-            ],
+            ] + (list(devirtualized.incomplete_reasons) if not recovery_complete else []),
         }
-        notice = (
-            "Luraph v15 VM code was lifted into readable Luau and passed a compile-only syntax check. "
-            "Original comments/names and semantic equivalence are not recovered or verified."
-        )
+        if recovery_complete:
+            notice = (
+                "Luraph v15 VM code was lifted into readable Luau and passed a compile-only syntax check. "
+                "Original comments/names and semantic equivalence are not recovered or verified."
+            )
+        else:
+            reasons = "; ".join(devirtualized.incomplete_reasons)
+            notice = (
+                "Luraph v15 produced a partial Luau candidate. It is syntax-valid, but the report lists "
+                f"unresolved VM logic: {reasons}. Protez did not mark it as recovered source."
+            )
         writes: list[tuple[Path, bytes]] = [
             (output_path, formatted_source.encode("utf-8")),
             (report_path, (json.dumps(report, indent=2, ensure_ascii=False) + "\n").encode("utf-8")),
@@ -1186,7 +1205,7 @@ class DeobfuscationPipeline:
 
         self.logger.info("Luraph v15 VM source written to %s", output_path)
         self.logger.info("Luraph v15 analysis report written to %s", report_path)
-        self._progress(100, "DONE")
+        self._progress(100, "DONE" if recovery_complete else "PARTIAL")
         return PipelineResult(
             output_path=output_path,
             report_path=report_path,
@@ -1194,8 +1213,9 @@ class DeobfuscationPipeline:
             decoded_layers=0,
             transformations=transformations,
             sandbox_result=last_run,
-            status="complete",
+            status=status,
             notice=notice,
+            preview_path=output_path if not recovery_complete else None,
             trace_files=(trace_path,) if trace_path else (),
             trace_event_count=0,
         )
