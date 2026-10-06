@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Preserve isolated Luraph `loadstring` captures as separate, hash-reported artifacts. A large captured body is promoted to source only after Luau validation and when it has no recognized VM signature or nested remote fetch; otherwise it remains a partial candidate.
+- Mark syntactically valid MoonSec output partial when strict source lifting reports errors, the output contains an unluac diagnostic marker, or it loads more Lua over HTTP. Keep the candidate, static preview, bytecode, and partial reasons in the report.
+- Expand the Windows family smoke run with pinned real Luraph v15 and MoonSec V3 samples. The smoke suite distinguishes recoverable local source from loader-only wrappers whose fetched payload is not embedded.
+
 ## 2026-10-06 — 0.6.2
 
 - Report incomplete Luraph lifts when generated output still contains unresolved constants, missing VM values, closures, iterators, tail calls, or runtime helpers. Remove unused generated error stubs from candidate source.
