@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 2026-10-06 — 0.6.1
+
+- Fixed the sandbox runtime for the supported Luraph v15 VM layout by exposing a monotonic, side-effect-free `os.clock()` and reading trace locals without mutating the active Luau stack. The instruction hook no longer changes Luau's callback table while code is running. Windows AppContainer smoke recovery now produces syntax-checked source for the pinned Luraph v15 and MoonSec V3 samples.
+
+## 2026-10-06 — 0.6.0
 
 - Added family-specific readable-source recovery for supported Luraph v15 and MoonSec V3 VM layouts. Luraph v15 uses the pinned MIT lifter in Protez's isolated Luau runtime; MoonSec V3 statically maps supported handlers to Lua 5.1 bytecode and decompiles it with pinned `unluac-rs`. The pipeline validates recovered source as Luau, writes real bytecode/disassembly artifacts on partial runs, and reports that semantic equivalence is not established. This is version/family-aware coverage, not a universal VM deobfuscator.
 - Bundled separate MoonSec and Lua bytecode helper executables and their licenses/source in the Windows build; source installations can build/download these tools when available. Bumped the application version to 0.6.0.

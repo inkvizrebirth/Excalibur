@@ -250,6 +250,15 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      - name: Upload recovered family smoke samples
+        if: ${{ success() && github.event_name == 'workflow_dispatch' && inputs.verify_family_recovery }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Protez-family-smoke-results
+          path: ${{ runner.temp }}/protez-family-smoke/**
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Package the self-contained application
         shell: pwsh
         run: |
