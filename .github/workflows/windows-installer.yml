@@ -307,23 +307,35 @@ jobs:
           New-Item -ItemType Directory -Force -Path $fixtures | Out-Null
           $luraphFixture = Join-Path $fixtures "luraph-v15.lua"
           $luraphGroundTruth = Join-Path $fixtures "luraph-v15-ground-truth.lua"
+          $luraphRepresentative = Join-Path $fixtures "luraph-v15-confirmed.lua"
           $moonsecFixture = Join-Path $fixtures "moonsec-v3.lua"
+          $moonsecRepresentative = Join-Path $fixtures "moonsec-v3-confirmed.lua"
+          $moonsecSecondVariant = Join-Path $fixtures "moonsec-v3-second-variant.lua"
           Invoke-WebRequest -Uri "https://raw.githubusercontent.com/KryptIT/luraph-v15-v14.x-deobfuscator/ed79a86cc41187af0480e69f45a4838723fdb099/Deobfuscator/samples/001_vm_like_dispatch-obfuscated.lua" -OutFile $luraphFixture -TimeoutSec 45
           Invoke-WebRequest -Uri "https://raw.githubusercontent.com/KryptIT/luraph-v15-v14.x-deobfuscator/ed79a86cc41187af0480e69f45a4838723fdb099/Deobfuscator/samples/001_vm_like_dispatch.lua" -OutFile $luraphGroundTruth -TimeoutSec 45
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Xyraniz/Obfuscator-Samples/b181a1b9a9bb55e31aa8d42eed6d5f7993869249/Luraph/v15.0/65556565.lua" -OutFile $luraphRepresentative -TimeoutSec 45
           Invoke-WebRequest -Uri "https://gist.githubusercontent.com/checkurasshole/1bdb0f162d79819f6a4a34d6e9f45bd3/raw/b822d7396aa18e182b581348f93a70a0cdd832fb/v12.lua" -OutFile $moonsecFixture -TimeoutSec 45
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Xyraniz/Obfuscator-Samples/b181a1b9a9bb55e31aa8d42eed6d5f7993869249/Moonsec/v3/323928.lua" -OutFile $moonsecRepresentative -TimeoutSec 45
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Xyraniz/Obfuscator-Samples/b181a1b9a9bb55e31aa8d42eed6d5f7993869249/Moonsec/v3/2098040928409.lua" -OutFile $moonsecSecondVariant -TimeoutSec 45
           $luraphHash = (Get-FileHash -Algorithm SHA256 $luraphFixture).Hash.ToLowerInvariant()
           $luraphGroundTruthHash = (Get-FileHash -Algorithm SHA256 $luraphGroundTruth).Hash.ToLowerInvariant()
+          $luraphRepresentativeHash = (Get-FileHash -Algorithm SHA256 $luraphRepresentative).Hash.ToLowerInvariant()
           $moonsecHash = (Get-FileHash -Algorithm SHA256 $moonsecFixture).Hash.ToLowerInvariant()
+          $moonsecRepresentativeHash = (Get-FileHash -Algorithm SHA256 $moonsecRepresentative).Hash.ToLowerInvariant()
+          $moonsecSecondVariantHash = (Get-FileHash -Algorithm SHA256 $moonsecSecondVariant).Hash.ToLowerInvariant()
           if ($luraphHash -ne "838a5ec65dde4b22399d88b4dc86d6c87dcdb6c1fe18f3c8dc54cd1b366af925") { throw "Pinned Luraph fixture hash mismatch: $luraphHash" }
           if ($luraphGroundTruthHash -ne "e8501de9bf9aef35a0142b965408e171e82ec11fddc1b0f810e7f3240d72584a") { throw "Pinned Luraph ground-truth hash mismatch: $luraphGroundTruthHash" }
+          if ($luraphRepresentativeHash -ne "88db28b5189a023bd737b9e478aa23ad224d9bb81f4ec2528c354fdc66a457df") { throw "Pinned representative Luraph fixture hash mismatch: $luraphRepresentativeHash" }
           if ($moonsecHash -ne "7d32c4ba8d7274619ead6e6f19857abf3eefa6abd0e3d89fcfc42505d3eafd77") { throw "Pinned MoonSec fixture hash mismatch: $moonsecHash" }
+          if ($moonsecRepresentativeHash -ne "5cd9600a17ed0f8ba325bca38a447bb9c2b82716b698ca073d49cbd5e0334fe1") { throw "Pinned representative MoonSec fixture hash mismatch: $moonsecRepresentativeHash" }
+          if ($moonsecSecondVariantHash -ne "23488e80fd39775651219b1b604c6d352bc039686e93955668d676dbaf02e402") { throw "Pinned second MoonSec fixture hash mismatch: $moonsecSecondVariantHash" }
           $smokeTools = Join-Path $env:RUNNER_TEMP "protez-smoke-tools"
           New-Item -ItemType Directory -Force -Path $smokeTools | Out-Null
           Copy-Item "build/release-inputs/native/protez-native-host.exe" $smokeTools
           Copy-Item "build/release-inputs/native/luau-ast.exe" $smokeTools
           Copy-Item "build/release-inputs/moonsec/protez-moonsec-v3.exe" $smokeTools
           Copy-Item "build/release-inputs/rust/unluac-cli.exe" $smokeTools
-          python scripts/smoke_family_devirtualizers.py --luraph-fixture $luraphFixture --luraph-ground-truth $luraphGroundTruth --moonsec-fixture $moonsecFixture --tools-dir $smokeTools --work-dir (Join-Path $env:RUNNER_TEMP "protez-family-smoke")
+          python scripts/smoke_family_devirtualizers.py --luraph-fixture $luraphFixture --luraph-ground-truth $luraphGroundTruth --luraph-fixture $luraphRepresentative --moonsec-fixture $moonsecFixture --moonsec-fixture $moonsecRepresentative --moonsec-fixture $moonsecSecondVariant --tools-dir $smokeTools --work-dir (Join-Path $env:RUNNER_TEMP "protez-family-smoke")
           if ($LASTEXITCODE -ne 0) { throw "Family-specific source recovery smoke test failed" }
 
       - name: Preserve family smoke diagnostics
