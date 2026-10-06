@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+import math
 import os
 import secrets
 import shutil
@@ -16,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Callable
 
-from core.runtime_paths import ENVLOG_PATH, HOOKS_PATH, LOGS_DIR, TOOLS_DIR
+from core.runtime_paths import LOGS_DIR, TOOLS_DIR
 
 DEFAULT_TOOLS_DIR = TOOLS_DIR
 DEFAULT_LOGS_DIR = LOGS_DIR
@@ -46,6 +47,7 @@ class SandboxResult:
     captured_paths: tuple[Path, ...]
     run_log_path: Path
     trace_token: str | None
+    isolation_backend: str
 
 
 class _PipeDrainer(threading.Thread):
@@ -261,7 +263,9 @@ class _CaptureParser:
 
         self._current_file.flush()
         self._current_file.close()
-        destination = self._capture_path.with_name(f"captured_payload_{index:03d}.luau")
+        destination = self._capture_path.with_name(
+            f"{self._capture_path.stem}_{index:03d}.luau"
+        )
         os.replace(self._current_path, destination)
         self._latest_path = destination
         self._paths.append(destination)
@@ -291,20 +295,13 @@ class _CaptureParser:
 
 
 class Sandbox:
-    """Run a Luau file in a separate process with a hard timeout.
-
-    The mock runtime is not an OS-level security boundary. Use a disposable
-    operating-system account or VM when testing untrusted input.
-    """
+    """Execute Luau in a networkless OS sandbox with bounded VM and process use."""
 
     def __init__(
         self,
         *,
         tools_dir: Path | str = DEFAULT_TOOLS_DIR,
         logs_dir: Path | str = DEFAULT_LOGS_DIR,
-        envlog_path: Path | str = ENVLOG_PATH,
-        hooks_path: Path | str = HOOKS_PATH,
-        luau_path: Path | str | None = None,
         timeout_seconds: float = 5.0,
         max_input_bytes: int = 16 * 1024 * 1024,
         max_output_bytes: int = 32 * 1024 * 1024,
@@ -317,12 +314,7 @@ class Sandbox:
             raise ValueError("input, output and trace-event limits must be positive")
         self.tools_dir = Path(tools_dir).expanduser().resolve()
         self.logs_dir = Path(logs_dir).expanduser().resolve()
-        self.envlog_path = Path(envlog_path).expanduser().resolve()
-        self.hooks_path = Path(hooks_path).expanduser().resolve()
         self.capture_path = self.logs_dir / CAPTURE_PATH.name
-        self.luau_path = (
-            Path(luau_path).expanduser().resolve() if luau_path is not None else None
-        )
         self.timeout_seconds = float(timeout_seconds)
         self.max_input_bytes = int(max_input_bytes)
         self.max_output_bytes = int(max_output_bytes)
@@ -371,23 +363,13 @@ class Sandbox:
         trace_token: str | None,
         output_line_callback: Callable[[bytes], None] | None,
     ) -> SandboxResult:
-        native_host = None if self.luau_path is not None else self._resolve_native_host()
-        binary = native_host or self._resolve_luau_binary()
-        try:
-            envlog = self.envlog_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise SandboxError(f"Could not read sandbox environment {self.envlog_path}: {exc}") from exc
-        if "__PROTEZ_CAPTURE_TOKEN__" not in envlog:
-            raise SandboxError("Sandbox environment is missing its capture-token placeholder")
-
-        hooks_text: str | None = None
+        native_host = self._resolve_native_host()
+        if native_host is None:
+            raise SandboxError(
+                "The isolated Luau worker is unavailable. Repair the bundled native host; "
+                "the ordinary Luau CLI is not used to execute untrusted source."
+            )
         if trace:
-            try:
-                hooks_text = self.hooks_path.read_text(encoding="utf-8")
-            except OSError as exc:
-                raise SandboxError(f"Could not read tracer hooks {self.hooks_path}: {exc}") from exc
-            if "__PROTEZ_TRACE_TOKEN__" not in hooks_text:
-                raise SandboxError("Tracer hooks are missing their trace-token placeholder")
             if trace_token is None:
                 trace_token = secrets.token_hex(16)
             elif len(trace_token) != 32 or any(
@@ -397,33 +379,23 @@ class Sandbox:
 
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.capture_path.parent.mkdir(parents=True, exist_ok=True)
-        self.capture_path.unlink(missing_ok=True)
-        for previous_capture in self.logs_dir.glob("captured_payload_[0-9]*.luau"):
-            previous_capture.unlink(missing_ok=True)
         token = secrets.token_hex(16)
-        runner_text = self._build_runner(
-            envlog,
-            token,
-            source,
-            hooks_text=hooks_text,
-            trace_token=trace_token,
-        )
+        capture_path = self.logs_dir / f"captured_payload_{token}.luau"
         run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_log_path = self.logs_dir / f"sandbox_{run_stamp}_{token[:8]}.log"
         timeout = self.timeout_seconds
         started = time.monotonic()
 
         self.logger.info("Deobfuscation input: %s (%s bytes)", source_name, f"{source_size:,}")
-        self.logger.warning(
-            "Process timeout is enabled; this mock is not an OS-level security boundary"
-        )
+        self.logger.info("Starting Luau in a networkless operating-system sandbox")
 
         with tempfile.TemporaryDirectory(prefix="protez-sandbox-", dir=self.logs_dir) as temp_dir:
-            runner_path = Path(temp_dir) / "runner.luau"
-            try:
-                runner_path.write_text(runner_text, encoding="utf-8")
-            except OSError as exc:
-                raise SandboxError(f"Could not prepare Luau runner: {exc}") from exc
+            runner_path = Path(temp_dir) / "input.luau"
+            if os.name != "nt":
+                try:
+                    runner_path.write_text(source, encoding="utf-8", newline="")
+                except OSError as exc:
+                    raise SandboxError(f"Could not stage Luau source: {exc}") from exc
 
             creationflags = 0
             popen_options: dict[str, object] = {}
@@ -433,27 +405,35 @@ class Sandbox:
             else:
                 popen_options["start_new_session"] = True
 
-            command = [str(binary)]
-            if native_host is not None:
-                command.extend(["--source", str(runner_path)])
-                if trace and trace_token is not None:
-                    command.extend(
-                        [
-                            "--trace-token",
-                            trace_token,
-                            "--max-trace-events",
-                            str(self.max_trace_events),
-                        ]
-                    )
+            worker_args = [
+                "--capture-token",
+                token,
+                "--max-captures",
+                "100",
+                "--max-capture-bytes",
+                str(min(8 * 1024 * 1024, max(1, self.max_output_bytes // 3))),
+            ]
+            if trace and trace_token is not None:
+                worker_args.extend(
+                    ["--trace-token", trace_token, "--max-trace-events", str(self.max_trace_events)]
+                )
+            if os.name == "nt":
+                command = [str(native_host), "--appcontainer", *worker_args]
+                stdin_mode = subprocess.PIPE
+                sandbox_backend = "Windows AppContainer"
+            elif os.name == "posix":
+                command = self._linux_isolated_command(native_host, runner_path, worker_args, timeout)
+                stdin_mode = subprocess.DEVNULL
+                sandbox_backend = "bubblewrap namespaces"
             else:
-                command.append(str(runner_path))
+                raise SandboxError(f"No isolated Luau worker is available on {os.name}")
 
             try:
                 process = subprocess.Popen(
                     command,
                     cwd=temp_dir,
                     env=self._minimal_environment(),
-                    stdin=subprocess.DEVNULL,
+                    stdin=stdin_mode,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     close_fds=True,
@@ -461,23 +441,19 @@ class Sandbox:
                     **popen_options,
                 )
             except OSError as exc:
-                raise SandboxError(f"Could not start Luau interpreter {binary}: {exc}") from exc
+                raise SandboxError(f"Could not start isolated Luau worker {native_host}: {exc}") from exc
 
             if process.stdout is None:
                 self._kill_process(process)
                 raise SandboxError("Luau process did not expose an output stream")
 
-            backend_name = "instrumented Luau native host" if native_host else "official Luau CLI"
-            self.logger.info("Sandbox spawned (%s)", backend_name)
-            self.logger.info("Hooking loadstring, load, require, game, Instance")
+            self.logger.info("Isolated worker started (%s)", sandbox_backend)
+            self.logger.info("Real loadstring/load compilation and execution capture enabled")
             if trace:
-                if native_host:
-                    self.logger.info(
-                        "Native instruction-step tracing enabled (limit: %s events)",
-                        f"{self.max_trace_events:,}",
-                    )
-                else:
-                    self.logger.info("Lua trace bridge loaded; native VM stepping is unavailable")
+                self.logger.info(
+                    "Native Luau instruction tracing enabled (limit: %s events)",
+                    f"{self.max_trace_events:,}",
+                )
             drainer = _PipeDrainer(
                 process.stdout,
                 run_log_path,
@@ -485,6 +461,26 @@ class Sandbox:
                 line_callback=output_line_callback,
             )
             drainer.start()
+            input_writer: threading.Thread | None = None
+            if process.stdin is not None:
+                def write_worker_source() -> None:
+                    try:
+                        process.stdin.write(source.encode("utf-8"))
+                        process.stdin.flush()
+                    except (BrokenPipeError, OSError) as exc:
+                        self.logger.debug("Worker stopped reading source input: %s", exc)
+                    finally:
+                        try:
+                            process.stdin.close()
+                        except OSError:
+                            pass
+
+                input_writer = threading.Thread(
+                    target=write_worker_source,
+                    name="protez-worker-input",
+                    daemon=True,
+                )
+                input_writer.start()
             timed_out = False
             output_limited = False
             deadline = started + timeout
@@ -506,6 +502,12 @@ class Sandbox:
                 self._kill_process(process)
                 returncode = process.wait()
 
+            if input_writer is not None:
+                input_writer.join(timeout=2.0)
+                if input_writer.is_alive():
+                    self._kill_process(process)
+                    input_writer.join(timeout=1.0)
+
             drainer.join(timeout=2.0)
             if drainer.is_alive():
                 self._kill_process(process)
@@ -524,7 +526,7 @@ class Sandbox:
         try:
             parser = _CaptureParser(
                 token=token,
-                capture_path=self.capture_path,
+                capture_path=capture_path,
                 logger=self.logger,
                 max_payload_bytes=self.max_output_bytes,
             )
@@ -569,6 +571,7 @@ class Sandbox:
             captured_paths=captured_paths,
             run_log_path=run_log_path,
             trace_token=trace_token,
+            isolation_backend=sandbox_backend,
         )
 
     def _resolve_native_host(self) -> Path | None:
@@ -589,62 +592,85 @@ class Sandbox:
                 continue
         return None
 
-    def _resolve_luau_binary(self) -> Path:
-        if self.luau_path is not None:
-            candidates = [self.luau_path]
-        else:
-            names = ("luau.exe", "luau") if os.name == "nt" else ("luau", "luau.exe")
-            candidates = [self.tools_dir / name for name in names]
-            path_from_env = shutil.which("luau")
-            if path_from_env:
-                candidates.append(Path(path_from_env))
+    def _linux_isolated_command(
+        self,
+        native_host: Path,
+        source_path: Path,
+        worker_args: list[str],
+        timeout_seconds: float,
+    ) -> list[str]:
+        bwrap = shutil.which("bwrap")
+        prlimit = shutil.which("prlimit")
+        if bwrap is None or prlimit is None:
+            missing = "bubblewrap" if bwrap is None else "prlimit"
+            raise SandboxError(
+                f"Linux dynamic analysis needs {missing}; install it to enable isolated execution."
+            )
 
-        for candidate in candidates:
+        command = [
+            prlimit,
+            f"--as={1024 * 1024 * 1024}",
+            f"--cpu={max(1, math.ceil(timeout_seconds) + 1)}",
+            "--fsize=1048576",
+            "--nofile=64",
+            "--core=0",
+            "--",
+            bwrap,
+            "--unshare-all",
+            "--die-with-parent",
+            "--new-session",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+        ]
+        for runtime_dir in (Path("/lib"), Path("/lib64")):
             try:
-                if candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK)):
-                    return candidate.resolve()
+                resolved_dir = runtime_dir.resolve(strict=True)
+                if resolved_dir.is_dir():
+                    # The ELF interpreter commonly lives under /lib64 even when
+                    # that path is a symlink to /usr/lib64 on the host.
+                    command.extend(["--ro-bind", str(resolved_dir), str(runtime_dir)])
             except OSError:
                 continue
-        expected = self.tools_dir / ("luau.exe" if os.name == "nt" else "luau")
-        raise SandboxError(
-            f"Luau CLI not found at {expected}. Run installer.py or place the official binary there."
+        command.extend(["--dir", "/etc"])
+        loader_cache = Path("/etc/ld.so.cache")
+        if loader_cache.is_file():
+            command.extend(["--ro-bind", str(loader_cache), "/etc/ld.so.cache"])
+        command.extend(
+            [
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+                "--ro-bind",
+                str(native_host),
+                "/protez-native-host",
+                "--ro-bind",
+                str(source_path),
+                "/input.luau",
+                "--clearenv",
+                "--setenv",
+                "HOME",
+                "/tmp",
+                "--setenv",
+                "PATH",
+                "/usr/bin:/bin",
+                "--setenv",
+                "LANG",
+                "C",
+                "--setenv",
+                "LC_ALL",
+                "C",
+                "--chdir",
+                "/tmp",
+                "--",
+                "/protez-native-host",
+                "--source",
+                "/input.luau",
+                *worker_args,
+            ]
         )
-
-    @staticmethod
-    def _build_runner(
-        envlog: str,
-        token: str,
-        source: str,
-        *,
-        hooks_text: str | None = None,
-        trace_token: str | None = None,
-    ) -> str:
-        prelude = envlog.replace("__PROTEZ_CAPTURE_TOKEN__", token)
-        if prelude == envlog:
-            raise SandboxError("Could not set the sandbox capture token")
-        if hooks_text is not None:
-            if trace_token is None or "__PROTEZ_TRACE_TOKEN__" not in hooks_text:
-                raise SandboxError("Could not configure tracer token")
-            hooks = hooks_text.replace("__PROTEZ_TRACE_TOKEN__", trace_token)
-            prelude += "\n" + hooks
-        trace_start = (
-            "if __PROTEZ_NATIVE_TRACE_BEGIN then __PROTEZ_NATIVE_TRACE_BEGIN() end\n"
-            if trace_token is not None
-            else ""
-        )
-        return (
-            prelude
-            + "\n"
-            + trace_start
-            + "local function __PROTEZ_INPUT(...)\n"
-            + source
-            + "\nend\n"
-            + "local __protez_run_ok, __protez_run_error = "
-            + "__protez_raw_pcall(__PROTEZ_INPUT)\n"
-            + "if not __protez_run_ok then\n"
-            + "    __protez_log('ERROR', __protez_run_error)\n"
-            + "end\n"
-        )
+        return command
 
     @staticmethod
     def _minimal_environment() -> dict[str, str]:

@@ -95,9 +95,11 @@ class BytecodePipelineTests(unittest.TestCase):
             max_pipeline_seconds=10,
         )
         with (
-            patch("core.pipeline.DeobfuscationPipeline._running_elevated", return_value=True),
             patch("core.pipeline._LuauCompiler.verify_text", autospec=True),
-            patch("core.pipeline.Sandbox.run", side_effect=AssertionError("sandbox must be skipped")),
+            patch(
+                "core.pipeline.DeobfuscationPipeline._trace_source",
+                side_effect=RuntimeError("native worker unavailable in this test"),
+            ),
         ):
             result = pipeline.run(source, source_name="input.luau")
 

@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import shutil
 import signal
 import subprocess
@@ -27,10 +28,20 @@ from core.luraph_static import (
     LuraphStaticUnpackResult,
     unpack_luraph_static,
 )
+from core.luraph_devirtualizer import (
+    LuraphDevirtualizationError,
+    LuraphDevirtualizationResult,
+    devirtualize_luraph_v15,
+)
+from core.moonsec_devirtualizer import (
+    MoonSecDevirtualizationError,
+    MoonSecV3Result,
+    devirtualize_moonsec_v3,
+)
 from core.protection import ProtectionProfile, inspect_protection
 from core.runtime_paths import LOGS_DIR, OUTPUT_DIR, TOOLS_DIR
 from core.sandbox import Sandbox, SandboxError, SandboxResult
-from core.tracer import Tracer
+from core.tracer import TraceError, TraceResult, Tracer
 from core.version import VERSION
 
 DEFAULT_OUTPUT_DIR = OUTPUT_DIR
@@ -59,6 +70,8 @@ class PipelineResult:
     status: str = "complete"
     notice: str | None = None
     preview_path: Path | None = None
+    trace_files: tuple[Path, ...] = ()
+    trace_event_count: int = 0
 
 
 class _LuauCompiler:
@@ -259,16 +272,91 @@ class DeobfuscationPipeline:
             raise TypeError("source must be text or compiled Luau bytecode")
 
         started = time.monotonic()
+        deadline = started + self.max_pipeline_seconds
         source_analysis = deobfuscate_source(source)
         protection = inspect_protection(source)
         if protection is not None:
             self._log_transformations("Input", source_analysis)
+            family_lifter_error: str | None = None
+            if protection.family == "MoonSec":
+                remaining = deadline - time.monotonic()
+                moonsec_result: MoonSecV3Result | None = None
+                if remaining > 0:
+                    self._progress(14, "DEVIRT")
+                    try:
+                        moonsec_result = devirtualize_moonsec_v3(
+                            source,
+                            tools_dir=self.tools_dir,
+                            timeout_seconds=remaining,
+                        )
+                    except MoonSecDevirtualizationError as exc:
+                        family_lifter_error = str(exc)
+                    except Exception as exc:
+                        family_lifter_error = f"unexpected {type(exc).__name__}: {exc}"
+                        self.logger.exception("Unexpected error in the MoonSec V3 lifter")
+                else:
+                    family_lifter_error = "the total pipeline time limit was reached before VM lifting started"
+                return self._write_moonsec_result(
+                    source=source,
+                    source_name=source_name,
+                    profile=protection,
+                    source_analysis=source_analysis,
+                    devirtualized=moonsec_result,
+                    error=family_lifter_error,
+                    compiler=_LuauCompiler(
+                        tools_dir=self.tools_dir,
+                        timeout_seconds=self.compiler_timeout_seconds,
+                        logger=self.logger,
+                    ),
+                    started=started,
+                    deadline=deadline,
+                )
+            if (
+                protection.family == "Luraph Obfuscator"
+                and protection.version is not None
+                and protection.version.split(".", maxsplit=1)[0] == "15"
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    self._progress(14, "DEVIRT")
+                    try:
+                        devirtualized = devirtualize_luraph_v15(
+                            source,
+                            source_name=source_name,
+                            tools_dir=self.tools_dir,
+                            logs_dir=LOGS_DIR,
+                            timeout_seconds=max(15.0, self.sandbox_timeout_seconds),
+                            total_budget_seconds=remaining,
+                            logger=self.logger,
+                        )
+                        return self._write_luraph_devirtualized_result(
+                            source=source,
+                            source_name=source_name,
+                            profile=protection,
+                            source_analysis=source_analysis,
+                            devirtualized=devirtualized,
+                            compiler=_LuauCompiler(
+                                tools_dir=self.tools_dir,
+                                timeout_seconds=self.compiler_timeout_seconds,
+                                logger=self.logger,
+                            ),
+                            started=started,
+                            deadline=deadline,
+                        )
+                    except LuraphDevirtualizationError as exc:
+                        family_lifter_error = str(exc)
+                        self.logger.warning("Luraph v15 VM lifting did not finish: %s", exc)
+                    except Exception as exc:
+                        family_lifter_error = f"unexpected {type(exc).__name__}: {exc}"
+                        self.logger.exception("Unexpected error in the Luraph v15 lifter")
+                else:
+                    family_lifter_error = "the total pipeline time limit was reached before VM lifting started"
             notice = (
-                f"{protection.display_name} detected; bounded static container extraction was selected. "
-                "Original-source reconstruction and code execution are disabled."
+                f"{protection.display_name} detected; Protez will try family-specific VM lifting "
+                "and isolated analysis. If lifting fails, the report will show the exact boundary."
             )
             self.logger.warning(notice)
-            self._progress(100, "PARTIAL")
+            self._progress(8, "ANALYZE")
             return self._write_protection_analysis(
                 source=source,
                 source_name=source_name,
@@ -276,14 +364,10 @@ class DeobfuscationPipeline:
                 source_analysis=source_analysis,
                 duration_seconds=time.monotonic() - started,
                 notice=notice,
+                deadline=deadline,
+                family_lifter_error=family_lifter_error,
             )
 
-        deadline = started + self.max_pipeline_seconds
-        elevated_mode = self._running_elevated()
-        if elevated_mode:
-            self.logger.warning(
-                "Administrator mode: dynamic execution and tracing of user source are disabled"
-            )
         self.logger.info("Static Luau analysis started (%s bytes)", f"{source_analysis.input_bytes:,}")
         self._log_transformations("Input", source_analysis)
         self._progress(8, "ANALYZE")
@@ -316,22 +400,33 @@ class DeobfuscationPipeline:
         )
         self._progress(18, "SANDBOX")
         initial_result: SandboxResult | None = None
+        trace_results: list[TraceResult] = []
+        trace_error: str | None = None
+        dynamic_attempted = False
         pending: list[tuple[str, int, str]] = []
         remaining = deadline - time.monotonic()
-        if elevated_mode:
-            self.logger.warning(
-                "Skipped initial sandbox in Administrator mode; user source was not executed"
-            )
-        elif remaining > 0:
+        if remaining > 0:
             sandbox.timeout_seconds = min(self.sandbox_timeout_seconds, remaining)
             try:
-                initial_result = sandbox.run(runtime_source, source_name=source_name)
-            except SandboxError as exc:
+                dynamic_attempted = True
+                initial_trace = self._trace_source(
+                    sandbox,
+                    runtime_source,
+                    source_name=source_name,
+                    label="input",
+                    timeout_seconds=min(self.sandbox_timeout_seconds, remaining),
+                )
+                trace_results.append(initial_trace)
+                initial_result = initial_trace.sandbox_result
+            except (SandboxError, TraceError) as exc:
+                trace_error = str(exc)
                 self.logger.error("Initial sandbox attempt failed: %s", exc)
-            except Exception:
+            except Exception as exc:
+                trace_error = f"unexpected {type(exc).__name__}: {exc}"
                 self.logger.exception("Initial sandbox attempt failed unexpectedly")
         else:
             self.logger.warning("Skipped initial sandbox after reaching the total runtime limit")
+            trace_error = "the total runtime limit was reached before dynamic analysis started"
 
         if initial_result is not None:
             self._log_sandbox_status(initial_result, "Input")
@@ -426,14 +521,21 @@ class DeobfuscationPipeline:
                 break
             sandbox.timeout_seconds = min(self.sandbox_timeout_seconds, remaining)
             try:
-                nested_result = sandbox.run(
+                nested_trace = self._trace_source(
+                    sandbox,
                     runtime_candidate,
                     source_name=f"{source_name} [{candidate_name}]",
+                    label=candidate_name,
+                    timeout_seconds=min(self.sandbox_timeout_seconds, remaining),
                 )
-            except SandboxError as exc:
+                trace_results.append(nested_trace)
+                nested_result = nested_trace.sandbox_result
+            except (SandboxError, TraceError) as exc:
+                layer_report[-1]["dynamic_trace_error"] = str(exc)
                 self.logger.warning("Sandbox could not inspect %s: %s", candidate_name, exc)
                 continue
             except Exception:
+                layer_report[-1]["dynamic_trace_error"] = "unexpected tracing error"
                 self.logger.exception("Nested sandbox failed for %s", candidate_name)
                 continue
             self._log_sandbox_status(nested_result, candidate_name)
@@ -442,19 +544,13 @@ class DeobfuscationPipeline:
                 pending.append((payload, depth + 1, f"{candidate_name}.{index}"))
 
         if best_source is None:
-            if elevated_mode:
-                report_path = self._write_failure_report(
-                    source, source_name, None, layer_report
-                )
-                raise PipelineError(
-                    "No valid Luau source was recovered. Dynamic execution and tracing are "
-                    f"disabled in Administrator mode. Report: {report_path}"
-                )
             return self._trace_unresolved(
-                runtime_source,
+                source,
                 source_name,
                 layer_report,
-                deadline=deadline,
+                trace_results=trace_results,
+                trace_error=trace_error,
+                dynamic_attempted=dynamic_attempted,
             )
 
         if initial_result is not None and initial_result.timed_out:
@@ -485,7 +581,9 @@ class DeobfuscationPipeline:
             layer_report=layer_report,
             sandbox_result=initial_result,
             duration_seconds=time.monotonic() - started,
-            dynamic_execution_skipped=elevated_mode,
+            trace_results=trace_results,
+            trace_error=trace_error,
+            dynamic_attempted=dynamic_attempted,
         )
 
     def _run_bytecode(self, bytecode: bytes, *, source_name: str) -> PipelineResult:
@@ -594,6 +692,135 @@ class DeobfuscationPipeline:
             ),
         )
 
+    def _write_moonsec_result(
+        self,
+        *,
+        source: str,
+        source_name: str,
+        profile: ProtectionProfile,
+        source_analysis: DeobfuscationResult,
+        devirtualized: MoonSecV3Result | None,
+        error: str | None,
+        compiler: _LuauCompiler,
+        started: float,
+        deadline: float,
+    ) -> PipelineResult:
+        """Persist MoonSec output as source only after syntax validation; retain real partial artifacts."""
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        stem = f"moonsec_{timestamp}"
+        preview_path = self.output_dir / f"{stem}.static-preview.luau"
+        output_path = self.output_dir / f"{stem}.lua"
+        candidate_path = self.output_dir / f"{stem}.candidate.lua"
+        bytecode_path = self.output_dir / f"{stem}.lua51.luac"
+        disassembly_path = self.output_dir / f"{stem}.disassembly.txt"
+        report_path = self.output_dir / f"{stem}.report.json"
+
+        source_candidate = devirtualized.source if devirtualized is not None else None
+        source_valid = False
+        if source_candidate is not None:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                compiler.timeout_seconds = min(self.compiler_timeout_seconds, remaining)
+                try:
+                    compiler.verify_text(source_candidate, label="MoonSec V3 lifted source")
+                    source_valid = True
+                except PipelineError as exc:
+                    error = f"Lua 5.1 decompiler output did not pass Luau syntax validation: {exc}"
+
+        artifacts: list[tuple[Path, bytes]] = []
+        if source_valid and source_candidate is not None:
+            artifacts.append((output_path, source_candidate.encode("utf-8")))
+            primary_path = output_path
+        else:
+            if source_candidate is not None:
+                artifacts.append((candidate_path, source_candidate.encode("utf-8")))
+            preview = (
+                "-- Protez static preview only; this is not recovered source.\n"
+                f"-- Detected: {profile.display_name}.\n"
+                "-- Do not treat the obfuscated wrapper as devirtualized Luau.\n\n"
+                + source_analysis.source
+            )
+            artifacts.append((preview_path, preview.encode("utf-8")))
+            primary_path = preview_path
+        if devirtualized is not None and devirtualized.bytecode is not None:
+            artifacts.append((bytecode_path, devirtualized.bytecode))
+        if devirtualized is not None and devirtualized.disassembly:
+            artifacts.append((disassembly_path, devirtualized.disassembly.encode("utf-8")))
+
+        status = "complete" if source_valid else "partial"
+        duration = time.monotonic() - started
+        report = {
+            "app_version": VERSION,
+            "status": status,
+            "source_name": source_name,
+            "route": "moonsec-v3-vm-lifter" if devirtualized else "moonsec-v3-analysis",
+            "duration_seconds": round(duration, 3),
+            "input_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            "protection": {"family": profile.family, "version": profile.version},
+            "family_specific_analysis": {
+                "engine": devirtualized.devirtualizer_version if devirtualized else "MoonsecDeobfuscator V3 adapter",
+                "decompiler": devirtualized.decompiler_version if devirtualized else "unluac-rs 1.4.4",
+                "attempted": True,
+                "lua51_bytecode_recovered": bool(devirtualized and devirtualized.bytecode),
+                "source_recovered": source_valid,
+                "source_parsed_as_luau": source_valid,
+                "semantic_equivalence_verified": False,
+                "elapsed_seconds": round(devirtualized.elapsed_seconds, 3) if devirtualized else None,
+                "lua51_bytecode_bytes": len(devirtualized.bytecode) if devirtualized and devirtualized.bytecode else None,
+                "lua51_bytecode_sha256": hashlib.sha256(devirtualized.bytecode).hexdigest() if devirtualized and devirtualized.bytecode else None,
+                "source_bytes": len(source_candidate.encode("utf-8")) if source_candidate is not None else None,
+                "error": error or (devirtualized.error if devirtualized else None),
+            },
+            "bytecode_executed": False,
+            "input_transformations": list(source_analysis.transformations),
+            "outputs": {
+                "source": str(output_path) if source_valid else None,
+                "unvalidated_source_candidate": str(candidate_path) if source_candidate is not None and not source_valid else None,
+                "static_preview": str(preview_path) if not source_valid else None,
+                "lua51_bytecode": str(bytecode_path) if devirtualized and devirtualized.bytecode else None,
+                "disassembly": str(disassembly_path) if devirtualized and devirtualized.disassembly else None,
+                "report": str(report_path),
+            },
+            "limitations": [
+                "Support is limited to MoonSec V3 wrappers matching the vendored handler and serializer patterns.",
+                "Recovered Lua source is approximate; original comments, local names, and exact formatting are unavailable.",
+                "Luau syntax validation does not prove semantic equivalence to the protected program.",
+                "The wrapper and recovered bytecode are parsed statically and are not executed by this route.",
+            ],
+        }
+        artifacts.append((report_path, (json.dumps(report, indent=2, ensure_ascii=False) + "\n").encode("utf-8")))
+        temporaries: list[Path] = []
+        try:
+            for path, payload in artifacts:
+                tmp = path.with_name(path.name + ".tmp")
+                tmp.write_bytes(payload)
+                os.replace(tmp, path)
+                temporaries.append(tmp)
+        except OSError as exc:
+            for path in (preview_path, output_path, candidate_path, bytecode_path, disassembly_path, report_path):
+                path.unlink(missing_ok=True)
+            raise PipelineError(f"Could not write MoonSec analysis output: {exc}") from exc
+        notice = (
+            "MoonSec V3 bytecode was lifted to readable Lua and passed Luau syntax validation; "
+            "semantic equivalence is not verified."
+            if source_valid
+            else f"MoonSec V3 analysis is partial. {error or (devirtualized.error if devirtualized else 'No bytecode was recovered.')}"
+        )
+        self.logger.info("MoonSec analysis report written to %s", report_path)
+        self._progress(100, "DONE" if source_valid else "PARTIAL")
+        return PipelineResult(
+            output_path=primary_path,
+            report_path=report_path,
+            route=str(report["route"]),
+            decoded_layers=0,
+            transformations=("MoonSec V3 VM to Lua 5.1 bytecode", "Lua 5.1 bytecode source lifting") if source_valid else (),
+            sandbox_result=None,
+            status=status,
+            notice=notice,
+            preview_path=preview_path if not source_valid else None,
+        )
+
     def _format_verified_candidate(
         self,
         source: str,
@@ -658,6 +885,67 @@ class DeobfuscationPipeline:
                 payloads.append(text)
         return tuple(payloads)
 
+    @staticmethod
+    def _sandbox_outcome(result: SandboxResult | None) -> str:
+        if result is None:
+            return "not-started"
+        if result.timed_out:
+            return "timed-out"
+        if result.output_limited:
+            return "output-limit"
+        if result.returncode == 0:
+            return "completed"
+        if result.returncode == 1:
+            return "runtime-error"
+        if result.returncode == 65:
+            return "compile-error"
+        if result.returncode == 66:
+            return "source-read-error"
+        if result.returncode in {70, 71}:
+            return "host-error"
+        return f"worker-error-{result.returncode}"
+
+    @staticmethod
+    def _capture_report_entries(
+        result: SandboxResult | None,
+    ) -> list[dict[str, object]]:
+        if result is None:
+            return []
+        paths = result.captured_paths or ((result.captured_path,) if result.captured_path else ())
+        entries: list[dict[str, object]] = []
+        for index, capture in enumerate(result.captures):
+            path = paths[index] if index < len(paths) else None
+            entry: dict[str, object] = {
+                "index": capture.index,
+                "kind": capture.kind,
+                "size_bytes": capture.size_bytes,
+            }
+            if path is not None and path.is_file():
+                entry["path"] = str(path)
+                try:
+                    digest = hashlib.sha256()
+                    with path.open("rb") as stream:
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    entry["sha256"] = digest.hexdigest()
+                except OSError:
+                    pass
+            entries.append(entry)
+        return entries
+
+    @classmethod
+    def _dynamic_run_report(cls, result: TraceResult) -> dict[str, object]:
+        sandbox_result = result.sandbox_result
+        return {
+            "source_name": result.source_name,
+            "execution_outcome": cls._sandbox_outcome(sandbox_result),
+            "isolation_backend": sandbox_result.isolation_backend,
+            "trace_files": [str(path) for path in result.trace_files],
+            "trace_event_count": result.event_count,
+            "native_instruction_tracing": result.native_hooks_available,
+            "captured_chunks": cls._capture_report_entries(sandbox_result),
+        }
+
     def _log_transformations(self, label: str, result: DeobfuscationResult) -> None:
         if not result.transformations:
             self.logger.info("%s: no static decoder patterns matched", label)
@@ -695,42 +983,222 @@ class DeobfuscationPipeline:
             )
         )
 
+    def _trace_source(
+        self,
+        sandbox: Sandbox,
+        source: str,
+        *,
+        source_name: str,
+        label: str,
+        timeout_seconds: float,
+    ) -> TraceResult:
+        trace_path = LOGS_DIR / (
+            f"trace_{label}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_"
+            f"{secrets.token_hex(4)}.jsonl"
+        )
+        tracer = Tracer(
+            logger=self.logger,
+            progress_callback=self.progress_callback,
+            tools_dir=self.tools_dir,
+            timeout_seconds=timeout_seconds,
+            trace_path=trace_path,
+            sandbox=sandbox,
+        )
+        try:
+            return tracer.trace(source, source_name=source_name)
+        except Exception as exc:
+            partial_paths = [trace_path, *trace_path.parent.glob(f"{trace_path.stem}.*{trace_path.suffix}")]
+            existing = []
+            for path in partial_paths:
+                try:
+                    if path.is_file() and path.stat().st_size:
+                        existing.append(path)
+                    else:
+                        path.unlink(missing_ok=True)
+                except OSError:
+                    continue
+            if existing:
+                detail = ", ".join(str(path) for path in existing)
+                raise TraceError(f"{exc}; partial trace was saved to {detail}") from exc
+            raise
+
     def _trace_unresolved(
         self,
         source: str,
         source_name: str,
         layer_report: list[dict[str, object]],
         *,
+        trace_results: list[TraceResult],
+        trace_error: str | None,
+        dynamic_attempted: bool,
+    ) -> PipelineResult:
+        self.logger.warning("No valid source layer was recovered after bounded dynamic analysis")
+        self._progress(82, "TRACE")
+        trace_files = tuple(path for result in trace_results for path in result.trace_files)
+        report_path = self._write_failure_report(
+            source,
+            source_name,
+            layer_report,
+            trace_results=trace_results,
+            trace_error=trace_error,
+            dynamic_attempted=dynamic_attempted,
+        )
+        detail = (
+            "VM instruction traces were saved, but VM lifting and source reconstruction are not implemented."
+            if trace_results and any(result.native_hooks_available for result in trace_results)
+            else f"Dynamic analysis did not recover valid source. {trace_error or 'No VM instruction trace was produced.'}"
+        )
+        trace_summary = f" Trace: {trace_files[0]}." if trace_files else ""
+        raise PipelineError(
+            f"No valid Luau source was recovered.{trace_summary} Report: {report_path}. {detail}"
+        )
+
+    def _write_luraph_devirtualized_result(
+        self,
+        *,
+        source: str,
+        source_name: str,
+        profile: ProtectionProfile,
+        source_analysis: DeobfuscationResult,
+        devirtualized: LuraphDevirtualizationResult,
+        compiler: _LuauCompiler,
+        started: float,
         deadline: float,
     ) -> PipelineResult:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            trace_path = LOGS_DIR / "trace.jsonl"
-            report_path = self._write_failure_report(source, source_name, trace_path, layer_report)
-            raise PipelineError(
-                f"No valid Luau source was recovered before the total time limit. "
-                f"Report: {report_path}. Tracing was skipped."
+            raise LuraphDevirtualizationError(
+                "the pipeline time limit was reached before validating the lifted source"
             )
-        self.logger.warning("No valid source layer was recovered; starting an instruction/API trace")
-        self._progress(82, "TRACE")
+        compiler.timeout_seconds = min(self.compiler_timeout_seconds, remaining)
         try:
-            trace_result = Tracer(
-                logger=self.logger,
-                progress_callback=self.progress_callback,
-                tools_dir=self.tools_dir,
-                timeout_seconds=remaining,
-            ).trace(source, source_name=source_name)
-        except Exception as trace_error:
-            raise PipelineError(f"No valid Luau source was recovered; tracing failed: {trace_error}") from trace_error
-        trace_path = trace_result.trace_files[0] if trace_result.trace_files else LOGS_DIR / "trace.jsonl"
-        detail = (
-            "Instruction trace saved; CFG lifting, register recovery and source reconstruction are not implemented."
-            if trace_result.native_hooks_available
-            else "Only mock/API events are available without the native host; no VM register trace was produced."
+            compiler.verify_text(devirtualized.source, label="Luraph v15 lifted source")
+        except PipelineError as exc:
+            raise LuraphDevirtualizationError(
+                f"the Luraph v15 lifter output failed Luau syntax validation: {exc}"
+            ) from exc
+
+        formatted_source, formatting_applied = self._format_verified_candidate(
+            devirtualized.source,
+            compiler,
+            label="formatted Luraph v15 source",
+            deadline=deadline,
         )
-        self.logger.error("Analysis incomplete: %s", detail)
-        report_path = self._write_failure_report(source, source_name, trace_path, layer_report)
-        raise PipelineError(f"No valid Luau source was recovered. Trace: {trace_path}. Report: {report_path}. {detail}")
+        elapsed = time.monotonic() - started
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        output_path = self.output_dir / f"devirtualized_{timestamp}.luau"
+        report_path = self.output_dir / f"devirtualized_{timestamp}.report.json"
+        trace_path = (
+            self.output_dir / f"devirtualized_{timestamp}.behavior-trace.luau"
+            if devirtualized.trace_source
+            else None
+        )
+        last_run = devirtualized.run_results[-1] if devirtualized.run_results else None
+        dynamic_runs = [
+            {
+                "run": index,
+                "execution_outcome": self._sandbox_outcome(run),
+                "duration_seconds": round(run.duration_seconds, 3),
+                "output_bytes": run.output_bytes,
+                "captures": self._capture_report_entries(run),
+                "isolation_backend": run.isolation_backend,
+                "run_log": str(run.run_log_path),
+            }
+            for index, run in enumerate(devirtualized.run_results, start=1)
+        ]
+        transformations = (
+            "Luraph v15 VM proto/opcode lifting",
+            "offline Roblox API model used during constant recovery",
+            "Luau compile-only syntax verification",
+        ) + (("compile-verified whitespace formatting",) if formatting_applied else ())
+        report = {
+            "app_version": VERSION,
+            "status": "complete",
+            "source_name": source_name,
+            "route": devirtualized.route,
+            "duration_seconds": round(elapsed, 3),
+            "input_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            "output_sha256": hashlib.sha256(formatted_source.encode("utf-8")).hexdigest(),
+            "protection": {
+                "family": profile.family,
+                "version": profile.version,
+                "container_layout": profile.container_layout,
+                "raw_payload_streams": profile.raw_payload_streams,
+                "valid_payload_streams": profile.valid_payload_streams,
+            },
+            "source_reconstructed": True,
+            "original_source_recovered": False,
+            "semantic_equivalence_verified": False,
+            "family_specific_analysis": {
+                "engine": "MIT-licensed Luraph v15 devirtualizer",
+                "provenance": "imnotherfav/deobfuscator-luraph-v15",
+                "source_commit": "5a1ac583b69451f56dd735d2a1de6ab7a513432b",
+                "source_bytes": devirtualized.source_bytes,
+                "elapsed_seconds": round(devirtualized.elapsed_seconds, 3),
+                "vm_prototypes_lifted": True,
+                "version_scope": "Luraph v15 wrappers matching the supported VM structure",
+            },
+            "formatting_applied": formatting_applied,
+            "formatting_validation": "compile-only" if formatting_applied else None,
+            "selected_transformations": list(transformations),
+            "dynamic_analysis": {
+                "attempted": bool(devirtualized.run_results),
+                "execution_outcome": self._sandbox_outcome(last_run),
+                "runs": dynamic_runs,
+                "isolation_backend": last_run.isolation_backend if last_run else None,
+                "trace_event_count": 0,
+                "native_instruction_tracing": False,
+                "error": None,
+            },
+            "outputs": {
+                "source": str(output_path),
+                "behavior_trace": str(trace_path) if trace_path else None,
+                "report": str(report_path),
+            },
+            "known_losses": [
+                "Comments and original local names are not recoverable from the VM representation.",
+                "Some control-flow edges and API values may remain approximate when the wrapper structure is unsupported.",
+                "Syntax validation does not prove semantic equivalence to the protected program.",
+            ],
+        }
+        notice = (
+            "Luraph v15 VM code was lifted into readable Luau and passed a compile-only syntax check. "
+            "Original comments/names and semantic equivalence are not recovered or verified."
+        )
+        writes: list[tuple[Path, bytes]] = [
+            (output_path, formatted_source.encode("utf-8")),
+            (report_path, (json.dumps(report, indent=2, ensure_ascii=False) + "\n").encode("utf-8")),
+        ]
+        if trace_path and devirtualized.trace_source is not None:
+            writes.append((trace_path, devirtualized.trace_source.encode("utf-8")))
+        temporary_paths = [path.with_name(path.name + ".tmp") for path, _ in writes]
+        try:
+            for (path, payload), temporary_path in zip(writes, temporary_paths):
+                temporary_path.write_bytes(payload)
+                os.replace(temporary_path, path)
+        except OSError as exc:
+            for temporary_path in temporary_paths:
+                temporary_path.unlink(missing_ok=True)
+            for path, _ in writes:
+                path.unlink(missing_ok=True)
+            raise PipelineError(f"Could not write Luraph v15 output: {exc}") from exc
+
+        self.logger.info("Luraph v15 VM source written to %s", output_path)
+        self.logger.info("Luraph v15 analysis report written to %s", report_path)
+        self._progress(100, "DONE")
+        return PipelineResult(
+            output_path=output_path,
+            report_path=report_path,
+            route=devirtualized.route,
+            decoded_layers=0,
+            transformations=transformations,
+            sandbox_result=last_run,
+            status="complete",
+            notice=notice,
+            trace_files=(trace_path,) if trace_path else (),
+            trace_event_count=0,
+        )
 
     def _write_protection_analysis(
         self,
@@ -741,8 +1209,10 @@ class DeobfuscationPipeline:
         source_analysis: DeobfuscationResult,
         duration_seconds: float,
         notice: str,
+        deadline: float,
+        family_lifter_error: str | None = None,
     ) -> PipelineResult:
-        """Write static triage plus any bounded Luraph container artifacts."""
+        """Write static triage, bounded container artifacts, and isolated runtime evidence."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         preview_path = self.output_dir / f"analysis_{timestamp}.static-preview.luau"
@@ -760,7 +1230,57 @@ class DeobfuscationPipeline:
             self.logger.exception("Unexpected error during static Luraph container extraction")
             unpack_error = f"unexpected static unpack error: {type(exc).__name__}: {exc}"
 
+        sandbox = Sandbox(
+            tools_dir=self.tools_dir,
+            timeout_seconds=self.sandbox_timeout_seconds,
+            logger=self.logger,
+        )
+        dynamic_trace: TraceResult | None = None
+        dynamic_error: str | None = None
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            self._progress(28, "SANDBOX")
+            sandbox.timeout_seconds = min(self.sandbox_timeout_seconds, remaining)
+            try:
+                dynamic_trace = self._trace_source(
+                    sandbox,
+                    source,
+                    source_name=source_name,
+                    label="luraph",
+                    timeout_seconds=min(self.sandbox_timeout_seconds, remaining),
+                )
+            except (SandboxError, TraceError) as exc:
+                dynamic_error = str(exc)
+                self.logger.warning("Isolated Luraph runtime analysis could not start: %s", exc)
+            except Exception as exc:
+                dynamic_error = f"unexpected {type(exc).__name__}: {exc}"
+                self.logger.exception("Unexpected isolated Luraph runtime-analysis error")
+        else:
+            dynamic_error = "the total runtime limit was reached before dynamic analysis started"
+        dynamic_result = dynamic_trace.sandbox_result if dynamic_trace is not None else None
+        if dynamic_result is not None:
+            self._log_sandbox_status(dynamic_result, "Luraph wrapper")
         elapsed_seconds = duration_seconds + (time.monotonic() - unpack_started)
+        trace_files = dynamic_trace.trace_files if dynamic_trace is not None else ()
+        dynamic_runs = [self._dynamic_run_report(dynamic_trace)] if dynamic_trace is not None else []
+        captured_chunks = dynamic_runs[0]["captured_chunks"] if dynamic_runs else []
+        dynamic_outcome = self._sandbox_outcome(dynamic_result)
+        dynamic_analysis: dict[str, object] = {
+            "attempted": remaining > 0,
+            "worker_started": dynamic_result is not None,
+            "execution_outcome": dynamic_outcome,
+            "runs": dynamic_runs,
+            "isolation_backend": (
+                dynamic_result.isolation_backend if dynamic_result is not None else None
+            ),
+            "trace_files": [str(path) for path in trace_files],
+            "trace_event_count": dynamic_trace.event_count if dynamic_trace is not None else 0,
+            "native_instruction_tracing": (
+                dynamic_trace.native_hooks_available if dynamic_trace is not None else False
+            ),
+            "captured_chunks": captured_chunks,
+            "error": dynamic_error,
+        }
         vm_source_path: Path | None = None
         bytecode_path: Path | None = None
         vm_source_details: dict[str, object] | None = None
@@ -783,7 +1303,7 @@ class DeobfuscationPipeline:
                 "sha256": hashlib.sha256(unpack_result.custom_bytecode).hexdigest(),
             }
             self.logger.info(
-                "Statically unpacked Luraph %s container; no Luau code was executed",
+                "Statically unpacked Luraph %s container",
                 unpack_result.layout,
             )
             if vm_source_details is not None:
@@ -791,8 +1311,8 @@ class DeobfuscationPipeline:
             self.logger.info("Luraph custom-bytecode artifact written to %s", bytecode_path)
             notice = (
                 f"{profile.display_name} container streams were statically unpacked "
-                f"({unpack_result.layout}); original Luau source was not reconstructed "
-                "and no code was executed."
+                f"({unpack_result.layout}); isolated execution/tracing outcome: "
+                f"{dynamic_outcome}. Original source was not reconstructed."
             )
         else:
             unpack_error = unpack_error or "no supported Luraph container layout was found"
@@ -802,13 +1322,13 @@ class DeobfuscationPipeline:
             )
             notice = (
                 f"{profile.display_name} detected; Protez produced a static wrapper preview only. "
-                f"Stream extraction did not complete: {unpack_error}. No code was executed."
+                f"Stream extraction did not complete: {unpack_error}. Isolated execution/tracing "
+                f"outcome: {dynamic_outcome}."
             )
 
         preview = (
             "-- Protez static preview only; this is not reconstructed source.\n"
-            f"-- Detected: {profile.display_name}. The wrapper, VM interpreter, "
-            "and payload were not executed.\n"
+            f"-- Detected: {profile.display_name}. Runtime outcome: {dynamic_outcome}.\n"
             "-- Do not treat this file as deobfuscated Luau.\n\n"
             + source_analysis.source
         )
@@ -820,9 +1340,6 @@ class DeobfuscationPipeline:
             ),
             "source_reconstructed": False,
             "custom_vm_devirtualized": False,
-            "wrapper_executed": False,
-            "vm_interpreter_executed": False,
-            "payload_executed": False,
             "compressed_stream_bytes": (
                 list(unpack_result.compressed_stream_sizes) if unpack_result is not None else []
             ),
@@ -833,6 +1350,25 @@ class DeobfuscationPipeline:
             "custom_bytecode": bytecode_details,
             "error": None if unpack_result is not None else unpack_error,
         }
+        execution_note = (
+            "The wrapper was submitted to the isolated Luau worker without Roblox Engine APIs. "
+            "A runtime error or timeout can stop it before a payload is reached."
+            if dynamic_result is not None
+            else "The wrapper did not run because isolated dynamic analysis could not start: "
+            + (dynamic_error or "no worker result was produced.")
+        )
+        if family_lifter_error:
+            family_lifter_limitation = (
+                "Luraph v15 family-specific lifting was attempted but did not recover source: "
+                + family_lifter_error
+            )
+        elif profile.version and profile.version.split(".", maxsplit=1)[0] == "15":
+            family_lifter_limitation = "Luraph v15 VM source was not recovered by the family-specific lifter."
+        else:
+            family_lifter_limitation = (
+                "This Protez release has a family-specific source lifter for Luraph v15 only; "
+                "other Luraph versions receive static and isolated runtime analysis."
+            )
         limitations = [
             (
                 "The readable Luraph wrapper is not the original program; container decoding "
@@ -842,13 +1378,11 @@ class DeobfuscationPipeline:
                 "The extracted custom VM bytecode is not standard Luau bytecode and is not "
                 "passed to the ordinary Luau bytecode decompiler."
             ),
+            family_lifter_limitation,
+            execution_note,
             (
-                "Protez does not currently lift Luraph VM prototypes/opcode handlers into "
-                "the original Luau source."
-            ),
-            (
-                "No wrapper, recovered VM interpreter, bytecode, or payload was executed; "
-                "no external service received the input."
+                "The Luau VM trace describes wrapper/interpreter instructions. It does not identify or "
+                "lift the semantics of Luraph's custom bytecode."
             ),
         ]
         if unpack_result is None:
@@ -874,16 +1408,30 @@ class DeobfuscationPipeline:
             },
             "recovered": False,
             "source_reconstructed": False,
-            "payload_executed": False,
+            "dynamic_analysis": dynamic_analysis,
+            "wrapper_execution_outcome": dynamic_outcome,
             "input_transformations": list(source_analysis.transformations),
             "visible_wrapper_literals": list(profile.visible_literals),
             "static_unpack": static_unpack_report,
+            "family_specific_analysis": {
+                "engine": "luraph-v15-vm-lifter",
+                "attempted": family_lifter_error is not None or (
+                    profile.version is not None
+                    and profile.version.split(".", maxsplit=1)[0] == "15"
+                ),
+                "source_recovered": False,
+                "error": family_lifter_error,
+            },
             "outputs": {
                 "human_report": str(summary_path),
                 "machine_report": str(report_path),
                 "static_preview": str(preview_path),
                 "luraph_vm_interpreter": str(vm_source_path) if vm_source_path else None,
                 "luraph_custom_bytecode": str(bytecode_path) if bytecode_path else None,
+                "trace_files": [str(path) for path in trace_files],
+                "captured_chunks": [
+                    item["path"] for item in captured_chunks if "path" in item
+                ],
             },
             "limitations": limitations,
         }
@@ -930,6 +1478,14 @@ class DeobfuscationPipeline:
                 "  - Static container extraction: NOT COMPLETED",
                 f"  - Detail: {unpack_error}",
             ]
+        captured_lines = []
+        for item in captured_chunks:
+            entry = f"  - {item['kind']}: {item['size_bytes']:,} bytes"
+            if item.get("sha256"):
+                entry += f", SHA-256 {item['sha256']}"
+            if item.get("path"):
+                entry += f" — {item['path']}"
+            captured_lines.append(entry)
         summary = (
             "PROTEZ // STATIC PROTECTION ANALYSIS\n"
             "=====================================\n"
@@ -938,8 +1494,19 @@ class DeobfuscationPipeline:
             f"Container layout: {profile.container_layout or 'not classified'}\n"
             f"Embedded payload: {payload_size}\n"
             f"Input: {source_name} ({source_analysis.input_bytes:,} bytes)\n"
-            f"Elapsed: {elapsed_seconds:.2f} seconds\n\n"
-            "Static Luraph extraction:\n"
+            f"Elapsed: {elapsed_seconds:.2f} seconds\n"
+            f"Isolated wrapper execution: {dynamic_outcome}\n"
+            f"Luau VM trace events: {dynamic_analysis['trace_event_count']}\n"
+            + (f"Trace file: {trace_files[0]}\n" if trace_files else "")
+            + (f"Runtime-analysis detail: {dynamic_error}\n" if dynamic_error else "")
+            + (
+                "Captured loadstring/load chunks:\n"
+                + "\n".join(captured_lines)
+                + "\n"
+                if captured_lines
+                else ""
+            )
+            + "\nStatic Luraph extraction:\n"
             f"{chr(10).join(unpack_lines)}\n\n"
             "Static wrapper transforms:\n"
             f"{transformations}\n\n"
@@ -948,14 +1515,12 @@ class DeobfuscationPipeline:
             "What this result means:\n"
             "The Luraph container may now be unpacked into its VM-interpreter stream "
             "and/or custom virtual bytecode. "
-            "This is an intermediate static-analysis result, not the unobfuscated "
-            "program. Protez does not yet "
-            "reconstruct Luraph prototypes, opcode semantics, or original "
-            "source-level control flow.\n\n"
+            "The wrapper was also attempted in an isolated Luau worker; see the runtime outcome below. "
+            "This is an intermediate analysis result, not the unobfuscated "
+            "program. This report was written because the v15 source lifter did not "
+            "complete or this version is outside its supported family.\n\n"
             "Safety:\n"
-            "The wrapper, decoded VM interpreter, custom bytecode, and payload were not "
-            "executed. All analysis "
-            "was local; the input was not uploaded to an external service. Treat "
+            f"{execution_note} The worker has no network access. Treat "
             "intermediate artifacts as "
             "untrusted code/data and review them before sharing.\n\n"
             "Files:\n"
@@ -993,17 +1558,20 @@ class DeobfuscationPipeline:
 
         self.logger.info("Static analysis report written to %s", summary_path)
         self.logger.info("Machine-readable report written to %s", report_path)
-        self.logger.info("Wrapper-only preview written to %s", preview_path)
+        self.logger.info("Static preview written to %s", preview_path)
+        self._progress(100, "PARTIAL")
         return PipelineResult(
             output_path=summary_path,
             report_path=report_path,
             route="static-protection-report",
             decoded_layers=0,
             transformations=source_analysis.transformations,
-            sandbox_result=None,
+            sandbox_result=dynamic_result,
             status="partial",
             notice=notice,
             preview_path=preview_path,
+            trace_files=tuple(trace_files),
+            trace_event_count=dynamic_trace.event_count if dynamic_trace is not None else 0,
         )
 
     def _write_result(
@@ -1021,7 +1589,9 @@ class DeobfuscationPipeline:
         layer_report: list[dict[str, object]],
         sandbox_result: SandboxResult | None,
         duration_seconds: float,
-        dynamic_execution_skipped: bool,
+        trace_results: list[TraceResult],
+        trace_error: str | None,
+        dynamic_attempted: bool,
     ) -> PipelineResult:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1029,15 +1599,33 @@ class DeobfuscationPipeline:
         report_path = self.output_dir / f"deobfuscated_{timestamp}.report.json"
         output_temp = output_path.with_name(output_path.name + ".tmp")
         report_temp = report_path.with_name(report_path.name + ".tmp")
+        trace_files = tuple(path for result in trace_results for path in result.trace_files)
+        trace_event_count = sum(result.event_count for result in trace_results)
+        dynamic_runs = [self._dynamic_run_report(result) for result in trace_results]
+        captured_chunks = [
+            item for run in dynamic_runs for item in run["captured_chunks"]
+        ]
+        dynamic_analysis = {
+            "attempted": dynamic_attempted,
+            "execution_outcome": self._sandbox_outcome(sandbox_result),
+            "runs": dynamic_runs,
+            "isolation_backend": (
+                sandbox_result.isolation_backend if sandbox_result is not None else None
+            ),
+            "trace_files": [str(path) for path in trace_files],
+            "trace_event_count": trace_event_count,
+            "native_instruction_tracing": any(
+                result.native_hooks_available for result in trace_results
+            ),
+            "captured_chunks": captured_chunks,
+            "error": trace_error,
+        }
         safety_notes = [
-            "HTTP and remote module requests remain disabled in the mock runtime.",
-            "Dynamic inspection is process-limited and is not an OS security boundary.",
+            "Dynamic runs use an OS sandbox with no network access and bounded process and VM memory.",
+            "Roblox Engine APIs are not fabricated; scripts that require them stop at the first missing API.",
+            "Filesystem, process, and remote module loading functions are unavailable inside the Luau worker.",
             "A syntactically valid output is not a guarantee of full deobfuscation.",
         ]
-        if dynamic_execution_skipped:
-            safety_notes.append(
-                "Dynamic sandbox execution was skipped because Protez is running as Administrator."
-            )
         report = {
             "app_version": VERSION,
             "source_name": source_name,
@@ -1052,6 +1640,7 @@ class DeobfuscationPipeline:
             "formatting_applied": formatting_applied,
             "formatting_validation": "compile-only" if formatting_applied else None,
             "layers": layer_report,
+            "dynamic_analysis": dynamic_analysis,
             "safety_notes": safety_notes,
         }
         try:
@@ -1077,35 +1666,53 @@ class DeobfuscationPipeline:
             decoded_layers=decoded_layers,
             transformations=transformations,
             sandbox_result=sandbox_result,
+            trace_files=trace_files,
+            trace_event_count=trace_event_count,
         )
 
     def _write_failure_report(
         self,
         source: str,
         source_name: str,
-        trace_path: Path | None,
         layer_report: list[dict[str, object]],
+        *,
+        trace_results: list[TraceResult],
+        trace_error: str | None,
+        dynamic_attempted: bool,
     ) -> Path:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         report_path = self.output_dir / f"analysis_{timestamp}.report.json"
+        trace_files = tuple(path for result in trace_results for path in result.trace_files)
+        sandbox_result = trace_results[0].sandbox_result if trace_results else None
+        dynamic_runs = [self._dynamic_run_report(result) for result in trace_results]
         report = {
             "app_version": VERSION,
             "source_name": source_name,
             "input_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
             "recovered": False,
-            "trace_path": str(trace_path) if trace_path is not None else None,
-            "dynamic_execution_skipped": trace_path is None,
+            "dynamic_analysis": {
+                "attempted": dynamic_attempted,
+                "execution_outcome": self._sandbox_outcome(sandbox_result),
+                "runs": dynamic_runs,
+                "isolation_backend": (
+                    sandbox_result.isolation_backend if sandbox_result is not None else None
+                ),
+                "trace_files": [str(path) for path in trace_files],
+                "trace_event_count": sum(result.event_count for result in trace_results),
+                "native_instruction_tracing": any(
+                    result.native_hooks_available for result in trace_results
+                ),
+                "captured_chunks": [
+                    item for run in dynamic_runs for item in run["captured_chunks"]
+                ],
+                "error": trace_error,
+            },
             "layers": layer_report,
             "limitations": [
                 "No syntactically valid source layer was recovered.",
-                "Remote HTTP and require requests are disabled.",
+                "Roblox Engine APIs are not supplied; code depending on them may stop at runtime.",
                 "VM handler lifting and source reconstruction are not implemented.",
-                *(
-                    ["Dynamic sandbox execution and tracing were skipped in Administrator mode."]
-                    if trace_path is None
-                    else []
-                ),
             ],
         }
         try:
@@ -1113,17 +1720,6 @@ class DeobfuscationPipeline:
         except OSError as exc:
             self.logger.error("Could not write analysis report: %s", exc)
         return report_path
-
-    @staticmethod
-    def _running_elevated() -> bool:
-        if os.name != "nt":
-            return False
-        try:
-            import ctypes
-
-            return bool(ctypes.windll.shell32.IsUserAnAdmin())
-        except (AttributeError, OSError):
-            return False
 
     def _progress(self, percent: float, stage: str) -> None:
         if self.progress_callback is not None:

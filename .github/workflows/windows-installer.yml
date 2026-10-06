@@ -45,6 +45,28 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Check out pinned Lua bytecode decompiler
+        uses: actions/checkout@v4
+        with:
+          repository: x3zvawq/unluac-rs
+          ref: 3186d2e392e44a2ddaadd1826a779c98c718be53
+          path: build/unluac-rs
+
+      - name: Apply bounded Lua table-constructor recovery
+        shell: pwsh
+        run: |
+          $patch = Join-Path $PWD "third_party/unluac-rs-protez-setlist.patch"
+          git -C build/unluac-rs apply --check --unidiff-zero $patch
+          if ($LASTEXITCODE -ne 0) { throw "The pinned Lua decompiler recovery patch no longer applies cleanly" }
+          git -C build/unluac-rs apply --unidiff-zero $patch
+          if ($LASTEXITCODE -ne 0) { throw "Could not apply the Lua decompiler recovery patch" }
+          Write-Host "Applied Protez's bounded fresh-table SETLIST source recovery."
+
       - name: Install Python dependencies and packager
         shell: pwsh
         run: |
@@ -84,6 +106,8 @@ jobs:
           }
           $native = Join-Path $PWD "build/native/host-bin/protez-native-host.exe"
           if (-not (Test-Path $native)) { throw "Native host output is missing: $native" }
+          $ast = Join-Path $PWD "build/native/host-bin/luau-ast.exe"
+          if (-not (Test-Path $ast)) { throw "Pinned Luau AST parser output is missing: $ast" }
           & $native --version
           if ($LASTEXITCODE -ne 0) { throw "Native host health check failed" }
 
@@ -114,30 +138,91 @@ jobs:
           if (-not (Test-Path (Join-Path $licenseDir "luau-decompiler-mit.txt"))) {
             throw "Could not stage the bytecode decompiler license notice"
           }
+          Copy-Item (Join-Path $PWD "build/native/_deps/luau-src/LICENSE.txt") (Join-Path $licenseDir "luau-mit.txt")
+
+      - name: Build MoonSec V3 and Lua 5.1 source lifters
+        shell: pwsh
+        run: |
+          $moonsecProject = Join-Path $PWD "third_party/moonsec_v3_gpl/MoonsecDeobfuscator.csproj"
+          dotnet publish $moonsecProject -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o build/moonsec-helper
+          if ($LASTEXITCODE -ne 0) { throw "MoonSec V3 helper build failed" }
+          $moonsec = Join-Path $PWD "build/moonsec-helper/protez-moonsec-v3.exe"
+          if (-not (Test-Path $moonsec)) { throw "MoonSec V3 helper executable is missing: $moonsec" }
+          $moonsecVersion = & $moonsec --version
+          if ($LASTEXITCODE -ne 0 -or "$moonsecVersion" -notmatch "MoonsecDeobfuscator Protez V3") { throw "MoonSec helper health check failed: $moonsecVersion" }
+          $unluacSource = Join-Path $PWD "build/unluac-rs"
+          $unluacCommit = (& git -C $unluacSource rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $unluacCommit -ne "3186d2e392e44a2ddaadd1826a779c98c718be53") { throw "unluac-rs source checkout does not match the recorded commit: $unluacCommit" }
+          cargo build --manifest-path (Join-Path $unluacSource "Cargo.toml") --locked --release -p unluac-cli
+          if ($LASTEXITCODE -ne 0) { throw "unluac-rs CLI build failed" }
+          $unluac = Join-Path $unluacSource "target/release/unluac-cli.exe"
+          if (-not (Test-Path $unluac)) { throw "unluac-rs CLI executable is missing: $unluac" }
+          $toolDir = Join-Path $PWD "build/third-party"
+          New-Item -ItemType Directory -Force -Path $toolDir | Out-Null
+          Copy-Item (Join-Path $PWD "third_party/moonsec_v3_gpl/LICENSE") (Join-Path $toolDir "moonsec-gpl-3.0.txt")
+          Copy-Item (Join-Path $PWD "third_party/unluac-rs-mit.txt") (Join-Path $toolDir "unluac-rs-mit.txt")
+
+      - name: Smoke-test Luraph and MoonSec source recovery
+        shell: pwsh
+        run: |
+          $fixtures = Join-Path $env:RUNNER_TEMP "protez-family-fixtures"
+          New-Item -ItemType Directory -Force -Path $fixtures | Out-Null
+          $luraphFixture = Join-Path $fixtures "luraph-v15.lua"
+          $moonsecFixture = Join-Path $fixtures "moonsec-v3.lua"
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/KryptIT/Deobfuscator/ed79a86cc41187af0480e69f45a4838723fdb099/Deobfuscator/samples/001_vm_like_dispatch-obfuscated.lua" -OutFile $luraphFixture -TimeoutSec 45
+          Invoke-WebRequest -Uri "https://gist.githubusercontent.com/checkurasshole/1bdb0f162d79819f6a4a34d6e9f45bd3/raw/b822d7396aa18e182b581348f93a70a0cdd832fb/v12.lua" -OutFile $moonsecFixture -TimeoutSec 45
+          $luraphHash = (Get-FileHash -Algorithm SHA256 $luraphFixture).Hash.ToLowerInvariant()
+          $moonsecHash = (Get-FileHash -Algorithm SHA256 $moonsecFixture).Hash.ToLowerInvariant()
+          if ($luraphHash -ne "838a5ec65dde4b22399d88b4dc86d6c87dcdb6c1fe18f3c8dc54cd1b366af925") { throw "Pinned Luraph fixture hash mismatch: $luraphHash" }
+          if ($moonsecHash -ne "7d32c4ba8d7274619ead6e6f19857abf3eefa6abd0e3d89fcfc42505d3eafd77") { throw "Pinned MoonSec fixture hash mismatch: $moonsecHash" }
+          $smokeTools = Join-Path $PWD "build/family-smoke-tools"
+          New-Item -ItemType Directory -Force -Path $smokeTools | Out-Null
+          Copy-Item "build/native/host-bin/protez-native-host.exe" $smokeTools
+          Copy-Item "build/native/host-bin/luau-ast.exe" $smokeTools
+          Copy-Item "build/moonsec-helper/protez-moonsec-v3.exe" $smokeTools
+          Copy-Item "build/unluac-rs/target/release/unluac-cli.exe" $smokeTools
+          python scripts/smoke_family_devirtualizers.py --luraph-fixture $luraphFixture --moonsec-fixture $moonsecFixture --tools-dir $smokeTools --work-dir (Join-Path $env:RUNNER_TEMP "protez-family-smoke")
+          if ($LASTEXITCODE -ne 0) { throw "Family-specific source recovery smoke test failed" }
 
       - name: Package the self-contained application
         shell: pwsh
         run: |
           $native = Join-Path $PWD "build/native/host-bin/protez-native-host.exe"
+          $ast = Join-Path $PWD "build/native/host-bin/luau-ast.exe"
           $decompiler = Join-Path $PWD "build/luau-decompiler/target/release/luau-decompiler.exe"
+          $moonsec = Join-Path $PWD "build/moonsec-helper/protez-moonsec-v3.exe"
+          $unluac = Join-Path $PWD "build/unluac-rs/target/release/unluac-cli.exe"
           $decompilerLicense = Join-Path $PWD "build/third-party/luau-decompiler-mit.txt"
-          $sandboxDir = (Resolve-Path "sandbox").Path
+          $luauLicense = Join-Path $PWD "build/third-party/luau-mit.txt"
+          $luraphVendor = Join-Path $PWD "third_party/protez_luraph_v15"
+          $moonsecSource = Join-Path $PWD "third_party/moonsec_v3_gpl"
+          $moonsecLicense = Join-Path $PWD "build/third-party/moonsec-gpl-3.0.txt"
+          $unluacLicense = Join-Path $PWD "build/third-party/unluac-rs-mit.txt"
+          $thirdPartyNotices = Join-Path $PWD "third_party/THIRD_PARTY_NOTICES.md"
           $iconPath = (Resolve-Path "assets/icons/protez.ico").Path
           $appDist = Join-Path $PWD "dist"
           $appWork = Join-Path $PWD "build/pyinstaller-app"
           $appSpec = Join-Path $PWD "build/spec-app"
           $entryPoint = Join-Path $PWD "main.py"
           $arguments = @(
-            "--noconfirm", "--clean", "--onefile", "--windowed", "--uac-admin",
+            "--noconfirm", "--clean", "--onefile", "--windowed",
             "--icon", $iconPath,
             "--name", "Protez",
             "--distpath", $appDist,
             "--workpath", $appWork,
             "--specpath", $appSpec,
-            "--add-data", "$sandboxDir;sandbox",
             "--add-data", "$native;tools",
+            "--add-data", "$ast;tools",
             "--add-data", "$decompiler;tools",
+            "--add-data", "$moonsec;tools",
+            "--add-data", "$unluac;tools",
             "--add-data", "$decompilerLicense;licenses",
+            "--add-data", "$luauLicense;licenses",
+            "--add-data", "$moonsecLicense;licenses",
+            "--add-data", "$unluacLicense;licenses",
+            "--add-data", "$thirdPartyNotices;licenses",
+            "--add-data", "$luraphVendor;third_party/protez_luraph_v15",
+            "--add-data", "$moonsecSource;third_party/moonsec_v3_gpl",
             "--add-data", "$iconPath;assets/icons",
             "--collect-all", "customtkinter",
             "--collect-all", "tkinterdnd2",
@@ -157,13 +242,7 @@ jobs:
             Write-Output "::error title=Protez.exe missing::PyInstaller completed but dist/Protez.exe was not created"
             throw "Protez.exe was not created"
           }
-          $binary = [System.IO.File]::ReadAllBytes((Resolve-Path "dist/Protez.exe"))
-          $manifestAscii = [System.Text.Encoding]::ASCII.GetString($binary)
-          $manifestUnicode = [System.Text.Encoding]::Unicode.GetString($binary)
-          if (-not ($manifestAscii.Contains("requireAdministrator") -or $manifestUnicode.Contains("requireAdministrator"))) {
-            throw "The packaged executable does not contain the required Administrator manifest"
-          }
-          Write-Host "Protez.exe contains the requireAdministrator manifest; it was not launched in CI."
+          Write-Host "Protez.exe is packaged without an elevation manifest; the analysis worker uses AppContainer isolation."
 
       - name: Create self-repair installer
         shell: pwsh

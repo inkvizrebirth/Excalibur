@@ -1,0 +1,123 @@
+diff --git a/src/ast/build/mod.rs b/src/ast/build/mod.rs
+index dbfddac..6b16cd6 100644
+--- a/src/ast/build/mod.rs
++++ b/src/ast/build/mod.rs
+@@ -14,2 +14,2 @@ use crate::hir::{
+-    HirBlock, HirClosureExpr, HirControlFlowFeature, HirExitRequirement, HirGenericFor,
+-    HirGlobalDecl, HirModule, HirStmt, TempId,
++    HirBlock, HirClosureExpr, HirControlFlowFeature, HirExitRequirement, HirExpr, HirGenericFor,
++    HirGlobalDecl, HirLValue, HirModule, HirStmt, HirTableConstructor, LocalId, TempId,
+@@ -25 +25,2 @@ use super::common::{
+-    AstReturn, AstRewriteAuthority, AstStmt, AstTargetDialect, AstWhile,
++    AstReturn, AstRewriteAuthority, AstStmt, AstTableConstructor, AstTableField, AstTargetDialect,
++    AstWhile,
+@@ -273,0 +275,7 @@ impl<'a> AstLowerer<'a> {
++            if let Some((new_stmts, consumed)) =
++                self.try_lower_empty_table_set_list(proto_index, block, index)?
++            {
++                stmts.extend(new_stmts);
++                index += consumed;
++                continue;
++            }
+@@ -289,0 +298,101 @@ impl<'a> AstLowerer<'a> {
++    /// Recover an open SETLIST into a table constructor only when the target is a
++    /// fresh, empty local table and every intervening statement is a pure scalar
++    /// local declaration. Replacing that unobserved table preserves observable
++    /// values while retaining Lua's multiple-return expansion for the final field.
++    fn try_lower_empty_table_set_list(
++        &mut self,
++        proto_index: usize,
++        block: &HirBlock,
++        index: usize,
++    ) -> Result<Option<(Vec<AstStmt>, usize)>, AstLowerError> {
++        let Some(HirStmt::TableSetList(batch)) = block.stmts.get(index) else {
++            return Ok(None);
++        };
++        let HirExpr::LocalRef(base) = &batch.base else {
++            return Ok(None);
++        };
++        let base = *base;
++        if batch.start_index != 1
++            || batch
++                .values
++                .tail
++                .as_ref()
++                .is_some_and(|tail| tail.exact_width().is_some())
++        {
++            return Ok(None);
++        }
++
++        let mut allocation_index = None;
++        for candidate in (0..index).rev() {
++            match &block.stmts[candidate] {
++                stmt if Self::empty_local_table_allocation(stmt, base).is_some() => {
++                    allocation_index = Some(candidate);
++                    break;
++                }
++                HirStmt::LocalDecl(decl) if Self::is_pure_table_setlist_prelude(decl, base) => {}
++                _ => return Ok(None),
++            }
++        }
++        let Some(allocation_index) = allocation_index else {
++            return Ok(None);
++        };
++
++        let Some(original_table) =
++            Self::empty_local_table_allocation(&block.stmts[allocation_index], base)
++        else {
++            unreachable!("the matched table allocation has one table-constructor initializer");
++        };
++        let values =
++            self.lower_value_pack(proto_index, &batch.values, PackLoweringContext::Ordinary)?;
++        let constructor = AstExpr::TableConstructor(Box::new(AstTableConstructor {
++            fields: values.into_iter().map(AstTableField::Array).collect(),
++            allocation: original_table.allocation.clone(),
++        }));
++        let replacement = AstStmt::Assign(Box::new(AstAssign {
++            targets: vec![AstLValue::Name(AstNameRef::Local(base))],
++            values: vec![constructor],
++            initializer_merge_transaction: None,
++            luau_compound_global: false,
++            method_rewrite_transaction: None,
++        }));
++        Ok(Some((vec![replacement], 1)))
++    }
++
++    fn is_pure_table_setlist_prelude(decl: &crate::hir::HirLocalDecl, base: LocalId) -> bool {
++        if decl.bindings.len() != 1 || decl.values.tail.is_some() || decl.values.fixed.len() != 1 {
++            return false;
++        }
++        match &decl.values.fixed[0] {
++            HirExpr::Nil
++            | HirExpr::Boolean(_)
++            | HirExpr::Integer(_)
++            | HirExpr::Number(_)
++            | HirExpr::String(_)
++            | HirExpr::ParamRef(_)
++            | HirExpr::TempRef(_)
++            | HirExpr::UpvalueRef(_) => true,
++            HirExpr::LocalRef(local) => *local != base,
++            _ => false,
++        }
++    }
++
++    fn empty_local_table_allocation(stmt: &HirStmt, base: LocalId) -> Option<&HirTableConstructor> {
++        let constructor = match stmt {
++            HirStmt::LocalDecl(decl) if decl.bindings.as_slice() == [base] => {
++                match (decl.values.fixed.as_slice(), &decl.values.tail) {
++                    ([HirExpr::TableConstructor(table)], None) => table.as_ref(),
++                    _ => return None,
++                }
++            }
++            HirStmt::Assign(assign) if matches!(assign.targets.as_slice(), [HirLValue::Local(local)] if *local == base) => {
++                match (assign.values.fixed.as_slice(), &assign.values.tail) {
++                    ([HirExpr::TableConstructor(table)], None) => table.as_ref(),
++                    _ => return None,
++                }
++            }
++            _ => return None,
++        };
++        (constructor.fields.is_empty() && constructor.trailing_multivalue.is_none())
++            .then_some(constructor)
++    }
++

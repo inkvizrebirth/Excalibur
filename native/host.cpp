@@ -4,6 +4,7 @@
 #include "lbytecode.h"
 #include "lstate.h"
 #include "Luau/BytecodeDump.h"
+#include "appcontainer_launcher.h"
 
 #include <algorithm>
 #include <chrono>
@@ -17,15 +18,23 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <locale>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 namespace
 {
 constexpr size_t kMaxSourceBytes = 64 * 1024 * 1024;
 constexpr size_t kMaxVmBytes = 256 * 1024 * 1024;
+constexpr size_t kMaxDynamicChunkBytes = 16 * 1024 * 1024;
 constexpr size_t kMaxTraceStringBytes = 128;
 constexpr size_t kMaxLocalsPerSnapshot = 16;
 constexpr uint64_t kLocalSnapshotStride = 64;
@@ -60,10 +69,15 @@ void* boundedAllocator(void* userdata, void* pointer, size_t oldSize, size_t new
 struct TraceContext
 {
     std::string prefix;
+    std::string capturePrefix;
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
     uint64_t sequence = 0;
     uint64_t stepCount = 0;
+    uint64_t captureCount = 0;
+    uint64_t capturedBytes = 0;
     uint64_t maxSteps = 25000;
+    uint64_t maxCaptures = 100;
+    uint64_t maxCaptureBytes = 16 * 1024 * 1024;
     bool active = false;
     bool hookReady = false;
     bool traceStopped = false;
@@ -92,6 +106,123 @@ std::string base64(std::string_view input)
         output.push_back(i + 2 < input.size() ? alphabet[packed & 0x3f] : '=');
     }
     return output;
+}
+
+void emitCapture(TraceContext& context, std::string_view source, std::string_view kind)
+{
+    if (context.capturePrefix.empty())
+        return;
+    if (context.captureCount >= context.maxCaptures ||
+        source.size() > kMaxDynamicChunkBytes ||
+        source.size() > context.maxCaptureBytes - std::min(context.maxCaptureBytes, context.capturedBytes))
+    {
+        std::fprintf(stdout, "[PROTEZ:WARN] Dynamic source capture limit reached; further chunks were not captured\n");
+        return;
+    }
+
+    ++context.captureCount;
+    context.capturedBytes += source.size();
+    const uint64_t index = context.captureCount;
+    std::fprintf(stdout, "%sB|%llu|%.*s\n", context.capturePrefix.c_str(),
+                 static_cast<unsigned long long>(index), static_cast<int>(kind.size()), kind.data());
+    const std::string encoded = base64(source);
+    constexpr size_t chunkSize = 4096;
+    for (size_t offset = 0; offset < encoded.size(); offset += chunkSize)
+    {
+        const size_t count = std::min(chunkSize, encoded.size() - offset);
+        std::fprintf(stdout, "%sC|%llu|%.*s\n", context.capturePrefix.c_str(),
+                     static_cast<unsigned long long>(index), static_cast<int>(count),
+                     encoded.data() + offset);
+    }
+    std::fprintf(stdout, "%sE|%llu|%llu\n", context.capturePrefix.c_str(),
+                 static_cast<unsigned long long>(index),
+                 static_cast<unsigned long long>(source.size()));
+}
+
+int dynamicLoadString(lua_State* state, const char* kind)
+{
+    auto* context = static_cast<TraceContext*>(lua_callbacks(state)->userdata);
+    size_t sourceSize = 0;
+    const char* source = lua_tolstring(state, 1, &sourceSize);
+    if (!source)
+    {
+        lua_settop(state, 0);
+        lua_pushnil(state);
+        lua_pushstring(state, "dynamic source must be a string");
+        return 2;
+    }
+    if (sourceSize > kMaxDynamicChunkBytes)
+    {
+        lua_settop(state, 0);
+        lua_pushnil(state);
+        lua_pushstring(state, "dynamic source exceeds the 16 MiB limit");
+        return 2;
+    }
+    if (context)
+        emitCapture(*context, std::string_view(source, sourceSize), kind);
+
+    char chunkName[64] = {};
+    std::snprintf(chunkName, sizeof(chunkName), "=Protez.%s.%llu", kind,
+                  static_cast<unsigned long long>(context ? context->captureCount : 0));
+
+    lua_CompileOptions options{};
+    options.optimizationLevel = 0;
+    options.debugLevel = 2;
+    options.typeInfoLevel = 0;
+    options.coverageLevel = 0;
+
+    size_t bytecodeSize = 0;
+    char* bytecode = nullptr;
+    try
+    {
+        bytecode = luau_compile(source, sourceSize, &options, &bytecodeSize);
+    }
+    catch (const std::exception& exception)
+    {
+        lua_settop(state, 0);
+        lua_pushnil(state);
+        lua_pushstring(state, exception.what());
+        return 2;
+    }
+    catch (...)
+    {
+        lua_settop(state, 0);
+        lua_pushnil(state);
+        lua_pushstring(state, "Luau compiler failed while compiling dynamic source");
+        return 2;
+    }
+
+    if (!bytecode || bytecodeSize == 0)
+    {
+        std::free(bytecode);
+        lua_settop(state, 0);
+        lua_pushnil(state);
+        lua_pushstring(state, "Luau compiler returned no dynamic bytecode");
+        return 2;
+    }
+
+    const int loadStatus = luau_load(state, chunkName, bytecode, bytecodeSize, 0);
+    std::free(bytecode);
+    if (loadStatus != 0)
+    {
+        const char* message = lua_tostring(state, -1);
+        const std::string error = message ? message : "Luau rejected dynamic bytecode";
+        lua_settop(state, 0);
+        lua_pushnil(state);
+        lua_pushlstring(state, error.data(), error.size());
+        return 2;
+    }
+    return 1;
+}
+
+int protectedLoadString(lua_State* state)
+{
+    return dynamicLoadString(state, "loadstring");
+}
+
+int protectedLoad(lua_State* state)
+{
+    return dynamicLoadString(state, "load");
 }
 
 std::string jsonQuote(std::string_view input)
@@ -426,30 +557,28 @@ void debugStep(lua_State* state, lua_Debug* info)
     }
 }
 
-int beginTrace(lua_State* state)
+void startTrace(lua_State* state, TraceContext& context)
 {
-    auto* context = static_cast<TraceContext*>(lua_callbacks(state)->userdata);
-    if (!context || context->prefix.empty() || context->hookReady)
-        return 0;
+    if (context.prefix.empty() || context.hookReady)
+        return;
 
-    context->hookReady = true;
-    context->active = true;
-    context->started = std::chrono::steady_clock::now();
+    context.hookReady = true;
+    context.active = true;
+    context.started = std::chrono::steady_clock::now();
     lua_singlestep(state, 1);
     emitTrace(
-        *context,
+        context,
         "HOOK_READY",
         "lua_singlestep",
         "",
         0,
         "{\"mode\":\"instruction-step\",\"pc_available\":true,\"opcode_available\":true,\"registers_available\":false}");
-    if (context->traceStopped || context->outputFailed)
+    if (context.traceStopped || context.outputFailed)
     {
-        context->active = false;
+        context.active = false;
         lua_singlestep(state, 0);
         lua_callbacks(state)->debugstep = nullptr;
     }
-    return 0;
 }
 
 bool readSourceFile(const std::string& path, std::string& source, std::string& error)
@@ -478,6 +607,32 @@ bool readSourceFile(const std::string& path, std::string& source, std::string& e
     return true;
 }
 
+bool readSourceStdin(std::string& source, std::string& error)
+{
+    source.clear();
+    char buffer[64 * 1024];
+    while (std::cin)
+    {
+        std::cin.read(buffer, sizeof(buffer));
+        const std::streamsize count = std::cin.gcount();
+        if (count > 0)
+        {
+            if (source.size() + static_cast<size_t>(count) > kMaxSourceBytes)
+            {
+                error = "source exceeds the 64 MiB host limit";
+                return false;
+            }
+            source.append(buffer, static_cast<size_t>(count));
+        }
+    }
+    if (std::cin.bad())
+    {
+        error = "could not read source from standard input";
+        return false;
+    }
+    return true;
+}
+
 void setGlobalNil(lua_State* state, const char* name)
 {
     lua_pushnil(state);
@@ -492,6 +647,11 @@ bool isTraceToken(const std::string& token)
         return (character >= '0' && character <= '9') ||
                (character >= 'a' && character <= 'f');
     });
+}
+
+bool isCaptureToken(const std::string& token)
+{
+    return isTraceToken(token);
 }
 
 bool parsePositiveInteger(const char* text, uint64_t& value)
@@ -510,31 +670,46 @@ void printUsage(const char* executable)
 {
     std::fprintf(
         stderr,
-        "Usage: %s --source <runner.luau> [--compile-only] [--trace-token <32-hex>] [--max-trace-events <count>]\n",
+        "Usage: %s (--source <file> | --source-stdin) [--compile-only] [--capture-token <32-hex>] [--max-captures <1..100>] [--max-capture-bytes <1..16777216>] [--trace-token <32-hex>] [--max-trace-events <count>]\n",
         executable);
 }
 } // namespace
 
 int main(int argc, char** argv)
 {
+#ifdef _WIN32
+    if (argc > 1 && std::string(argv[1]) == "--appcontainer")
+    {
+        _setmode(_fileno(stdin), _O_BINARY);
+        _setmode(_fileno(stdout), _O_BINARY);
+        return runInAppContainer(argc, argv);
+    }
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
     std::setlocale(LC_ALL, "C");
     std::setbuf(stdout, nullptr);
 
     std::string sourcePath;
     std::string traceToken;
+    std::string captureToken;
     bool compileOnly = false;
+    bool sourceFromStdin = false;
     uint64_t maxTraceEvents = 25000;
+    uint64_t maxCaptures = 100;
+    uint64_t maxCaptureBytes = 16 * 1024 * 1024;
 
     for (int index = 1; index < argc; ++index)
     {
         const std::string argument = argv[index];
         if (argument == "--version")
         {
-            std::puts("Protez native Luau host 0.2 (Luau 0.740)");
+            std::puts("Protez native Luau host 0.3 (Luau 0.740)");
             return 0;
         }
         if ((argument == "--source" || argument == "--trace-token" ||
-             argument == "--max-trace-events") && index + 1 >= argc)
+             argument == "--capture-token" || argument == "--max-trace-events" ||
+             argument == "--max-captures" || argument == "--max-capture-bytes") && index + 1 >= argc)
         {
             printUsage(argv[0]);
             return 64;
@@ -546,6 +721,14 @@ int main(int argc, char** argv)
         else if (argument == "--source")
         {
             sourcePath = argv[++index];
+        }
+        else if (argument == "--source-stdin")
+        {
+            sourceFromStdin = true;
+        }
+        else if (argument == "--capture-token")
+        {
+            captureToken = argv[++index];
         }
         else if (argument == "--trace-token")
         {
@@ -559,6 +742,23 @@ int main(int argc, char** argv)
                 return 64;
             }
         }
+        else if (argument == "--max-captures")
+        {
+            if (!parsePositiveInteger(argv[++index], maxCaptures) || maxCaptures > 100)
+            {
+                std::fprintf(stderr, "Invalid --max-captures value (expected 1..100)\n");
+                return 64;
+            }
+        }
+        else if (argument == "--max-capture-bytes")
+        {
+            if (!parsePositiveInteger(argv[++index], maxCaptureBytes) ||
+                maxCaptureBytes > 16 * 1024 * 1024)
+            {
+                std::fprintf(stderr, "Invalid --max-capture-bytes value (expected 1..16777216)\n");
+                return 64;
+            }
+        }
         else
         {
             std::fprintf(stderr, "Unknown option: %s\n", argument.c_str());
@@ -567,7 +767,7 @@ int main(int argc, char** argv)
         }
     }
 
-    if (sourcePath.empty())
+    if (sourceFromStdin == !sourcePath.empty())
     {
         printUsage(argv[0]);
         return 64;
@@ -577,10 +777,17 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "Invalid trace token\n");
         return 64;
     }
+    if (!captureToken.empty() && !isCaptureToken(captureToken))
+    {
+        std::fprintf(stderr, "Invalid capture token\n");
+        return 64;
+    }
 
     std::string source;
     std::string readError;
-    if (!readSourceFile(sourcePath, source, readError))
+    const bool sourceRead = sourceFromStdin ? readSourceStdin(source, readError)
+                                            : readSourceFile(sourcePath, source, readError);
+    if (!sourceRead)
     {
         std::fprintf(stderr, "Protez host error: %s\n", readError.c_str());
         return 66;
@@ -595,22 +802,29 @@ int main(int argc, char** argv)
     }
 
     luaL_openlibs(state);
-    // The mock environment is installed at the start of the runner. Keep host-level
-    // filesystem, process, package and debug facilities unavailable even if setup fails.
-    for (const char* name : {"io", "os", "package", "dofile", "loadfile"})
+    // Roblox services are intentionally absent: no fabricated API values are supplied.
+    // Host filesystem, process and module-loading functions stay unavailable.
+    for (const char* name : {"io", "os", "package", "dofile", "loadfile", "require"})
         setGlobalNil(state, name);
 
     TraceContext trace;
     trace.maxSteps = maxTraceEvents;
+    trace.maxCaptures = maxCaptures;
+    trace.maxCaptureBytes = maxCaptureBytes;
+    if (!captureToken.empty())
+        trace.capturePrefix = "__PROTEZ_CAPTURE_" + captureToken + "|";
+    lua_callbacks(state)->userdata = &trace;
+    lua_pushcfunction(state, protectedLoadString, "loadstring");
+    lua_setglobal(state, "loadstring");
+    lua_pushcfunction(state, protectedLoad, "load");
+    lua_setglobal(state, "load");
+
     if (!traceToken.empty())
     {
         trace.prefix = "__PROTEZ_TRACE_" + traceToken + "|";
         lua_Callbacks* callbacks = lua_callbacks(state);
-        callbacks->userdata = &trace;
         callbacks->debugstep = debugStep;
         callbacks->userthread = onUserThread;
-        lua_pushcfunction(state, beginTrace, "__PROTEZ_NATIVE_TRACE_BEGIN");
-        lua_setglobal(state, "__PROTEZ_NATIVE_TRACE_BEGIN");
     }
 
     lua_CompileOptions options{};
@@ -646,7 +860,7 @@ int main(int argc, char** argv)
         return 70;
     }
 
-    const std::string chunkName = "@" + std::string(sourcePath);
+    const std::string chunkName = sourceFromStdin ? "=Protez.input" : "@" + std::string(sourcePath);
     const int loadStatus = luau_load(state, chunkName.c_str(), bytecode, bytecodeSize, 0);
     std::free(bytecode);
     if (loadStatus != 0)
@@ -661,6 +875,9 @@ int main(int argc, char** argv)
         lua_close(state);
         return 0;
     }
+
+    if (!traceToken.empty())
+        startTrace(state, trace);
 
     const int status = lua_pcall(state, 0, 0, 0);
     if (status != LUA_OK)

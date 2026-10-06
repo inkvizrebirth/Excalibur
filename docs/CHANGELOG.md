@@ -2,8 +2,13 @@
 
 ## Unreleased
 
-- Added bounded, local-only static extraction for recognized Luraph LPH container layouts: Ascii85 framing with single/two-stream Zstandard or legacy two-stream raw LZMA1/range streams. Protez saves intermediate VM-interpreter/custom-bytecode artifacts and records sizes, hashes, and safety flags. This does not devirtualize the custom VM or reconstruct original Luau; unsupported variants remain explicitly partial. The wrapper, interpreter, and payload are never executed.
-- Added the `zstandard` runtime dependency to the self-contained Windows package and deterministic tests for stream decoding, limits, report output, and the no-execution path.
+- Added family-specific readable-source recovery for supported Luraph v15 and MoonSec V3 VM layouts. Luraph v15 uses the pinned MIT lifter in Protez's isolated Luau runtime; MoonSec V3 statically maps supported handlers to Lua 5.1 bytecode and decompiles it with pinned `unluac-rs`. The pipeline validates recovered source as Luau, writes real bytecode/disassembly artifacts on partial runs, and reports that semantic equivalence is not established. This is version/family-aware coverage, not a universal VM deobfuscator.
+- Bundled separate MoonSec and Lua bytecode helper executables and their licenses/source in the Windows build; source installations can build/download these tools when available. Bumped the application version to 0.6.0.
+- Replaced the no-op dynamic loader capture with real bounded Luau compilation. `loadstring`/`load` return executable functions in the same Luau state; wrapper-invoked chunks are traced when they run. Roblox Engine APIs are not faked.
+- Added Windows AppContainer/Job Object and Linux bubblewrap/prlimit isolation for dynamic source runs, with fail-closed behavior when the native worker or isolation tools are unavailable. Windows application no longer requests Administrator elevation.
+- Pipeline runs collect Luau VM instruction traces alongside payload capture, trace nested loader candidates, and report trace paths, isolation backend, execution outcome, and captured chunk metadata. Unsupported protected variants receive explicit partial reports.
+- Added bounded, local-only static extraction for recognized Luraph LPH LZ/Zstandard containers. The extracted custom bytecode is only lifted when it matches the supported Luraph v15 VM family; unsupported layouts/versions remain partial.
+- Added the `zstandard` runtime dependency to the self-contained Windows package and deterministic tests for static stream decoding, size limits, and report output.
 
 ## 2026-10-05 — 0.4.0
 

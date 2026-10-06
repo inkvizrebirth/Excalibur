@@ -10,6 +10,7 @@ _LURAPH_VERSION = re.compile(
     r"\bLuraph(?:\s+Obfuscator)?\s+(?:v|version\s*)?([0-9]+(?:\.[0-9]+)*)\b",
     re.IGNORECASE,
 )
+_MOONSEC_V3_MARKER = re.compile(r"\bMoonSec\s*V?\s*3\b|\bMoonSecV3\b", re.IGNORECASE)
 _LONG_BRACKET_OPEN = re.compile(r"\[(=*)\[")
 _MAX_VISIBLE_LITERAL_BYTES = 256
 _MAX_VISIBLE_LITERALS = 80
@@ -67,7 +68,16 @@ def inspect_protection(source: str) -> ProtectionProfile | None:
         None,
     )
     container_info = inspect_luraph_container(source, tokens=tokens)
-    if version_match is None and not container_info.detected:
+    moonsec_marker = next(
+        (
+            token
+            for token in tokens
+            if token.kind in {"comment", "string"}
+            and _MOONSEC_V3_MARKER.search(token.text) is not None
+        ),
+        None,
+    )
+    if version_match is None and not container_info.detected and moonsec_marker is None:
         return None
 
     payload_chars = 0
@@ -97,8 +107,16 @@ def inspect_protection(source: str) -> ProtectionProfile | None:
             literals.append(value)
 
     return ProtectionProfile(
-        family="Luraph Obfuscator",
-        version=version_match.group(1) if version_match is not None else None,
+        family=(
+            "Luraph Obfuscator"
+            if version_match is not None or container_info.detected
+            else "MoonSec"
+        ),
+        version=(
+            version_match.group(1)
+            if version_match is not None
+            else "3" if moonsec_marker is not None else None
+        ),
         embedded_payload_chars=payload_chars,
         visible_literals=tuple(literals),
         container_layout=container_info.layout,

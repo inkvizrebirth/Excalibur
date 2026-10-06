@@ -24,8 +24,6 @@ from typing import Any, BinaryIO
 
 from core.runtime_paths import (
     DATA_ROOT,
-    ENVLOG_PATH,
-    HOOKS_PATH,
     IS_FROZEN,
     LICENSES_DIR,
     LOGS_DIR,
@@ -39,7 +37,7 @@ from core.version import VERSION
 ROOT = RESOURCE_ROOT
 REQUIREMENTS_FILE = ROOT / "requirements.txt"
 MARKER_FILE = DATA_ROOT / ".installed"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 MIN_PYTHON = (3, 10)
 NATIVE_HOST_LUAU_TAG = "0.740"
 MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024
@@ -58,6 +56,8 @@ TOOL_NAMES = {
     "luau-compile.exe",
     "luau-analyze",
     "luau-analyze.exe",
+    "luau-ast",
+    "luau-ast.exe",
 }
 
 ALLOWED_DOWNLOAD_HOSTS = {
@@ -130,9 +130,53 @@ def _native_host_binary_path() -> Path:
     return TOOLS_DIR / f"protez-native-host{suffix}"
 
 
+def _luau_ast_binary_path() -> Path:
+    suffix = ".exe" if platform.system().lower() == "windows" else ""
+    return TOOLS_DIR / f"luau-ast{suffix}"
+
+
+def _moonsec_helper_path() -> Path:
+    suffix = ".exe" if platform.system().lower() == "windows" else ""
+    return TOOLS_DIR / f"protez-moonsec-v3{suffix}"
+
+
+def _unluac_cli_path() -> Path:
+    suffix = ".exe" if platform.system().lower() == "windows" else ""
+    return TOOLS_DIR / f"unluac-cli{suffix}"
+
+
+def _native_host_supports_isolation(path: Path | None = None) -> bool:
+    binary = path or _native_host_binary_path()
+    if not binary.is_file():
+        return False
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        result = subprocess.run(
+            [str(binary), "--version"],
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+            creationflags=creationflags,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and "protez native luau host 0.3" in (result.stdout or "").lower()
+
+
 def _native_host_source_digest() -> str:
     digest = hashlib.sha256(f"Luau:{NATIVE_HOST_LUAU_TAG}\n".encode("utf-8"))
-    for relative_path in ("native/CMakeLists.txt", "native/host.cpp"):
+    for relative_path in (
+        "native/CMakeLists.txt",
+        "native/host.cpp",
+        "native/appcontainer_launcher.cpp",
+        "native/appcontainer_launcher.h",
+    ):
         path = ROOT / relative_path
         try:
             content = path.read_bytes()
@@ -169,7 +213,7 @@ def _marker_is_current() -> bool:
         for name in ("luau", "luau-compile")
     )
     runtime_available = (
-        _native_host_binary_path().is_file()
+        _native_host_supports_isolation()
         if native_host_available
         else cli_runtime_available
     )
@@ -180,6 +224,9 @@ def _marker_is_current() -> bool:
         and marker.get("native_host_source_sha256") == _native_host_source_digest()
         and isinstance(marker.get("native_host_available"), bool)
         and runtime_available
+        and marker.get("luraph_ast_available") is _luau_ast_binary_path().is_file()
+        and marker.get("moonsec_helper_available") is _moonsec_helper_path().is_file()
+        and marker.get("unluac_available") is _unluac_cli_path().is_file()
         and marker.get("dependencies_installed") is True
         and _dependencies_available()
     )
@@ -490,7 +537,12 @@ def _extract_tar(archive_path: Path, tools_dir: Path) -> list[str]:
 
 def _expected_tool_names() -> set[str]:
     suffix = ".exe" if platform.system().lower() == "windows" else ""
-    return {f"luau{suffix}", f"luau-compile{suffix}", f"luau-analyze{suffix}"}
+    return {
+        f"luau{suffix}",
+        f"luau-compile{suffix}",
+        f"luau-analyze{suffix}",
+        f"luau-ast{suffix}",
+    }
 
 
 def download_luau_tools() -> tuple[list[str], list[str]]:
@@ -548,14 +600,16 @@ def download_luau_tools() -> tuple[list[str], list[str]]:
 def build_native_host() -> bool:
     tools_dir = TOOLS_DIR
     destination = _native_host_binary_path()
+    ast_destination = _luau_ast_binary_path()
     cmake = shutil.which("cmake")
     if cmake is None:
-        if destination.is_file():
-            LOGGER.warning("CMake is unavailable; keeping the existing native host")
+        if _native_host_supports_isolation(destination):
+            LOGGER.warning("CMake is unavailable; keeping the compatible native host")
             return True
         LOGGER.warning(
-            "CMake was not found; using the official Luau CLI fallback. "
-            "Install CMake and a C++17 compiler, then rerun installer.py --force to enable VM tracing."
+            "CMake was not found; Luau CLI tools can still perform compile-only checks, "
+            "but dynamic execution is disabled without the native worker. Install CMake and a C++17 compiler, "
+            "then rerun installer.py --force to enable isolated execution and VM tracing."
         )
         return False
 
@@ -591,23 +645,24 @@ def build_native_host() -> bool:
             )
         except InstallationError as exc:
             LOGGER.warning("Native host %s did not complete: %s", label, exc)
-            return destination.is_file()
+            return _native_host_supports_isolation(destination)
         if return_code != 0:
             LOGGER.warning(
-                "Native host %s failed (exit code %s); retaining CLI fallback%s",
+                "Native host %s failed (exit code %s); retaining compile-only CLI support%s",
                 label,
                 return_code,
                 f":\n{output}" if output else "",
             )
-            return destination.is_file()
+            return _native_host_supports_isolation(destination)
 
     built_binary = build_dir / "host-bin" / destination.name
+    built_ast = build_dir / "host-bin" / ast_destination.name
     if not built_binary.is_file():
         LOGGER.warning(
-            "Native host build completed without producing %s; retaining CLI fallback",
+            "Native host build completed without producing %s; retaining compile-only CLI support",
             built_binary,
         )
-        return destination.is_file()
+        return _native_host_supports_isolation(destination)
 
     temporary_binary = destination.with_name(destination.name + ".tmp")
     try:
@@ -618,8 +673,24 @@ def build_native_host() -> bool:
     except OSError as exc:
         temporary_binary.unlink(missing_ok=True)
         LOGGER.warning("Could not install native host: %s", exc)
-        return destination.is_file()
+        return _native_host_supports_isolation(destination)
 
+    if built_ast.is_file():
+        temporary_ast = ast_destination.with_name(ast_destination.name + ".tmp")
+        try:
+            shutil.copy2(built_ast, temporary_ast)
+            if platform.system().lower() != "windows":
+                temporary_ast.chmod(0o755)
+            os.replace(temporary_ast, ast_destination)
+        except OSError as exc:
+            temporary_ast.unlink(missing_ok=True)
+            LOGGER.warning("Could not install the pinned Luau AST parser: %s", exc)
+    else:
+        LOGGER.warning("CMake completed without producing the pinned Luau AST parser")
+
+    if not _native_host_supports_isolation(destination):
+        LOGGER.warning("Installed native host does not provide the isolated worker interface")
+        return False
     LOGGER.info("Instrumented Luau native host ready: %s", destination.name)
     return True
 
@@ -638,6 +709,9 @@ def _write_marker(
         "luau_tools_available": available_tools,
         "luau_tools_missing": missing_tools,
         "native_host_available": native_host_available,
+        "luraph_ast_available": _luau_ast_binary_path().is_file(),
+        "moonsec_helper_available": _moonsec_helper_path().is_file(),
+        "unluac_available": _unluac_cli_path().is_file(),
         "native_host_luau_tag": NATIVE_HOST_LUAU_TAG,
         "native_host_source_sha256": _native_host_source_digest(),
     }
@@ -714,10 +788,6 @@ def verify_frozen_runtime() -> None:
     if not IS_FROZEN:
         return
     ensure_directories()
-    for required in (ENVLOG_PATH, HOOKS_PATH):
-        if not required.is_file():
-            raise InstallationError(f"Bundled runtime resource is missing: {required.name}")
-
     host_name = _native_host_binary_path().name
     host_path = _native_host_binary_path()
     _repair_packaged_binary(
@@ -734,13 +804,99 @@ def verify_frozen_runtime() -> None:
         label="offline Luau bytecode decompiler",
         required=True,
     )
+    ast_name = "luau-ast.exe" if os.name == "nt" else "luau-ast"
+    _repair_packaged_binary(
+        PACKAGED_TOOLS_DIR / ast_name,
+        _luau_ast_binary_path(),
+        label="pinned Luau AST parser",
+        required=True,
+    )
+    moonsec_name = _moonsec_helper_path().name
+    unluac_name = _unluac_cli_path().name
+    _repair_packaged_binary(
+        PACKAGED_TOOLS_DIR / moonsec_name,
+        _moonsec_helper_path(),
+        label="MoonSec V3 VM devirtualizer",
+        required=True,
+    )
+    _repair_packaged_binary(
+        PACKAGED_TOOLS_DIR / unluac_name,
+        _unluac_cli_path(),
+        label="Lua 5.1 bytecode decompiler",
+        required=True,
+    )
     license_file = LICENSES_DIR / "luau-decompiler-mit.txt"
     if not license_file.is_file():
         raise InstallationError("The bundled bytecode decompiler license notice is missing")
+    if not (LICENSES_DIR / "luau-mit.txt").is_file():
+        raise InstallationError("The pinned Luau license notice is missing")
+    for license_name in ("moonsec-gpl-3.0.txt", "unluac-rs-mit.txt"):
+        if not (LICENSES_DIR / license_name).is_file():
+            raise InstallationError(f"The bundled {license_name} license notice is missing")
+    moonsec_source = RESOURCE_ROOT / "third_party" / "moonsec_v3_gpl"
+    if not (moonsec_source / "LICENSE").is_file() or not (moonsec_source / "PROTEZ_NOTES.md").is_file():
+        raise InstallationError("The separate MoonSec helper's corresponding source and license are missing")
 
-    _run_version_check(host_path, expected="Protez native Luau host", label="Luau runtime")
+    _run_version_check(host_path, expected="Protez native Luau host 0.3", label="Luau runtime")
     _run_version_check(decompiler_path, expected="luau-decompiler", label="bytecode decompiler")
-    LOGGER.info("The executable includes its offline bytecode decompiler; no Rust install is required")
+    _run_version_check(_moonsec_helper_path(), expected="moonsecdeobfuscator protez v3", label="MoonSec V3 devirtualizer")
+    LOGGER.info("The executable includes its offline bytecode decompilers; no Rust or .NET install is required")
+
+
+def install_moonsec_tools() -> None:
+    """Install the separate static MoonSec helper and pinned unluac-rs executable when available."""
+    tools_dir = TOOLS_DIR
+    tools_dir.mkdir(parents=True, exist_ok=True)
+    helper = _moonsec_helper_path()
+    if not helper.is_file():
+        dotnet = shutil.which("dotnet")
+        project = ROOT / "third_party" / "moonsec_v3_gpl" / "MoonsecDeobfuscator.csproj"
+        if dotnet and project.is_file():
+            command = [dotnet, "publish", str(project), "-c", "Release", "-r", "win-x64" if os.name == "nt" else "linux-x64", "--self-contained", "true", "-p:PublishSingleFile=true", "-o", str(tools_dir / "moonsec-publish")]
+            try:
+                code, output = _run_logged(command, label="MoonSec V3 helper publish", cwd=ROOT, timeout_seconds=1200)
+                built = tools_dir / "moonsec-publish" / helper.name
+                if code == 0 and built.is_file():
+                    shutil.copy2(built, helper)
+                    version = subprocess.run(
+                        [str(helper), "--version"], cwd=ROOT, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                        encoding="utf-8", errors="replace", timeout=10, check=False,
+                    )
+                    if version.returncode == 0 and "moonsecdeobfuscator protez v3" in version.stdout.lower():
+                        LOGGER.info("MoonSec V3 static helper installed: %s", helper.name)
+                    else:
+                        helper.unlink(missing_ok=True)
+                        LOGGER.warning("MoonSec V3 helper failed its health check: %s", version.stdout.strip())
+                else:
+                    LOGGER.warning("MoonSec V3 helper build did not produce %s%s", helper.name, f":\n{output}" if output else "")
+            except InstallationError as exc:
+                LOGGER.warning("MoonSec V3 helper could not be built: %s", exc)
+        else:
+            LOGGER.warning("MoonSec V3 analysis is unavailable: install .NET 9 SDK and rerun Repair")
+
+    if _unluac_cli_path().is_file():
+        return
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    assets = {
+        ("windows", "x86_64"): ("https://github.com/x3zvawq/unluac-rs/releases/download/v1.4.4/unluac-1.4.4-windows-x86_64.exe", "879c6b5f4bdb23bd82ba0579c1c844e7afb28f3b641a036ff10c734d6a92e050"),
+        ("linux", "x86_64"): ("https://github.com/x3zvawq/unluac-rs/releases/download/v1.4.4/unluac-1.4.4-linux-x86_64", "45dd5ef946fbd18a2e284267e32c2b14caeabe7dfc76d688f704244c5c3d4baf"),
+        ("darwin", "aarch64"): ("https://github.com/x3zvawq/unluac-rs/releases/download/v1.4.4/unluac-1.4.4-macos-aarch64", "41889a4f29925c0365881376eddfc69880670411713177f9d9879f42a49407c2"),
+        ("darwin", "x86_64"): ("https://github.com/x3zvawq/unluac-rs/releases/download/v1.4.4/unluac-1.4.4-macos-x86_64", "076f0431fa42de95a4807622f5b66c521f854b9704d4992673b39ddeac3296a9"),
+    }
+    arch = "aarch64" if machine in {"aarch64", "arm64"} else "x86_64" if machine in {"x86_64", "amd64", "x64"} else machine
+    asset = assets.get((system, arch))
+    if asset is None:
+        LOGGER.warning("No pinned unluac-rs release asset is configured for %s %s", system, arch)
+        return
+    try:
+        _download_file(asset[0], _unluac_cli_path(), sha256=asset[1], max_bytes=MAX_DOWNLOAD_BYTES)
+        if os.name != "nt":
+            _unluac_cli_path().chmod(0o755)
+        LOGGER.info("Pinned unluac-rs 1.4.4 CLI installed")
+    except (InstallationError, OSError) as exc:
+        LOGGER.warning("MoonSec bytecode source lifting is unavailable: %s", exc)
 
 
 def ensure_installed(*, force: bool = False) -> None:
@@ -759,6 +915,7 @@ def ensure_installed(*, force: bool = False) -> None:
 
     install_dependencies()
     available_tools, missing_tools = download_luau_tools()
+    install_moonsec_tools()
     native_host_available = build_native_host()
     if not native_host_available:
         suffix = ".exe" if platform.system().lower() == "windows" else ""

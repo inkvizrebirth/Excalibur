@@ -6,6 +6,8 @@ venv/
 build/
 dist/
 artifacts/
+third_party/moonsec_v3_gpl/bin/
+third_party/moonsec_v3_gpl/obj/
 *.spec
 .installed
 .installed.tmp

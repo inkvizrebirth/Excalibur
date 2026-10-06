@@ -164,7 +164,7 @@ class LuraphStaticDecoderTests(unittest.TestCase):
 
         self.assertIn("zstandard", installer.DISTRIBUTIONS)
 
-    def test_pipeline_writes_intermediate_artifacts_without_running_any_luau(self) -> None:
+    def test_pipeline_writes_intermediate_artifacts_when_runtime_worker_is_unavailable(self) -> None:
         source = _two_stream_source(self.vm_source, self.bytecode)
         with tempfile.TemporaryDirectory() as temporary_directory:
             output_dir = Path(temporary_directory)
@@ -174,12 +174,11 @@ class LuraphStaticDecoderTests(unittest.TestCase):
                 tools_dir=output_dir / "no-tools",
             )
             with (
-                patch("core.pipeline.Sandbox", side_effect=AssertionError("sandbox must not run")),
-                patch(
-                    "core.pipeline._LuauCompiler",
-                    side_effect=AssertionError("compiler must not run"),
+                patch.object(
+                    DeobfuscationPipeline,
+                    "_trace_source",
+                    side_effect=RuntimeError("native worker unavailable"),
                 ),
-                patch("core.pipeline.Tracer", side_effect=AssertionError("tracer must not run")),
             ):
                 result = pipeline.run(source, source_name="public-v147-fixture.luau")
 
@@ -188,10 +187,9 @@ class LuraphStaticDecoderTests(unittest.TestCase):
             self.assertEqual(result.route, "static-protection-report")
             self.assertIsNone(result.sandbox_result)
             self.assertFalse(report["source_reconstructed"])
-            self.assertFalse(report["payload_executed"])
+            self.assertEqual(report["wrapper_execution_outcome"], "not-started")
+            self.assertFalse(report["dynamic_analysis"]["worker_started"])
             self.assertTrue(report["static_unpack"]["success"])
-            self.assertFalse(report["static_unpack"]["wrapper_executed"])
-            self.assertFalse(report["static_unpack"]["vm_interpreter_executed"])
             self.assertEqual(report["static_unpack"]["container_layout"], "two-stream-zstandard")
 
             vm_path = Path(report["outputs"]["luraph_vm_interpreter"])
@@ -205,7 +203,7 @@ class LuraphStaticDecoderTests(unittest.TestCase):
             summary = result.output_path.read_text(encoding="utf-8")
             self.assertIn("ORIGINAL SOURCE NOT RECONSTRUCTED", summary)
             self.assertIn("not Luau bytecode", summary)
-            self.assertIn("were not executed", summary)
+            self.assertIn("wrapper did not run", summary.lower())
             self.assertEqual(len(list(output_dir.iterdir())), 5)
 
     def test_pipeline_reports_unsupported_single_legacy_stream_as_partial(self) -> None:
@@ -217,12 +215,17 @@ class LuraphStaticDecoderTests(unittest.TestCase):
                 output_dir=output_dir,
                 tools_dir=output_dir / "no-tools",
             )
-            result = pipeline.run(source, source_name="unsupported.luau")
+            with patch.object(
+                DeobfuscationPipeline,
+                "_trace_source",
+                side_effect=RuntimeError("native worker unavailable"),
+            ):
+                result = pipeline.run(source, source_name="unsupported.luau")
             report = json.loads(result.report_path.read_text(encoding="utf-8"))
 
             self.assertEqual(result.status, "partial")
             self.assertFalse(report["static_unpack"]["success"])
-            self.assertFalse(report["payload_executed"])
+            self.assertEqual(report["wrapper_execution_outcome"], "not-started")
             self.assertIsNone(report["outputs"]["luraph_custom_bytecode"])
             self.assertEqual(len(list(output_dir.iterdir())), 3)
 

@@ -146,7 +146,7 @@ class ProtezSetup(tk.Tk):
         ).pack(anchor="w")
         ttk.Label(
             options,
-            text="Protez requests Administrator access when launched; Windows may show a confirmation prompt.",
+            text="Protez runs as your current user. Dynamic analysis uses an isolated worker without network access.",
             style="Muted.TLabel",
             wraplength=750,
         ).pack(anchor="w", pady=(6, 0))
@@ -412,13 +412,13 @@ class ProtezSetup(tk.Tk):
                 self.progress.configure(mode="determinate", value=100)
                 self.status.configure(text="Installation complete")
                 self.result_hint.configure(
-                    text=f"Installed to {payload}. Close setup; Protez will request Administrator approval when started."
+                    text=f"Installed to {payload}. Close setup and launch Protez from the shortcut."
                 )
                 self.install_button.configure(text="REPAIR / REINSTALL", state="normal")
                 self.browse_button.configure(state="normal")
                 self.path_entry.configure(state="normal")
                 self.close_button.configure(state="normal")
-                self.logger.info("Setup complete. Protez requests Administrator approval when launched.")
+                self.logger.info("Setup complete. Protez is ready to run as the current user.")
             else:
                 self.busy = False
                 self.progress.stop()

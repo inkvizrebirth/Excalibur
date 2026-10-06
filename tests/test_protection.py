@@ -32,7 +32,7 @@ class ProtectionDetectionTests(unittest.TestCase):
         source = 'local label = "Luraph Obfuscator v14.7"'
         self.assertIsNone(inspect_protection(source))
 
-    def test_pipeline_returns_partial_report_without_running_payload(self) -> None:
+    def test_pipeline_returns_partial_report_when_isolated_worker_is_unavailable(self) -> None:
         source = (
             "-- This file was protected using Luraph Obfuscator v14.7 [https://lura.ph/]\n"
             'local payload = [=[LPH&'
@@ -47,7 +47,12 @@ class ProtectionDetectionTests(unittest.TestCase):
                 tools_dir=output_dir / "no-tools",
             )
 
-            result = pipeline.run(source, source_name="luraph-sample.luau")
+            with patch.object(
+                DeobfuscationPipeline,
+                "_trace_source",
+                side_effect=RuntimeError("native worker unavailable"),
+            ):
+                result = pipeline.run(source, source_name="luraph-sample.luau")
 
             self.assertEqual(result.status, "partial")
             self.assertEqual(result.route, "static-protection-report")
@@ -60,7 +65,7 @@ class ProtectionDetectionTests(unittest.TestCase):
 
             summary = result.output_path.read_text(encoding="utf-8")
             self.assertIn("ORIGINAL SOURCE NOT RECONSTRUCTED", summary)
-            self.assertIn("not executed", summary.lower())
+            self.assertIn("wrapper did not run", summary.lower())
             self.assertIn("Luraph Obfuscator v14.7", summary)
 
             preview = result.preview_path.read_text(encoding="utf-8")
@@ -70,12 +75,13 @@ class ProtectionDetectionTests(unittest.TestCase):
 
             machine_report = json.loads(result.report_path.read_text(encoding="utf-8"))
             self.assertFalse(machine_report["source_reconstructed"])
-            self.assertFalse(machine_report["payload_executed"])
+            self.assertFalse(machine_report["dynamic_analysis"]["worker_started"])
+            self.assertEqual(machine_report["wrapper_execution_outcome"], "not-started")
             self.assertEqual(machine_report["status"], "partial")
 
             self.assertEqual(len(list(output_dir.iterdir())), 3)
 
-    def test_elevated_mode_keeps_static_analysis_but_skips_sandbox(self) -> None:
+    def test_valid_source_is_kept_when_isolated_worker_cannot_start(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             output_dir = Path(temporary_directory)
             pipeline = DeobfuscationPipeline(
@@ -85,22 +91,20 @@ class ProtectionDetectionTests(unittest.TestCase):
             )
             with (
                 patch("core.pipeline._LuauCompiler") as compiler_factory,
-                patch("core.pipeline.Sandbox") as sandbox_factory,
-                patch.object(DeobfuscationPipeline, "_running_elevated", return_value=True),
+                patch.object(
+                    DeobfuscationPipeline,
+                    "_trace_source",
+                    side_effect=RuntimeError("native worker unavailable"),
+                ),
             ):
                 compiler_factory.return_value.timeout_seconds = 10.0
                 result = pipeline.run("local answer = 42", source_name="static.luau")
 
             self.assertEqual(result.status, "complete")
             self.assertIsNone(result.sandbox_result)
-            sandbox_factory.return_value.run.assert_not_called()
             report = json.loads(result.report_path.read_text(encoding="utf-8"))
-            self.assertTrue(
-                any(
-                    "skipped because Protez is running as Administrator" in item
-                    for item in report["safety_notes"]
-                )
-            )
+            self.assertEqual(report["dynamic_analysis"]["execution_outcome"], "not-started")
+            self.assertIn("native worker unavailable", report["dynamic_analysis"]["error"])
             compiler_factory.return_value.verify_text.assert_called_once()
 
 

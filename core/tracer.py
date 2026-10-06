@@ -36,6 +36,7 @@ class TraceResult:
     timed_out: bool
     output_limited: bool
     sandbox_result: SandboxResult
+    source_name: str
 
 
 class _RotatingJsonlWriter:
@@ -90,12 +91,7 @@ class _RotatingJsonlWriter:
 
 
 class Tracer:
-    """Collect structured hook/API events without retaining a trace in RAM.
-
-    Stock Luau does not implement debug.sethook, so a normal Luau CLI run can
-    only provide mock/API events. The optional pinned native host additionally
-    emits instruction-step events from Luau's C API debugstep callback.
-    """
+    """Collect structured Luau VM instruction events without retaining them in RAM."""
 
     def __init__(
         self,
@@ -140,10 +136,7 @@ class Tracer:
     def _trace_once(self, source: str, source_name: str) -> TraceResult:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)
-        self.logger.info("Tracing started: mock/API events plus native VM steps when available")
-        self.logger.warning(
-            "Instruction stepping requires the optional native host; stock Luau CLI records mock/API events only"
-        )
+        self.logger.info("Tracing started in the isolated native Luau worker")
         self._progress(20, "TRACE")
 
         token = secrets.token_hex(16)
@@ -192,15 +185,13 @@ class Tracer:
             self.logger.warning("Trace run reached the %s second timeout", self.timeout_seconds)
         if sandbox_result.output_limited:
             self.logger.warning("Trace run reached its process-output limit")
+        event_count = state["event_count"]
         if state["hooks_available"]:
             self.logger.info(
                 "Native trace records include proto-relative PCs and opcode headers; the full register file is not captured"
             )
-        else:
-            self.logger.warning(
-                "Trace contains mock/API events only; build the optional native host for instruction-step events"
-            )
-        event_count = state["event_count"]
+        elif event_count:
+            self.logger.warning("Worker emitted events but no Luau VM instruction steps")
         self.logger.info("Trace recorded: %s events", f"{event_count:,}".replace(",", " "))
         self.logger.info("Trace written to %s", self.trace_path)
         self._progress(60, "TRACE")
@@ -212,6 +203,7 @@ class Tracer:
             timed_out=sandbox_result.timed_out,
             output_limited=sandbox_result.output_limited,
             sandbox_result=sandbox_result,
+            source_name=source_name,
         )
 
     @staticmethod
@@ -244,9 +236,9 @@ class Tracer:
             "backend": (
                 "luau-native-debugstep"
                 if op in {"VM_STEP", "VM_STEP_LIMIT"}
-                else "luau-hook"
-                if op in {"CALL", "RETURN", "LINE", "COUNT", "TAIL_RETURN", "HOOK_READY", "HOOK_UNAVAILABLE"}
-                else "mock-api"
+                else "luau-native-debugstep"
+                if op == "HOOK_READY"
+                else "native-worker"
             ),
         }
         if op in {"VM_STEP", "VM_STEP_LIMIT", "HOOK_READY"}:
