@@ -932,6 +932,16 @@ class DeobfuscationPipeline:
                         family_lifter_error = str(exc)
                         self.logger.warning("%s VM lifting did not finish: %s",
                                             luraph_family_label, exc)
+                        if "time limit" in str(exc):
+                            # The lift is a long walk, not a stuck one: a bigger
+                            # budget or a smaller sample is what changes the
+                            # outcome, and the deadline is a parameter, not a
+                            # constant of nature.
+                            self.logger.warning(
+                                "The lift is bounded by max_pipeline_seconds (%.0fs); a larger "
+                                "budget is what delivers the partially lifted listing",
+                                self.max_pipeline_seconds,
+                            )
                     except Exception as exc:
                         family_lifter_error = f"unexpected {type(exc).__name__}: {exc}"
                         self.logger.exception("Unexpected error in the %s lifter", luraph_family_label)
