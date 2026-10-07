@@ -59,9 +59,15 @@ def _newest_results(dirs: tuple[Path, ...]) -> list[tuple[str, str, Path]]:
 
 
 def _signature(error: object) -> str:
-    """First line of an error, whitespace collapsed: its identity, not a traceback."""
+    """First line of an error, whitespace collapsed: its identity, not a traceback.
+
+    Line numbers are dropped: the same failure in a formatted result happens on
+    a different line than in the minified input it came from.
+    """
     text = re.sub(r"\s+", " ", str(error or "")).strip()
-    return text.split(" stack traceback:")[0][:120]
+    text = text.split(" stack traceback:")[0]
+    text = re.sub(r":(?:\d+)(?=:)", ":#", text)
+    return text[:120]
 
 
 def _verdict(baseline_status: str, baseline_error: object,

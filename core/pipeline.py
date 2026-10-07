@@ -496,13 +496,16 @@ class DeobfuscationPipeline:
         better.
         """
         baseline = str(getattr(input_result, "status", "") or "")
+        baseline_error = str(getattr(input_result, "error", "") or "")
         if not self.verify_delivery:
             return body, {"checked": False, "reason": "verification disabled"}
-        if outcome_rank(baseline) > 0:
+        if "wall-clock" in baseline_error:
+            # A loader that never returns from its own run costs a full budget
+            # per check and the answer is known in advance: it hangs again.
             return body, {
                 "checked": False,
                 "input_status": baseline,
-                "reason": "the input does not complete on its own either",
+                "reason": "the input is stopped by the wall clock",
             }
         budget = min(20.0, max(5.0, self.max_pipeline_seconds * 0.25))
         status, error = self._verify_runtime(body, budget=budget)
@@ -513,7 +516,10 @@ class DeobfuscationPipeline:
             "form": "readable",
             "error": error[:400],
         }
-        if outcome_rank(status) <= outcome_rank(baseline):
+        # Readability wins unless the result is *broken*: a run that completes is
+        # the answer, and being stopped by a budget is a limit, not a defect (and
+        # one the one-line form cannot lift).  An error is what it repairs.
+        if outcome_rank(status) <= 1:
             return body, record
         one_line = collapse_to_one_line(body)
         if "\n" in one_line:
@@ -523,7 +529,7 @@ class DeobfuscationPipeline:
         wrapped_status, wrapped_error = self._verify_runtime(wrapped, budget=budget)
         record["wrapped_status"] = wrapped_status
         record["wrapped_error"] = wrapped_error[:400]
-        if outcome_rank(wrapped_status) < outcome_rank(status):
+        if outcome_rank(wrapped_status) < 2:
             record["form"] = "single-line chunk"
             self.logger.info(
                 "Result runs better with a one-line chunk (%s -> %s)", status, wrapped_status
