@@ -122,8 +122,6 @@ end
 
 local abortHits = 0
 local function checkBudget()
-	-- a plugin's end hook running script code after the run (ironbrew1's
-	-- capture pushes never-run protos through the VM's closure maker)
 	if CHAIN.unlimited then return end
 	if ABORT_REASON then
 		-- the script's pcall swallowed the abort and it kept going (a loop
@@ -2392,6 +2390,15 @@ E.loadstring = function(src, chunkname)
 		if not patched and not NEWCHUNKS[key] then
 			NEWCHUNKS[key] = src
 			R.insert(NEWCHUNKS, key)
+			if CFG.chunks_only then
+				-- the driver only wanted the chunk source: dump it now and stop.
+				-- Executing the raw (uninstrumented) VM here would be silent and
+				-- pointless -- the real trace comes from the patched rerun.
+				R.print("\0CHUNK " .. key)
+				R.print((R.gsub(src, ".", function(c) return R.fmt("%02x", R.byte(c)) end)))
+				ABORT_REASON = "chunk captured"
+				R.error(ABORT, 0)
+			end
 		end
 		-- spin watchdog (see E.__SPIN): a chunk the driver never saw (the run
 		-- that would report it hung) gets its dispatch heads patched here
@@ -4539,9 +4546,6 @@ else
 		end
 	end
 	if CFG.plugin_rt then
-		-- --cfg plugin_rt=CODE (set by a plugin, e.g. ironbrew1's capture.luau):
-		-- harness-side code that runs before the script, gets the runtime's
-		-- tables and may add CHAIN.endHooks (their output goes into the result block)
 		local pf, perr = R.loadstring(CFG.plugin_rt, "=plugin_rt")
 		if not pf then R.error("plugin runtime: " .. R.tostring(perr)) end
 		pf({ E = E, CHAIN = CHAIN, R = R, CFG = CFG, isP = isP, INFO = INFO })

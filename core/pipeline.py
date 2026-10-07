@@ -29,7 +29,7 @@ from core.deobfuscator import (
 )
 from core.engine import RecoveryEngine, RecoveryResult, static_decode_is_useful
 from core.families import family_report
-from core.formatter import format_luau
+from core.formatter import break_statements, format_luau
 from core.injector_env import (
     DEFAULT_PROFILE_KEY,
     ExecutorProfile,
@@ -45,7 +45,7 @@ from core.luraph_static import (
 from core.luraph_devirtualizer import (
     LuraphDevirtualizationError,
     LuraphDevirtualizationResult,
-    devirtualize_luraph_v15,
+    devirtualize_luraph,
 )
 from core.moonsec_devirtualizer import (
     MoonSecDevirtualizationError,
@@ -97,6 +97,22 @@ class PipelineResult:
     preview_path: Path | None = None
     trace_files: tuple[Path, ...] = ()
     trace_event_count: int = 0
+
+
+#: A recovered line longer than this is a minified wall, not readable source:
+#: machine-made wrappers and lifted VM listings put thousands of characters --
+#: sometimes a whole program -- on one line.
+_READABLE_LINE_LIMIT = 400
+
+
+def _longest_line(text: str) -> int:
+    return max((len(line) for line in text.splitlines()), default=0)
+
+
+def _as_lua_comment(text: str) -> str:
+    """Render ``text`` as a Lua comment block, so a report can prefix a script."""
+    lines = ["-- " + line if line.strip() else "--" for line in text.splitlines()]
+    return "\n".join(lines) + "\n\n"
 
 
 class _LuauCompiler:
@@ -454,7 +470,10 @@ class DeobfuscationPipeline:
             profile_label=self.profile.label,
             layers=result.layer_count,
         )
-        write_text_atomic(script_path, header + result.source.rstrip() + "\n")
+        formatted_source, formatting_applied = self._format_recovered_source(
+            result.source, label=f"recovered {source_name}"
+        )
+        write_text_atomic(script_path, header + formatted_source.rstrip() + "\n")
         removed = prune_legacy_artifacts(self.output_dir)
         if removed:
             self.logger.info("Removed %s stale artifact(s) from output/", len(removed))
@@ -757,13 +776,15 @@ class DeobfuscationPipeline:
             if (
                 protection.family == "Luraph Obfuscator"
                 and protection.version is not None
-                and protection.version.split(".", maxsplit=1)[0] == "15"
+                and protection.version.split(".", maxsplit=1)[0] in {"14", "15"}
             ):
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
+                    luraph_family_name = "luraph_v15" if protection.version.startswith("15") else "luraph_v14"
+                    luraph_family_label = "Luraph v15" if luraph_family_name == "luraph_v15" else "Luraph v14"
                     self._progress(14, "DEVIRT")
                     try:
-                        devirtualized = devirtualize_luraph_v15(
+                        devirtualized = devirtualize_luraph(
                             source,
                             source_name=source_name,
                             tools_dir=self.tools_dir,
@@ -771,6 +792,7 @@ class DeobfuscationPipeline:
                             timeout_seconds=max(15.0, self.sandbox_timeout_seconds),
                             total_budget_seconds=remaining,
                             logger=self.logger,
+                            family=luraph_family_name,
                         )
                         return self._write_luraph_devirtualized_result(
                             source=source,
@@ -788,10 +810,11 @@ class DeobfuscationPipeline:
                         )
                     except LuraphDevirtualizationError as exc:
                         family_lifter_error = str(exc)
-                        self.logger.warning("Luraph v15 VM lifting did not finish: %s", exc)
+                        self.logger.warning("%s VM lifting did not finish: %s",
+                                            luraph_family_label, exc)
                     except Exception as exc:
                         family_lifter_error = f"unexpected {type(exc).__name__}: {exc}"
-                        self.logger.exception("Unexpected error in the Luraph v15 lifter")
+                        self.logger.exception("Unexpected error in the %s lifter", luraph_family_label)
                 else:
                     family_lifter_error = "the total pipeline time limit was reached before VM lifting started"
             notice = (
@@ -1221,7 +1244,9 @@ class DeobfuscationPipeline:
                 "-- Protez static preview only; this is not recovered source.\n"
                 f"-- Detected: {profile.display_name}.\n"
                 "-- Do not treat the obfuscated wrapper as devirtualized Luau.\n\n"
-                + source_analysis.source
+                + self._make_readable(
+                    source_analysis.source, label="MoonSec V3 wrapper preview"
+                )[0]
             )
             artifacts.append((preview_path, preview.encode("utf-8")))
             primary_path = preview_path
@@ -1324,21 +1349,100 @@ class DeobfuscationPipeline:
         except Exception as exc:
             self.logger.warning("Could not prepare conservative formatting; preserving original: %s", exc)
             return source, False
+        lexical_only = False
         if formatted == source:
-            return source, False
+            # Machine-made wrappers are full of syntax ``format_luau`` declines
+            # to model (if-expressions, type annotations, interpolation), and
+            # they used to be written out as a single unreadable line.  The
+            # statement breaker only inserts newlines, so it cannot change what
+            # the chunk means even when the compiler is not available to confirm
+            # it, and an unverified readable candidate beats a verified wall.
+            try:
+                formatted = break_statements(source)
+            except Exception as exc:  # noqa: BLE001 - formatting is best effort
+                self.logger.warning("Could not split the candidate at statement boundaries: %s", exc)
+                return source, False
+            if formatted == source:
+                return source, False
+            lexical_only = True
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             self.logger.warning("Skipped optional formatting after reaching the pipeline time limit")
-            return source, False
+            return formatted if lexical_only else source, False
         compiler.timeout_seconds = min(compiler.timeout_seconds, max(0.001, remaining))
         try:
             compiler.verify_text(formatted, label=label)
         except PipelineError as exc:
             self.logger.warning("Formatted candidate did not pass compile-only validation; preserving original: %s", exc)
-            return source, False
+            return formatted if lexical_only else source, False
 
+        if lexical_only:
+            self.logger.info("Split the candidate at statement boundaries; no program text was changed")
+            return formatted, False
         self.logger.info("Conservative token-preserving formatting passed compile-only validation")
+        return formatted, True
+
+    def _make_readable(self, source: str, *, label: str = "source") -> tuple[str, bool]:
+        """Re-flow ``source`` onto readable lines; never touches program text.
+
+        ``format_luau`` declines any input it cannot fully model -- an
+        if-expression, a type annotation, an interpolated string -- and every
+        machine-made wrapper is full of those, which used to leave them as a
+        single wall of text.  The statement breaker runs afterwards (and alone
+        when the formatter declines): it only inserts newlines where a statement
+        or a block boundary provably ends, so the chunk parses exactly as before.
+
+        Returns the text and whether the whitespace-aware formatter produced it
+        (the caller only compile-verifies that variant).
+        """
+        if not source.strip():
+            return source, False
+        formatted = source
+        by_formatter = False
+        try:
+            candidate = format_luau(source)
+        except Exception as exc:  # noqa: BLE001 - formatting is best effort
+            self.logger.debug("Formatting skipped for %s: %s", label, exc)
+            candidate = source
+        if candidate != source:
+            formatted = candidate
+            by_formatter = True
+        if _longest_line(formatted) <= _READABLE_LINE_LIMIT:
+            # A hand-written or already re-flowed chunk is left alone: breaking
+            # it further would only move statements that were readable as they
+            # were.
+            return formatted, by_formatter
+        try:
+            broken = break_statements(formatted)
+        except Exception as exc:  # noqa: BLE001 - formatting is best effort
+            self.logger.debug("Statement breaking skipped for %s: %s", label, exc)
+            return formatted, by_formatter
+        if broken != formatted:
+            self.logger.info("Split %s at statement boundaries", label)
+        return broken, by_formatter
+
+    def _format_recovered_source(self, source: str, *, label: str = "recovered source") -> tuple[str, bool]:
+        """Make recovered source readable and compile-verify it when possible.
+
+        Used on paths that do not run the compiler at all (the engine's own
+        result).  When a compiler is available the formatted text is verified
+        with it; when none is installed the formatting is still applied, because
+        the formatter is defined to be token-preserving and declining on Luau
+        syntax it cannot prove it handles.
+        """
+        formatted, by_formatter = self._make_readable(source, label=label)
+        if formatted == source or not by_formatter:
+            return formatted, formatted != source
+        compiler = _LuauCompiler(
+            tools_dir=self.tools_dir,
+            timeout_seconds=self.compiler_timeout_seconds,
+            logger=self.logger,
+        )
+        try:
+            compiler.verify_text(formatted, label=label)
+        except Exception as exc:  # noqa: BLE001 - verification is optional
+            self.logger.debug("Formatted %s was not compile-verified: %s", label, exc)
         return formatted, True
 
     def _is_valid_source(
@@ -1659,6 +1763,7 @@ class DeobfuscationPipeline:
         started: float,
         deadline: float,
     ) -> PipelineResult:
+        luraph_label = "Luraph v14" if devirtualized.route.startswith("luraph-v14") else "Luraph v15"
         captured_source, captured_source_info = self._best_luraph_runtime_payload(
             devirtualized,
             compiler=compiler,
@@ -1673,16 +1778,16 @@ class DeobfuscationPipeline:
             )
         compiler.timeout_seconds = min(self.compiler_timeout_seconds, remaining)
         try:
-            compiler.verify_text(source_candidate, label=f"Luraph v15 {source_origin} source")
+            compiler.verify_text(source_candidate, label=f"{luraph_label} {source_origin} source")
         except PipelineError as exc:
             raise LuraphDevirtualizationError(
-                f"the Luraph v15 {source_origin} output failed Luau syntax validation: {exc}"
+                f"the {luraph_label} {source_origin} output failed Luau syntax validation: {exc}"
             ) from exc
 
         formatted_source, formatting_applied = self._format_verified_candidate(
             source_candidate,
             compiler,
-            label=f"formatted Luraph v15 {source_origin} source",
+            label=f"formatted {luraph_label} {source_origin} source",
             deadline=deadline,
         )
         output_partial_reasons = list(devirtualized.incomplete_reasons)
@@ -1772,7 +1877,7 @@ class DeobfuscationPipeline:
             )
             captured_source_info["artifact"] = selected_capture_artifact
         transformations = (
-            "Luraph v15 VM proto/opcode lifting",
+            f"{luraph_label} VM proto/opcode lifting",
             "offline Roblox API model used during constant recovery",
         ) + (("sandbox-captured loadstring payload",) if captured_source is not None else ()) + (
             "Luau compile-only syntax verification",
@@ -1796,7 +1901,7 @@ class DeobfuscationPipeline:
             "original_source_recovered": False,
             "semantic_equivalence_verified": False,
             "family_specific_analysis": {
-                "engine": "MIT-licensed Luraph v15 devirtualizer",
+                "engine": f"MIT-licensed {luraph_label} devirtualizer",
                 "provenance": "imnotherfav/deobfuscator-luraph-v15",
                 "source_commit": "5a1ac583b69451f56dd735d2a1de6ab7a513432b",
                 "source_bytes": devirtualized.source_bytes,
@@ -1815,7 +1920,7 @@ class DeobfuscationPipeline:
                 "partial_reasons": output_partial_reasons,
                 "vm_lift_partial_reasons": list(devirtualized.incomplete_reasons),
                 "readability_status": status,
-                "version_scope": "Luraph v15 wrappers matching the supported VM structure",
+                "version_scope": f"{luraph_label} wrappers matching the supported VM structure",
             },
             "formatting_applied": formatting_applied,
             "formatting_validation": "compile-only" if formatting_applied else None,
@@ -1849,16 +1954,16 @@ class DeobfuscationPipeline:
         }
         if recovery_complete:
             notice = (
-                "Luraph v15 source was recovered from an isolated loadstring capture and passed a compile-only syntax check. "
+                f"{luraph_label} source was recovered from an isolated loadstring capture and passed a compile-only syntax check. "
                 "Original comments/names and semantic equivalence are not recovered or verified."
                 if captured_source is not None
-                else "Luraph v15 VM code was lifted into readable Luau and passed a compile-only syntax check. "
+                else f"{luraph_label} VM code was lifted into readable Luau and passed a compile-only syntax check. "
                 "Original comments/names and semantic equivalence are not recovered or verified."
             )
         else:
             reasons = "; ".join(output_partial_reasons)
             notice = (
-                "Luraph v15 produced a partial Luau candidate. It is syntax-valid, but the report lists "
+                f"{luraph_label} produced a partial Luau candidate. It is syntax-valid, but the report lists "
                 f"unresolved source content: {reasons}. Protez did not mark it as fully recovered source."
             )
         writes: list[tuple[Path, bytes]] = [
@@ -1877,10 +1982,10 @@ class DeobfuscationPipeline:
                 temporary_path.unlink(missing_ok=True)
             for path, _ in writes:
                 path.unlink(missing_ok=True)
-            raise PipelineError(f"Could not write Luraph v15 output: {exc}") from exc
+            raise PipelineError(f"Could not write {luraph_label} output: {exc}") from exc
 
-        self.logger.info("Luraph v15 VM source written to %s", output_path)
-        self.logger.info("Luraph v15 analysis report written to %s", report_path)
+        self.logger.info("%s VM source written to %s", luraph_label, output_path)
+        self.logger.info("%s analysis report written to %s", luraph_label, report_path)
         self._progress(100, "DONE" if recovery_complete else "PARTIAL")
         return PipelineResult(
             output_path=output_path,
@@ -2022,11 +2127,14 @@ class DeobfuscationPipeline:
                 f"outcome: {dynamic_outcome}."
             )
 
+        preview_source = self._make_readable(
+            source_analysis.source, label=f"{profile.display_name} wrapper preview"
+        )[0]
         preview = (
             "-- Protez static preview only; this is not reconstructed source.\n"
             f"-- Detected: {profile.display_name}. Runtime outcome: {dynamic_outcome}.\n"
             "-- Do not treat this file as deobfuscated Luau.\n\n"
-            + source_analysis.source
+            + preview_source
         )
         static_unpack_report: dict[str, object] = {
             "attempted": True,
@@ -2055,14 +2163,18 @@ class DeobfuscationPipeline:
         )
         if family_lifter_error:
             family_lifter_limitation = (
-                "Luraph v15 family-specific lifting was attempted but did not recover source: "
+                f"{'Luraph v14' if profile.version and profile.version.startswith('14') else 'Luraph v15'} "
+                "family-specific lifting was attempted but did not recover source: "
                 + family_lifter_error
             )
-        elif profile.version and profile.version.split(".", maxsplit=1)[0] == "15":
-            family_lifter_limitation = "Luraph v15 VM source was not recovered by the family-specific lifter."
+        elif profile.version and profile.version.split(".", maxsplit=1)[0] in {"14", "15"}:
+            family_lifter_limitation = (
+                f"Luraph v{profile.version.split('.', maxsplit=1)[0]} VM source was not recovered "
+                "by the family-specific lifter."
+            )
         else:
             family_lifter_limitation = (
-                "This Protez release has a family-specific source lifter for Luraph v15 only; "
+                "This Protez release has family-specific source lifters for Luraph v14 and v15; "
                 "other Luraph versions receive static and isolated runtime analysis."
             )
         limitations = [
@@ -2110,10 +2222,15 @@ class DeobfuscationPipeline:
             "visible_wrapper_literals": list(profile.visible_literals),
             "static_unpack": static_unpack_report,
             "family_specific_analysis": {
-                "engine": "luraph-v15-vm-lifter",
+                "engine": (
+                    "luraph-v14-vm-lifter"
+                    if profile.version is not None
+                    and profile.version.split(".", maxsplit=1)[0] == "14"
+                    else "luraph-v15-vm-lifter"
+                ),
                 "attempted": family_lifter_error is not None or (
                     profile.version is not None
-                    and profile.version.split(".", maxsplit=1)[0] == "15"
+                    and profile.version.split(".", maxsplit=1)[0] in {"14", "15"}
                 ),
                 "source_recovered": False,
                 "error": family_lifter_error,
@@ -2182,6 +2299,14 @@ class DeobfuscationPipeline:
             if item.get("path"):
                 entry += f" — {item['path']}"
             captured_lines.append(entry)
+        preview_banner = (
+            "\n"
+            "--========================================================================\n"
+            "-- WRAPPER SOURCE BELOW (formatted preview, NOT reconstructed source)\n"
+            f"-- {profile.display_name}, runtime outcome: {dynamic_outcome}\n"
+            "-- Formatting only inserts line breaks; no program text was changed.\n"
+            "--========================================================================\n\n"
+        )
         summary = (
             "PROTEZ // STATIC PROTECTION ANALYSIS\n"
             "=====================================\n"
@@ -2226,6 +2351,9 @@ class DeobfuscationPipeline:
             + (f"  VM interpreter: {vm_source_path}\n" if vm_source_path else "")
             + (f"  Custom VM bytecode: {bytecode_path}\n" if bytecode_path else "")
         )
+        # The report and the wrapper preview share one file, so the report is
+        # written as a Lua comment block: destroyed_N.lua stays loadable Lua.
+        summary = _as_lua_comment(summary) + preview_banner + preview_source
 
         writes: list[tuple[Path, bytes]] = [
             (preview_path, preview.encode("utf-8")),

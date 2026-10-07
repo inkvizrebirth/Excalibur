@@ -30,6 +30,11 @@ def _binary() -> Path:
     raise AstToolError("the pinned Luau AST tool is unavailable; repair Protez's native runtime")
 
 
+def binary() -> Path:
+    """The pinned Luau AST tool, for the vendored passes that spawn it themselves."""
+    return _binary()
+
+
 def parse_file(path: str | os.PathLike[str]) -> bytes:
     """Return AST JSON while bounding parser time and output size."""
     source = Path(path)

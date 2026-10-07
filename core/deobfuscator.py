@@ -14,13 +14,20 @@ MAX_EXPRESSION_TOKENS = 512
 MAX_TRANSFORM_PASSES = 6
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Lua 5.4 and Luau both accept underscores as digit separators in numerals
+# (``1_000``, ``0x_00ff`` is rejected but ``0x00_ff`` is fine); keep the rule
+# permissive here and let the callers validate, so that obfuscated sources
+# using separators still lex as a single number token.
 _NUMBER = re.compile(
-    r"(?:0[xX][0-9a-fA-F]+(?:\.(?!\.)[0-9a-fA-F]*)?(?:[pP][+-]?\d+)?|"
-    r"0[bB][01]+|(?:\d+(?:\.(?!\.)\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+    r"(?:0[xX][0-9a-fA-F][0-9a-fA-F_]*"
+    r"(?:\.(?!\.)[0-9a-fA-F_]*)?(?:[pP][+-]?\d[\d_]*)?|"
+    r"0[bB][01][01_]*|"
+    r"\d[\d_]*(?:\.(?!\.)[\d_]*)?(?:[eE][+-]?\d[\d_]*)?|"
+    r"\.\d[\d_]*(?:[eE][+-]?\d[\d_]*)?)"
 )
 _LONG_BRACKET = re.compile(r"\[(=*)\[")
 _OPERATORS = (
-    "...", "..=", "//", "<<", ">>", "==", "~=", "<=", ">=", "..", "::", "->",
+    "...", "..=", "//=", "//", "<<", ">>", "==", "~=", "<=", ">=", "..", "::", "->",
     "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=",
 )
 _PRECEDENCE = {
@@ -121,6 +128,46 @@ def _long_bracket_end(source: str, start: int) -> tuple[int, int] | None:
     return content_end + len(closing), content_start
 
 
+def interpolated_string_end(source: str, start: int) -> int:
+    """Index just past a Luau interpolated string opening at ``start``.
+
+    Luau writes string interpolation as `` `text {expression} more` ``.  The
+    expression may itself contain braces, strings and further interpolated
+    strings, so the scan tracks brace depth and skips nested literals; a
+    backtick that is not escaped and not inside a brace group closes the
+    string.
+    """
+    index = start + 1
+    depth = 0
+    length = len(source)
+    while index < length:
+        character = source[index]
+        if character == "\\":
+            index += 2
+            continue
+        if character == "`" and depth == 0:
+            return index + 1
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            if depth > 0:
+                depth -= 1
+        elif depth and character in "\"'":
+            quote = character
+            index += 1
+            while index < length:
+                if source[index] == "\\":
+                    index += 2
+                    continue
+                if source[index] == quote:
+                    break
+                index += 1
+        elif depth and character == "`":
+            index = interpolated_string_end(source, index) - 1
+        index += 1
+    return length
+
+
 def tokenize(source: str) -> list[Token]:
     """Lex enough Lua/Luau syntax to safely find constant literal expressions."""
     tokens: list[Token] = []
@@ -154,6 +201,13 @@ def tokenize(source: str) -> list[Token]:
                 index += 1
                 if current == quote:
                     break
+            tokens.append(Token("string", source[start:index], start, index))
+            continue
+
+        if character == "`":
+            # Luau string interpolation: one token, so normalisation passes can
+            # never rewrite text that only looks like code.
+            index = interpolated_string_end(source, index)
             tokens.append(Token("string", source[start:index], start, index))
             continue
 
@@ -372,6 +426,10 @@ def _quote_bytes(value: bytes) -> str:
 
 def _parse_number(text: str) -> int | float | object:
     lowered = text.lower()
+    if "_" in lowered:
+        # Lua 5.4 / Luau digit separators; the separators are never significant.
+        lowered = lowered.replace("_", "")
+        text = text.replace("_", "")
     try:
         if lowered.startswith("0x"):
             if "p" in lowered or "." in lowered:
@@ -1690,6 +1748,102 @@ def _collect_local_constants(
     return bindings, paths
 
 
+#: Characters that make up a Lua identifier or number: a replacement that ends
+#: (or starts) with one of these can fuse with the neighbouring token.
+_WORD_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+#: A value that cannot act as a prefix expression: it must be parenthesised
+#: before a ``.``/``:``/``[``/call suffix, otherwise ``"text":gsub(...)`` stops
+#: being Lua.  (Names, calls and table constructors are already prefixes.)
+_NON_PREFIX_LITERALS = frozenset({"nil", "true", "false"})
+#: Tokens that can never be the final token of a complete expression.
+_SPAN_REJECT_END = frozenset({
+    "and", "break", "do", "else", "elseif", "for", "function", "if", "in", "local", "not", "or",
+    "repeat", "return", "then", "until", "while", "=", ",", "==", "~=", "<", ">", "<=", ">=",
+    "..", "+", "-", "*", "/", "%", "^", "|", "&", "<<", ">>", "::", ":", "#",
+})
+#: Tokens that can never start a folded expression.
+_SPAN_REJECT_START = frozenset({
+    "and", "break", "do", "else", "elseif", "end", "for", "in", "local", "or", "repeat", "return",
+    "then", "until", "while", "=", ",", "==", "~=", "<", ">", "<=", ">=", "..", "*", "/", "%", "^",
+    "|", "&", "<<", ">>", "::", ":", ")", "]", "}",
+})
+_OPEN_TOKENS = frozenset({"(", "[", "{"})
+_CLOSE_TOKENS = frozenset({")", "]", "}"})
+#: Character pairs that would start a comment or a long string if a replacement
+#: fused with its neighbour: ``x- -5`` must not become the comment ``x--5``,
+#: and a long-bracket literal must not follow an index bracket directly.
+_DANGEROUS_PAIRS = ("--", "[[", "[=")
+
+
+def _is_prefix_expression(rendered: str) -> bool:
+    if not rendered or rendered in _NON_PREFIX_LITERALS:
+        return False
+    first = rendered[0]
+    return first in _WORD_CHARS and not first.isdigit() or first in {"(", "{"}
+
+
+def _span_is_complete_expression(tokens: list[Token], start: int, end: int) -> bool:
+    """Whether ``tokens[start:end]`` can be a whole expression on its own.
+
+    The expression parser stops where it runs out of grammar it models, and a
+    truncated span is dangerous: folding ``105 or yz==((function()`` to ``105``
+    deleted the head of a real function body.  A span is only trusted when its
+    brackets balance, it starts where an expression can start and it ends where
+    a value can end.
+    """
+    if end <= start:
+        return False
+    depth = 0
+    for token in tokens[start:end]:
+        if token.text in _OPEN_TOKENS:
+            depth += 1
+        elif token.text in _CLOSE_TOKENS:
+            depth -= 1
+            if depth < 0:
+                return False
+    if depth != 0:
+        return False
+    first, last = tokens[start], tokens[end - 1]
+    if first.kind == "identifier" and first.text in _SPAN_REJECT_START:
+        return False
+    if last.kind == "identifier":
+        return last.text not in _SPAN_REJECT_END
+    if last.kind in {"number", "string"}:
+        return True
+    return last.text in _CLOSE_TOKENS or last.text in {"end", "..."}
+
+
+def _prepare_replacement(source: str, start: int, end: int, rendered: str) -> str:
+    """Return replacement text that keeps the surrounding chunk parseable.
+
+    Two hazards come with rewriting a span into a literal: the literal can fuse
+    with the token next to it (minified Luau relies on the delimiter the fold
+    removes -- ``if c<(A+B)then`` becomes ``256then``, a malformed number), and
+    it can lose the parentheses a ``.``/``:``/``[``/call suffix needs to stay a
+    prefix expression.  Both are repaired without touching program text.
+    """
+    if not rendered:
+        return rendered
+    result = rendered
+    following = source[end : end + 1]
+    if following in {".", ":", "[", "("} and not _is_prefix_expression(result):
+        result = "(" + result + ")"
+        following = ")"
+    if result[-1] in _WORD_CHARS and following in _WORD_CHARS:
+        result += " "
+    preceding = source[start - 1 : start] if start else ""
+    if preceding in _WORD_CHARS and result[0] in _WORD_CHARS:
+        result = " " + result
+    for first, second in _DANGEROUS_PAIRS:
+        if preceding == first and result[0] == second:
+            result = " " + result
+            break
+        if result[-1] == first and following == second:
+            result += " "
+            break
+    return result
+
+
 def _rewrite_once(source: str) -> tuple[str, int, int, dict[str, int]]:
     tokens = tokenize(source)
     bindings, paths = _collect_local_constants(source, tokens)
@@ -1737,7 +1891,7 @@ def _rewrite_once(source: str) -> tuple[str, int, int, dict[str, int]]:
                 continue
         parser = _ExpressionParser(tokens, index, active_environment)
         value, end = parser.parse()
-        if value is not _UNKNOWN and end > index:
+        if value is not _UNKNOWN and end > index and _span_is_complete_expression(tokens, index, end):
             rendered = _render_value(value)
             if rendered is not None:
                 first = tokens[index]
@@ -1747,7 +1901,9 @@ def _rewrite_once(source: str) -> tuple[str, int, int, dict[str, int]]:
                 is_local_reference = token.kind == "identifier" and token.text in active_environment
                 should_replace = end > index + 1 or is_literal_string or is_local_reference
                 if should_replace and old != rendered:
-                    edits.append((first.start, last.end, rendered))
+                    edits.append(
+                        (first.start, last.end, _prepare_replacement(source, first.start, last.end, rendered))
+                    )
                     if isinstance(value, bytes):
                         string_count += 1
                         transformations["decoded string expression"] = (

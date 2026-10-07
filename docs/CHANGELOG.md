@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+- **Every fixture now ends as a readable script.**  The pipeline used to hand
+  back minified wrappers unchanged: `format_luau` declines any input whose `if`
+  is not a statement (every machine-made wrapper), and the single formatting path
+  was gated on the Luau compiler, so `destroyed_N.lua` could be 16 lines of
+  100 000 characters.  `core.formatter.break_statements` is the lexical fallback:
+  it only inserts newlines, only where an expression provably cannot continue
+  (`;`, `then`/`do`/`else`/`repeat`/`end`, a comma inside brackets, a statement
+  keyword or a new assignment after a finished value), re-indents block bodies up
+  to six levels and leaves every byte of program text alone.  Static-protection
+  results now carry their report as a Lua comment block in front of the formatted
+  wrapper preview, so the single result file stays loadable Lua.  All twelve
+  `samples/real` fixtures land between 620 and 21 700 lines and re-parse as
+  Lua/Luau; `dev/check_readability.py` proves it per result (line count, longest
+  line of *code* ignoring data literals, token preservation, parse) and
+  `tests/test_formatter.py` pins the breaker.
+- Fixed three ways constant folding corrupted a recovered script.  Folding a
+  span into a literal can fuse with its neighbours: `if c<(A+B)then` (minified
+  Luau relies on the `)` that folding deletes) became the malformed number
+  `256then`; `x-(A-B)` became the comment `x--5`, which swallowed the rest of the
+  line and with it real `end`s; and dropping the parentheses of
+  `([[MoonSec V3]]):gsub(...)` left a string where Lua needs a prefix expression.
+  A replacement is now spaced or parenthesised exactly when the surrounding text
+  requires it.
+- The expression parser no longer accepts a truncated span.  On an IronBrew3
+  fixture it stopped parsing inside a function body (`105 or yz==((function()`)
+  and the "fold" deleted the body's head; a span is now only trusted when its
+  brackets balance and it starts and ends where an expression can.
+
+
+- The portable backend now runs **Luau** source.  `core.devirt.luau_normalize`
+  was written but never called, so every Luaph wrapper died on the first line
+  with a Lua 5.1 syntax error; the backend probes with `loadstring` and lowers
+  what does not compile: numeric separators (`0Xf5__e`), `!=`, compound
+  assignment, `continue`, string interpolation, Luau's floor division (`a // b`
+  -> `math.floor(a / b)`) and if-*expressions* (`z = if c then a else b` ->
+  a one-shot closure, which keeps `false`/`nil` branches correct).  The
+  `continue` pass no longer mistakes an if-expression for a block that needs an
+  `end`.  With this, the Luraph v14.6 and v15.0 fixtures parse *and run*
+  (previously both failed before executing a statement).
+- The Lua bridge is byte-exact (`LuaRuntime(encoding="latin-1")`): a loader may
+  hand the host raw binary (a dumped chunk, a packed table) without the run
+  dying on `UnicodeDecodeError`.  MoonSec v3 now dumps its 131 KB interpreter
+  chunk this way.
+- `core.luau_compat` provides `string.pack`/`unpack`/`packsize` (Lua 5.3 format
+  strings on `struct`) as real Lua functions, so an IronBrew3 wrapper's
+  `string.pack and string.unpack` gate passes and the loader runs to completion.
+- The executor prelude gained Luau's `buffer` and `vector` libraries plus
+  `table.move`/`clone`, `math.noise`, `bit32.byteswap`, `coroutine.close` and
+  `utf8` additions.  Luraph v15 builds its chunk inside `buffer` and its
+  constants with `vector`; both used to stop the run at the first call.
+- `core/lua51.py`: the structured lifter no longer explodes on an obfuscated
+  jump table.  It refuses to re-enter a region it is already lifting and stops
+  at a step budget with a line in the output that says so — the MoonSec v3
+  interpreter chunk (112-instruction root, overlapping branch layouts) used to
+  spend minutes of CPU and look like a hang; it now lifts in ~1.3 s.
+- `core.devirt.wrd` (WeAreDevs/WRD string-pool recovery) is wired into the
+  family registry ahead of the generic bytecode method and pinned by tests.
+- Luraph **v14.7-v14.9** wrappers are now devirtualized the same way v15 is: the vendored MIT engine gained its v14 front end (repeat-dispatchers, prototype-as-argument-0 factories, initializer-scoped helpers, symbolic holes for not-yet-materialized tables), Protez routes a `v14.x` banner or a stripped v14 entry tail (`...}):t()(...)`) to it, and the payload root is picked engine-side because the runtime capture reports Luraph's anti-tamper prototype first. The shared lifter then walks the real dispatch loop with symbolic registers, rebuilds control flow, and runs the same naming/local-function/formatting passes as v15. A v14.7 container is one flat prototype namespace per VM — the entry prototype is only the program's main chunk — so the whole namespace is lifted: the entry plus every sibling prototype is emitted as a labelled `proto_<id>` function with its own opcode count, Luraph's anti-tamper-shaped prototypes (a deep register file and thousands of guard opcodes) are skipped and reported instead of being passed off as script code, and the emitted file is Luau-parser clean; the report, notice and log lines name the family that actually ran. Every pass that spawns a Luau parser now uses Protez's bounded `luau-ast` adapter instead of the vendor's unbounded subprocess call.
 - Rebuilt the desktop interface in a pixel style: bitmap-font chrome, segmented progress blocks, a compact option row (executor profile, remote-payload switch, `script_key`) and an in-app result viewer with line numbers, Lua highlighting and search. The viewer opens automatically when a run finishes; intermediate artifacts are parked under `logs/` so `output/` keeps exactly one `destroyed_N.lua` per run.
 - The default executor profile is now **Real**, a fictional executor with the full command surface (144 features). `core.executor_api` gives the sandbox a working file API (`writefile`, `appendfile`, `readfile`, `isfile`, `isfolder`, `makefolder`, `delfile`, `delfolder`, `listfiles`, `loadfile`, `getcustomasset`), HTTP tables (`request`/`http_request`/`HttpGet*`/`fetch`), `crypt` (base64/hex/HMAC/SHA-256 in pure Lua), identity and HWID functions, `hookfunction`/`hookmetamethod`/`newcclosure`, the `debug` helpers and a recorded input surface, so scripts that refuse to run outside a real injector boot normally. Files written by a script are mirrored into `logs/executor-workspace/` and reported.
 - Namecall hooks work the way dumpers expect: `hookmetamethod(game, "__namecall", hook)` and the classic `getrawmetatable(game).__namecall = hook` / `__index` swap both see `game:HttpGet(...)` and friends with the real arguments, `getnamecallmethod()` is set during the hook, and a hook that errors falls back to the emulated call instead of killing the run.

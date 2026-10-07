@@ -140,5 +140,63 @@ class DeobfuscatorTests(unittest.TestCase):
         self.assertEqual(deobfuscate_source(source).source, source)
 
 
+class FoldedTextStaysParseableTests(unittest.TestCase):
+    """Folding rewrites text, so it must leave a chunk the Lua parser still accepts.
+
+    Every case below came from a real obfuscated fixture: minified Luau relies on
+    the delimiters that folding removes, and a wrong replacement either fused two
+    tokens, opened a comment or dropped the parentheses a method call needs.
+    """
+
+    @staticmethod
+    def _lua51():
+        try:
+            from lupa import lua51
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise unittest.SkipTest("lupa is required to parse Lua 5.1") from exc
+        return lua51
+
+    def _assert_parses(self, source: str, *, label: str) -> str:
+        folded = deobfuscate_source(source).source
+        lua51 = self._lua51()
+        runtime = lua51.LuaRuntime(unpack_returned_tuples=True, encoding="latin-1")
+        outcome = runtime.eval("loadstring")(folded)
+        function = outcome[0] if isinstance(outcome, tuple) else outcome
+        error = outcome[1] if isinstance(outcome, tuple) and len(outcome) > 1 else None
+        self.assertIsNotNone(function, f"{label} did not parse: {error}\n{folded!r}")
+        return folded
+
+    def test_keeps_a_keyword_separated_from_a_folded_number(self) -> None:
+        folded = self._assert_parses(
+            "if c<(610129+(486042-222348))then return 1 end", label="number before then"
+        )
+        self.assertNotIn("then", folded.replace(" then", ""))
+        self.assertIn(" then", folded)
+
+    def test_does_not_open_a_comment_in_front_of_a_negative_value(self) -> None:
+        folded = self._assert_parses(
+            "local function f(a) return a-(-2-3) end return f", label="negative value"
+        )
+        self.assertNotIn("--", folded)
+        self.assertIn("- -5", folded)
+
+    def test_keeps_parentheses_required_by_a_method_call(self) -> None:
+        folded = self._assert_parses(
+            '([[This file was protected with MoonSec V3]]):gsub(".+", function() end)',
+            label="string prefix",
+        )
+        self.assertIn('("This file was protected with MoonSec V3"):gsub', folded)
+
+    def test_rejects_a_truncated_span_next_to_a_function_body(self) -> None:
+        source = (
+            "local yz = 7 if yz<105 or yz==((function()local kz={};kz[kz]=105;"
+            "return kz[kz]end)())then return 1 end return 2"
+        )
+        folded = self._assert_parses(source, label="truncated span")
+        # The function body must survive the fold, not be swallowed by it.
+        for token in ("local kz={}", "return kz[kz]", "end"):
+            self.assertIn(token, folded)
+
+
 if __name__ == "__main__":
     unittest.main()

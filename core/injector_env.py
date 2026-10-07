@@ -187,7 +187,7 @@ def _features(*extra: str) -> tuple[str, ...]:
 EXECUTOR_PROFILES: tuple[ExecutorProfile, ...] = (
     ExecutorProfile(
         key="real",
-        label="Real — full executor API (recommended)",
+        label="Real - full executor API (recommended)",
         executor_name="Real",
         version="1.0.0",
         markers=(
@@ -222,7 +222,7 @@ EXECUTOR_PROFILES: tuple[ExecutorProfile, ...] = (
     ),
     ExecutorProfile(
         key="universal",
-        label="Auto — all executors (recommended)",
+        label="Auto - all executors (recommended)",
         executor_name="Synapse X",
         version="3.0.0",
         markers=(
@@ -814,116 +814,142 @@ end
 -- Luau/Roblox compatibility: bit32, utf8 and the Luau additions to the
 -- standard library that loader stubs routinely call.
 if rawget(_G, 'bit32') == nil then
-  local function __protez_to_unsigned(value)
-    value = value % 4294967296
+  local function __protez_u32(value)
+    value = math.floor(tonumber(value) or 0) % 4294967296
     if value < 0 then value = value + 4294967296 end
-    return math.floor(value)
+    return value
   end
-  local function __protez_to_signed(value)
-    value = __protez_to_unsigned(value)
+  local function __protez_s32(value)
+    value = __protez_u32(value)
     if value >= 2147483648 then value = value - 4294967296 end
     return value
   end
   local function __protez_bitop(left, right, mode)
-    local a = __protez_to_unsigned(left)
-    local b = __protez_to_unsigned(right)
-    local out = 0
-    local bit = 1
-    while a > 0 or b > 0 do
+    local a, b = __protez_u32(left), __protez_u32(right)
+    local out, place = 0, 1
+    for _ = 1, 32 do
       local abit = a % 2
       local bbit = b % 2
       local keep
       if mode == 'and' then keep = (abit == 1 and bbit == 1)
       elseif mode == 'or' then keep = (abit == 1 or bbit == 1)
       else keep = (abit ~= bbit) end
-      if keep then out = out + bit end
-      a = math.floor(a / 2)
-      b = math.floor(b / 2)
-      bit = bit * 2
+      if keep then out = out + place end
+      place = place * 2
+      a = (a - abit) / 2
+      b = (b - bbit) / 2
     end
     return out
   end
-  local bit32_table = {}
-  bit32_table.band = function(...)
-    local arguments = { ... }
-    local result = __protez_to_unsigned(arguments[1] or 0)
-    for index = 2, #arguments do result = __protez_bitop(result, arguments[index], 'and') end
-    return __protez_to_signed(result)
-  end
-  bit32_table.bor = function(...)
-    local arguments = { ... }
-    local result = __protez_to_unsigned(arguments[1] or 0)
-    for index = 2, #arguments do result = __protez_bitop(result, arguments[index], 'or') end
-    return __protez_to_signed(result)
-  end
-  bit32_table.bxor = function(...)
-    local arguments = { ... }
-    local result = __protez_to_unsigned(arguments[1] or 0)
-    for index = 2, #arguments do result = __protez_bitop(result, arguments[index], 'xor') end
-    return __protez_to_signed(result)
-  end
-  bit32_table.bnot = function(value) return __protez_to_signed(4294967295 - __protez_to_unsigned(value)) end
-  bit32_table.btest = function(...)
-    local arguments = { ... }
-    local result = __protez_to_unsigned(arguments[1] or 0)
-    for index = 2, #arguments do result = __protez_bitop(result, arguments[index], 'and') end
-    return result ~= 0
-  end
-  bit32_table.lshift = function(value, count)
-    count = __protez_to_unsigned(count) % 32
-    return __protez_to_signed(__protez_to_unsigned(value) * (2 ^ count))
-  end
-  bit32_table.rshift = function(value, count)
-    count = __protez_to_unsigned(count) % 32
-    return __protez_to_signed(math.floor(__protez_to_unsigned(value) / (2 ^ count)))
-  end
-  bit32_table.arshift = function(value, count)
-    count = __protez_to_unsigned(count) % 32
-    local unsigned = __protez_to_unsigned(value)
-    if unsigned >= 2147483648 then
-      return __protez_to_signed(math.floor((unsigned - 4294967296) / (2 ^ count)))
+  local function __protez_fold(mode, ...)
+    local count = select('#', ...)
+    local result = __protez_u32((select(1, ...)) or 0)
+    for index = 2, count do
+      result = __protez_bitop(result, select(index, ...), mode)
     end
-    return __protez_to_signed(math.floor(unsigned / (2 ^ count)))
+    return result
   end
-  bit32_table.rol = function(value, count)
-    count = __protez_to_unsigned(count) % 32
-    local unsigned = __protez_to_unsigned(value)
-    if count == 0 then return __protez_to_signed(unsigned) end
-    return __protez_to_signed((unsigned * (2 ^ count)) % 4294967296 + math.floor(unsigned / (2 ^ (32 - count))))
+  -- Roblox/Luau `bit32` works on unsigned 32-bit values: bit32.bnot(0) is
+  -- 4294967295 and bit32.band(-1, -1) is 4294967295, not -1.  Returning signed
+  -- values here made obfuscator decoders compute negative indices, so their
+  -- payload tables came back nil and the VM died with "arithmetic on a nil
+  -- value".  The legacy `bit` library keeps the same results reinterpreted as
+  -- signed 32-bit numbers, which is what old clients returned.
+  local bit32_table = {}
+  bit32_table.band = function(...) return __protez_fold('and', ...) end
+  bit32_table.bor = function(...) return __protez_fold('or', ...) end
+  bit32_table.bxor = function(...) return __protez_fold('xor', ...) end
+  bit32_table.bnot = function(value) return 4294967295 - __protez_u32(value) end
+  bit32_table.btest = function(...) return __protez_fold('and', ...) ~= 0 end
+  bit32_table.lshift = function(value, displacement)
+    displacement = math.floor(tonumber(displacement) or 0)
+    if displacement < 0 then return bit32_table.rshift(value, -displacement) end
+    if displacement >= 32 then return 0 end
+    return (__protez_u32(value) * 2 ^ displacement) % 4294967296
   end
-  bit32_table.ror = function(value, count)
-    count = __protez_to_unsigned(count) % 32
-    local unsigned = __protez_to_unsigned(value)
-    if count == 0 then return __protez_to_signed(unsigned) end
-    return __protez_to_signed(math.floor(unsigned / (2 ^ count)) + (unsigned * (2 ^ (32 - count))) % 4294967296)
+  bit32_table.rshift = function(value, displacement)
+    displacement = math.floor(tonumber(displacement) or 0)
+    if displacement < 0 then return bit32_table.lshift(value, -displacement) end
+    if displacement >= 32 then return 0 end
+    return math.floor(__protez_u32(value) / 2 ^ displacement)
+  end
+  bit32_table.arshift = function(value, displacement)
+    displacement = math.floor(tonumber(displacement) or 0)
+    if displacement < 0 then return bit32_table.lshift(value, -displacement) end
+    if displacement >= 32 then
+      if __protez_u32(value) >= 2147483648 then return 4294967295 end
+      return 0
+    end
+    local shifted = math.floor(__protez_s32(value) / 2 ^ displacement)
+    if shifted < 0 then return 4294967296 + shifted end
+    return shifted
+  end
+  local function __protez_rotate(value, displacement, leftward)
+    displacement = math.floor(tonumber(displacement) or 0) % 32
+    if displacement < 0 then displacement = displacement + 32 end
+    if displacement == 0 then return __protez_u32(value) end
+    local unsigned = __protez_u32(value)
+    if leftward then
+      return (unsigned * 2 ^ displacement) % 4294967296
+        + math.floor(unsigned / 2 ^ (32 - displacement))
+    end
+    return math.floor(unsigned / 2 ^ displacement)
+      + (unsigned * 2 ^ (32 - displacement)) % 4294967296
+  end
+  bit32_table.lrotate = function(value, displacement)
+    return __protez_rotate(value, displacement, true)
+  end
+  bit32_table.rrotate = function(value, displacement)
+    return __protez_rotate(value, displacement, false)
+  end
+  bit32_table.rotate = function(value, displacement)
+    if (tonumber(displacement) or 0) < 0 then
+      return __protez_rotate(value, -displacement, false)
+    end
+    return __protez_rotate(value, displacement, true)
   end
   bit32_table.extract = function(value, field, width)
-    width = width or 1
-    local mask = 2 ^ width - 1
-    return math.floor(__protez_to_unsigned(value) / (2 ^ field)) % (mask + 1)
+    width = math.floor(tonumber(width) or 1)
+    field = math.floor(tonumber(field) or 0)
+    return math.floor(__protez_u32(value) / 2 ^ field) % (2 ^ width)
   end
-  bit32_table.replace = function(value, field, width, replacement)
-    width = width or 1
-    local unsigned = __protez_to_unsigned(value)
-    local base = unsigned - (unsigned % (2 ^ field))
-    return __protez_to_signed(base + (replacement % (2 ^ width)) * (2 ^ field) + unsigned % (2 ^ field))
+  -- Lua/Luau signature is replace(n, v, field, width): the replacement comes
+  -- second, not last.
+  bit32_table.replace = function(value, replacement, field, width)
+    width = math.floor(tonumber(width) or 1)
+    field = math.floor(tonumber(field) or 0)
+    local unsigned = __protez_u32(value)
+    -- Clear the whole field first: keeping the field's high part in the base
+    -- and adding the replacement on top of it produced 68095 instead of 64255.
+    local low = unsigned % 2 ^ field
+    local high = unsigned - (unsigned % 2 ^ (field + width))
+    local inserted = (__protez_u32(replacement) % 2 ^ width) * 2 ^ field
+    return (high + inserted + low) % 4294967296
   end
   bit32_table.countlz = function(value)
-    local unsigned = __protez_to_unsigned(value)
+    local unsigned = __protez_u32(value)
     for index = 0, 31 do
-      if math.floor(unsigned / (2 ^ (31 - index))) % 2 == 1 then return index end
+      if math.floor(unsigned / 2 ^ (31 - index)) % 2 == 1 then return index end
     end
     return 32
   end
   bit32_table.countrz = function(value)
-    local unsigned = __protez_to_unsigned(value)
+    local unsigned = __protez_u32(value)
     for index = 0, 31 do
-      if math.floor(unsigned / (2 ^ index)) % 2 == 1 then return index end
+      if math.floor(unsigned / 2 ^ index) % 2 == 1 then return index end
     end
     return 32
   end
   rawset(_G, 'bit32', bit32_table)
-  rawset(_G, 'bit', bit32_table)
+  local bit_table = {}
+  for name, fn in pairs(bit32_table) do
+    if name == 'btest' then
+      bit_table[name] = fn
+    else
+      bit_table[name] = function(...) return __protez_s32(fn(...)) end
+    end
+  end
+  rawset(_G, 'bit', bit_table)
 end
 if rawget(_G, 'utf8') == nil then
   rawset(_G, 'utf8', {
@@ -945,6 +971,94 @@ if rawget(_G, 'utf8') == nil then
     codepoint = function(value, index) return value:byte(index or 1) end,
     offset = function(value, count) return (count or 1) + 1 end,
   })
+end
+-- Luau's `buffer` library.  Obfuscators build their payloads inside buffers
+-- (Luraph v15 writes a whole bytecode chunk with buffer.writeu8), so a backend
+-- without it stops at the very first write; the v15 fixture died on
+-- "attempt to index global 'buffer'".  The values are Lua tables; reads and
+-- writes go through string.pack/unpack, which the portable backend provides.
+if rawget(_G, 'buffer') == nil and string.pack ~= nil and string.unpack ~= nil then
+  local pack, unpack = string.pack, string.unpack
+  local character, repeat_string = string.char, string.rep
+  local format_sizes = {
+    ['i8'] = 'b', ['u8'] = 'B', ['i16'] = 'h', ['u16'] = 'H',
+    ['i32'] = 'i4', ['u32'] = 'I4', ['f32'] = 'f', ['f64'] = 'd',
+  }
+  local format_bytes = { b = 1, B = 1, h = 2, H = 2, i4 = 4, I4 = 4, f = 4, d = 8 }
+
+  local function is_buffer(value)
+    return type(value) == 'table' and type(value.size) == 'number' and type(value.data) == 'string'
+  end
+  local function check(value, offset, count)
+    if not is_buffer(value) then error('buffer expected', 3) end
+    if type(offset) ~= 'number' or type(count) ~= 'number' then error('number expected', 3) end
+    if offset < 0 or count < 0 or offset + count > value.size then
+      error('buffer access out of bounds', 3)
+    end
+  end
+  local function new(size)
+    return { data = repeat_string('\0', size), size = size }
+  end
+
+  local buffer_table = {}
+  buffer_table.create = function(size)
+    size = math.floor(tonumber(size) or 0)
+    if size < 0 then error('invalid buffer size', 2) end
+    return new(size)
+  end
+  buffer_table.fromstring = function(value)
+    if type(value) ~= 'string' then error('string expected', 2) end
+    return { data = value, size = #value }
+  end
+  buffer_table.tostring = function(value)
+    check(value, 0, 0)
+    return value.data
+  end
+  buffer_table.len = function(value)
+    check(value, 0, 0)
+    return value.size
+  end
+  local function splice(value, offset, payload)
+    value.data = string.sub(value.data, 1, offset)
+      .. payload
+      .. string.sub(value.data, offset + #payload + 1)
+  end
+  buffer_table.copy = function(target, target_offset, source, source_offset, count)
+    target_offset = target_offset or 0
+    source_offset = source_offset or 0
+    count = count or (source.size - source_offset)
+    check(target, target_offset, count)
+    check(source, source_offset, count)
+    splice(target, target_offset, string.sub(source.data, source_offset + 1, source_offset + count))
+  end
+  buffer_table.fill = function(value, offset, byte, count)
+    check(value, offset, count or (value.size - offset))
+    if type(byte) ~= 'number' then error('number expected', 2) end
+    splice(value, offset, repeat_string(character(byte % 256), count or (value.size - offset)))
+  end
+  for name, format in pairs(format_sizes) do
+    local width = format_bytes[format]
+    buffer_table['read' .. name] = function(value, offset)
+      check(value, offset, width)
+      return (unpack('<' .. format, value.data, offset + 1))
+    end
+    buffer_table['write' .. name] = function(value, offset, number)
+      check(value, offset, width)
+      splice(value, offset, pack('<' .. format, number))
+    end
+  end
+  buffer_table.readstring = function(value, offset, count)
+    check(value, offset, count)
+    return string.sub(value.data, offset + 1, offset + count)
+  end
+  buffer_table.writestring = function(value, offset, text, count)
+    if type(text) ~= 'string' then error('string expected', 2) end
+    count = count or #text
+    check(value, offset, count)
+    if #text < count then text = text .. repeat_string('\0', count - #text) end
+    splice(value, offset, string.sub(text, 1, count))
+  end
+  rawset(_G, 'buffer', buffer_table)
 end
 if type(table.create) ~= 'function' then
   rawset(table, 'create', function(count, value)
@@ -1022,17 +1136,25 @@ local __protez_real_setfenv = rawget(_G, 'setfenv')
 local __protez_real_getfenv = rawget(_G, 'getfenv')
 if type(__protez_real_setfenv) == 'function' and rawget(_G, '__PROTEZ_SETFENV_WRAPPED') == nil then
   rawset(_G, '__PROTEZ_SETFENV_WRAPPED', true)
-  local __protez_stub_table = rawget(_G, '__protez_globals_table') or {}
+  local __protez_surface = rawget(_G, '__protez_globals_table') or {}
   rawset(_G, 'setfenv', function(target, environment)
     if type(environment) == 'table' and rawequal(environment, _G) == false then
-      local wrapper = setmetatable(environment, {
-        __index = function(_, key)
-          local value = __protez_stub_table[key]
+      local previous = getmetatable(environment)
+      local previous_index = type(previous) == 'table' and rawget(previous, '__index') or nil
+      local previous_newindex = type(previous) == 'table' and rawget(previous, '__newindex') or nil
+      -- A function metamethod cannot take part in Lua's metatable loop, so
+      -- this lookup always terminates.
+      setmetatable(environment, {
+        __index = function(self, key)
+          local value = __protez_surface[key]
           if value ~= nil then return value end
-          return _G[key]
+          if type(previous_index) == 'function' then return previous_index(self, key) end
+          if type(previous_index) == 'table' then return previous_index[key] end
+          return rawget(_G, key)
         end,
+        __newindex = previous_newindex,
       })
-      return __protez_real_setfenv(target, wrapper)
+      return __protez_real_setfenv(target, environment)
     end
     return __protez_real_setfenv(target, environment)
   end)
@@ -1040,8 +1162,21 @@ end
 if type(__protez_real_getfenv) == 'function' then
   rawset(_G, 'getfenv', function(target)
     local environment = __protez_real_getfenv(target)
-    if type(environment) == 'table' then
-      return setmetatable(environment, { __index = rawget(_G, '__protez_globals_table') })
+    if type(environment) ~= 'table' then return environment end
+    -- The real environment already carries every global and every executor
+    -- function; returning it unchanged is what a Roblox executor does.  The
+    -- previous version wrapped it, which put a metatable on _G itself and made
+    -- every later miss walk _G -> surface -> _G until Lua gave up.
+    if rawequal(environment, _G) then return environment end
+    local meta = getmetatable(environment)
+    if meta == nil then
+      setmetatable(environment, {
+        __index = function(_, key)
+          local value = __protez_surface[key]
+          if value ~= nil then return value end
+          return rawget(_G, key)
+        end,
+      })
     end
     return environment
   end)
@@ -1352,6 +1487,162 @@ if rawget(_G, 'UDim2') == nil then
 end
 if rawget(_G, 'UDim') == nil then
   rawset(_G, 'UDim', { new = function(...) return { __protez_type = 'UDim' } end })
+end
+-- Luau's `vector` library.  Luraph v15 builds vectors out of its constants
+-- (`vector.create`), so a backend without it stops at the first component.
+if rawget(_G, 'vector') == nil then
+  local vector_mt
+  local function component(value, index)
+    if type(value) == 'number' then return value end
+    if type(value) ~= 'table' then error('vector or number expected', 3) end
+    if index == 1 then return value.x or value.X or value[1] or 0 end
+    if index == 2 then return value.y or value.Y or value[2] or 0 end
+    return value.z or value.Z or value[3] or 0
+  end
+  local function make(x, y, z)
+    return setmetatable({ x = x, y = y, z = z, X = x, Y = y, Z = z }, vector_mt)
+  end
+  vector_mt = {
+    __index = function(self, key)
+      if key == 'Magnitude' or key == 'magnitude' then
+        return math.sqrt(self.x * self.x + self.y * self.y + self.z * self.z)
+      end
+      if key == 'Unit' or key == 'unit' then
+        local length = math.sqrt(self.x * self.x + self.y * self.y + self.z * self.z)
+        if length == 0 then return make(0, 0, 0) end
+        return make(self.x / length, self.y / length, self.z / length)
+      end
+      return nil
+    end,
+    __add = function(a, b) return make(component(a, 1) + component(b, 1), component(a, 2) + component(b, 2), component(a, 3) + component(b, 3)) end,
+    __sub = function(a, b) return make(component(a, 1) - component(b, 1), component(a, 2) - component(b, 2), component(a, 3) - component(b, 3)) end,
+    __mul = function(a, b) return make(component(a, 1) * component(b, 1), component(a, 2) * component(b, 2), component(a, 3) * component(b, 3)) end,
+    __div = function(a, b)
+      local bx, by, bz = component(b, 1), component(b, 2), component(b, 3)
+      return make(component(a, 1) / bx, component(a, 2) / by, component(a, 3) / bz)
+    end,
+    __unm = function(a) return make(-component(a, 1), -component(a, 2), -component(a, 3)) end,
+    __eq = function(a, b)
+      return component(a, 1) == component(b, 1) and component(a, 2) == component(b, 2)
+        and component(a, 3) == component(b, 3)
+    end,
+    __tostring = function(self) return self.x .. ', ' .. self.y .. ', ' .. self.z end,
+  }
+  local vector_table = {}
+  vector_table.create = function(x, y, z) return make(x or 0, y or 0, z or 0) end
+  vector_table.zero = make(0, 0, 0)
+  vector_table.one = make(1, 1, 1)
+  vector_table.magnitude = function(value)
+    return math.sqrt(component(value, 1) ^ 2 + component(value, 2) ^ 2 + component(value, 3) ^ 2)
+  end
+  vector_table.normalize = function(value)
+    local length = vector_table.magnitude(value)
+    if length == 0 then return make(0, 0, 0) end
+    return make(component(value, 1) / length, component(value, 2) / length, component(value, 3) / length)
+  end
+  vector_table.dot = function(a, b)
+    return component(a, 1) * component(b, 1) + component(a, 2) * component(b, 2) + component(a, 3) * component(b, 3)
+  end
+  vector_table.cross = function(a, b)
+    local ax, ay, az = component(a, 1), component(a, 2), component(a, 3)
+    local bx, by, bz = component(b, 1), component(b, 2), component(b, 3)
+    return make(ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx)
+  end
+  vector_table.angle = function(a, b, axis)
+    local denominator = vector_table.magnitude(a) * vector_table.magnitude(b)
+    if denominator == 0 then return 0 end
+    local cosine = vector_table.dot(a, b) / denominator
+    if cosine > 1 then cosine = 1 elseif cosine < -1 then cosine = -1 end
+    return math.acos(cosine)
+  end
+  local function unary(value, operation)
+    return make(operation(component(value, 1)), operation(component(value, 2)), operation(component(value, 3)))
+  end
+  vector_table.floor = function(value) return unary(value, math.floor) end
+  vector_table.ceil = function(value) return unary(value, math.ceil) end
+  vector_table.abs = function(value) return unary(value, math.abs) end
+  vector_table.sign = function(value)
+    return unary(value, function(number)
+      if number > 0 then return 1 end
+      if number < 0 then return -1 end
+      return 0
+    end)
+  end
+  vector_table.clamp = function(value, minimum, maximum)
+    return make(
+      math.max(component(minimum, 1), math.min(component(maximum, 1), component(value, 1))),
+      math.max(component(minimum, 2), math.min(component(maximum, 2), component(value, 2))),
+      math.max(component(minimum, 3), math.min(component(maximum, 3), component(value, 3)))
+    )
+  end
+  vector_table.max = function(...)
+    local result = { math.huge, math.huge, math.huge }
+    for index = 1, select('#', ...) do
+      local value = select(index, ...)
+      for axis = 1, 3 do
+        result[axis] = math.max(result[axis], component(value, axis))
+      end
+    end
+    return make(result[1], result[2], result[3])
+  end
+  vector_table.min = function(...)
+    local result = { -math.huge, -math.huge, -math.huge }
+    for index = 1, select('#', ...) do
+      local value = select(index, ...)
+      for axis = 1, 3 do
+        result[axis] = math.min(result[axis], component(value, axis))
+      end
+    end
+    return make(result[1], result[2], result[3])
+  end
+  rawset(_G, 'vector', vector_table)
+end
+-- Remaining Luau standard-library gaps loaders probe for.
+if type(table.move) ~= 'function' then
+  rawset(table, 'move', function(source, first, last, target, destination)
+    local out = destination or source
+    if source == out and target > first and target <= last then
+      for offset = last - first, 0, -1 do out[target + offset] = source[first + offset] end
+    else
+      for offset = 0, last - first do out[target + offset] = source[first + offset] end
+    end
+    return out
+  end)
+end
+if type(table.clone) ~= 'function' then
+  rawset(table, 'clone', function(source)
+    local out = {}
+    for key, value in pairs(source) do out[key] = value end
+    return out
+  end)
+end
+if type(math.noise) ~= 'function' then
+  rawset(math, 'noise', function(x, y, z)
+    local total = (x or 0) * 12.9898 + (y or 0) * 78.233 + (z or 0) * 37.719
+    local fract = total - math.floor(total)
+    return fract * 2 - 1
+  end)
+end
+if type(bit32.byteswap) ~= 'function' then
+  rawset(bit32, 'byteswap', function(value)
+    value = value % 4294967296
+    if value < 0 then value = value + 4294967296 end
+    local first = value % 256
+    local second = math.floor(value / 256) % 256
+    local third = math.floor(value / 65536) % 256
+    local fourth = math.floor(value / 16777216) % 256
+    return ((first * 256 + second) * 256 + third) * 256 + fourth
+  end)
+end
+if type(coroutine.close) ~= 'function' then
+  rawset(coroutine, 'close', function(thread) return true end)
+end
+if type(utf8.charpattern) ~= 'string' then
+  rawset(utf8, 'charpattern', '[\\0-\\127\\194-\\244][\\128-\\191]*')
+end
+if rawset ~= nil and rawget(_G, 'utf8') ~= nil and type(utf8.nfcnormalize) ~= 'function' then
+  rawset(utf8, 'nfcnormalize', function(value) return value end)
+  rawset(utf8, 'nfdnormalize', function(value) return value end)
 end
 if rawget(_G, 'Vector2') == nil then
   rawset(_G, 'Vector2', { new = function(x, y) return { X = x or 0, Y = y or 0, __protez_type = 'Vector2' } end, zero = { X = 0, Y = 0 } })

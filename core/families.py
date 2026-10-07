@@ -79,12 +79,28 @@ class FamilyOutcome:
 
 
 class FamilyHandler:
-    """Base class: a family knows how to recognise and how to approach itself."""
+    """Base class: a family knows how to recognise and how to approach itself.
+
+    Two kinds of name markers exist because the two are not equally reliable:
+
+    * ``markers`` are searched across the whole file.  They are only used for
+      tokens an obfuscator's *code* carries and other families' pools do not
+      (``LPH``, ``syn.protect``, ...).
+    * ``banner_markers`` are searched only in the preamble
+      (``banner_window`` characters).  A family's own name is a banner: every
+      obfuscator puts it at the top, while an *obfuscated* payload's string
+      pool is full of other obfuscators' names (PSU, MoonSec and Wynfuscate
+      loaders all carry an ``IB2``/``IB3`` detection list), so a whole-file
+      search for ``IronBrew`` used to outrank the real banner and route the
+      sample to the wrong devirtualizer.
+    """
 
     key = "generic"
     display_name = "Unknown obfuscator"
     version: str | None = None
     markers: tuple[str, ...] = ()
+    banner_markers: tuple[str, ...] = ()
+    banner_window: int = 512
     structural: tuple[str, ...] = ()
     version_pattern: str | None = None
     marker_threshold: float = 0.85
@@ -94,7 +110,11 @@ class FamilyHandler:
 
     def evidence(self, source: str) -> tuple[str, ...]:
         lowered = source.lower()
-        return tuple(marker for marker in self.markers if marker.lower() in lowered)
+        found = [marker for marker in self.markers if marker.lower() in lowered]
+        if self.banner_markers:
+            head = lowered[: self.banner_window]
+            found += [marker for marker in self.banner_markers if marker.lower() in head]
+        return tuple(found)
 
     def structural_evidence(self, source: str) -> tuple[str, ...]:
         found: list[str] = []
@@ -299,6 +319,11 @@ def _decode_escape_runs(text: str, *, limit: int = 256) -> list[bytes]:
     return decoded
 
 
+# A blob made only of these characters carries no Lua structure: it is
+# encoded data that survived a decode step, not a recovered script.
+_DATA_ALPHABET = re.compile(r"[A-Za-z0-9+/=\\s]+")
+
+
 def scan_embedded_source(data: str | bytes, *, minimum: int = 48) -> str | None:
     """Find Lua **source** hidden in escapes, hex/base64 or numeric arrays.
 
@@ -333,10 +358,19 @@ def scan_embedded_source(data: str | bytes, *, minimum: int = 48) -> str | None:
     if best is not None:
         return best
     # No Lua keyword found, but a decoded blob that is plain printable text and
-    # much larger than a single string is still a candidate worth reporting.
+    # much larger than a single string is still a candidate worth reporting --
+    # unless it is *data*: a blob made only of base64 characters (no whitespace,
+    # no punctuation a script needs) is an encoded payload, not source, and
+    # calling it recovered source would send an analyst chasing noise.  WRD and
+    # MoonSec wrappers decode to exactly that shape.
     if fallback is not None:
-        printable = sum(1 for character in fallback[:2000] if character.isprintable() or character in "\n\r\t")
-        if printable >= len(fallback[:2000]) * 0.95 and len(fallback.strip()) >= max(minimum, 96):
+        head = fallback[:2000]
+        printable = sum(1 for character in head if character.isprintable() or character in "\n\r\t")
+        structured = any(character.isspace() for character in head) and any(
+            character in ",()=;[]{}'\"\n" for character in head
+        )
+        if (printable >= len(head) * 0.95 and len(fallback.strip()) >= max(minimum, 96)
+                and structured and not _DATA_ALPHABET.fullmatch(head.strip())):
             return fallback
     return None
 
@@ -377,7 +411,8 @@ def _decode_text_layers(text: str) -> list[bytes]:
 class LuraphHandler(FamilyHandler):
     key = "luraph"
     display_name = "Luraph Obfuscator"
-    markers = ("Luraph", "LPH")
+    markers = ("LPH",)
+    banner_markers = ("Luraph",)
     version_pattern = r"luraph(?:\s+obfuscator)?\s+v?(\d+(?:\.\d+)*)"
 
     def confidence(self, source: str, profile: ProtectionProfile | None) -> float:
@@ -408,7 +443,7 @@ class LuraphHandler(FamilyHandler):
             method="bounded container extraction",
             notes=(
                 "Luraph stores a custom VM stream; Protez extracts containers and lifts "
-                "only the supported v15 layout",
+                "the supported v14.7-v14.9 and v15 layouts",
             ),
         )
 
@@ -416,7 +451,9 @@ class LuraphHandler(FamilyHandler):
 class MoonSecHandler(FamilyHandler):
     key = "moonsec"
     display_name = "MoonSec"
-    markers = ("MoonSec", "MoonSecV2", "MoonSecV3", "moonsec")
+    # "diu9u" is MoonSec V2's own signature: its wrapper banner is a rude
+    # ASCII comment that never spells the product name.
+    banner_markers = ("MoonSec", "MoonSecV2", "MoonSecV3", "moonsec", "diu9u")
     version_pattern = r"moonsec\s*v?(\d+(?:\.\d+)*)"
 
     def confidence(self, source: str, profile: ProtectionProfile | None) -> float:
@@ -453,7 +490,7 @@ class WeAreDevsHandler(FamilyHandler):
     key = "wearedevs"
     display_name = "WeAreDevs Obfuscator"
     version = "2.4"
-    markers = ("WeAreDevs", "wearedevs", "wad_obfuscator")
+    banner_markers = ("WeAreDevs", "wearedevs", "wad_obfuscator")
     version_pattern = r"wearedevs[^0-9]{0,12}v?(\d+(?:\.\d+)*)"
 
     def confidence(self, source: str, profile: ProtectionProfile | None) -> float:
@@ -496,7 +533,7 @@ class WeAreDevsHandler(FamilyHandler):
 class IronBrewHandler(FamilyHandler):
     key = "ironbrew"
     display_name = "IronBrew"
-    markers = ("IronBrew", "ironbrew", "IB2", "IB3")
+    banner_markers = ("IronBrew", "ironbrew", "IB2", "IB3")
     version_pattern = r"ironbrew[^0-9]{0,4}(\d+(?:\.\d+)*)"
 
     def confidence(self, source: str, profile: ProtectionProfile | None) -> float:
@@ -544,7 +581,7 @@ class PsuHandler(FamilyHandler):
     key = "psu"
     display_name = "PSU Obfuscator"
     version = "1.0"
-    markers = ("PSU", "psu_obfuscator", "PsuObf", "PSU Obfuscator")
+    banner_markers = ("PSU", "psu_obfuscator", "PsuObf", "PSU Obfuscator")
     version_pattern = r"psu(?:\s+obfuscator)?\s*v?(\d+(?:\.\d+)*)"
 
     def confidence(self, source: str, profile: ProtectionProfile | None) -> float:
@@ -557,7 +594,7 @@ class NexusHandler(FamilyHandler):
     key = "nexus"
     display_name = "Nexus Obfuscator"
     version = "2.0"
-    markers = (
+    banner_markers = (
         "Nexus Obfuscator",
         "nexus_obfuscator",
         "NexusObf",
@@ -574,7 +611,7 @@ class NexusHandler(FamilyHandler):
 class PrometheusHandler(FamilyHandler):
     key = "prometheus"
     display_name = "Prometheus"
-    markers = ("Prometheus", "prometheus", "levno-710")
+    banner_markers = ("Prometheus", "prometheus", "levno-710")
     structural = (r"\\27\\76\\117\\97", r"\\27Lua")
     version_pattern = r"prometheus\s*v?(\d+(?:\.\d+)*)"
 
@@ -583,7 +620,7 @@ class WynfuscateHandler(FamilyHandler):
     key = "wynfuscate"
     display_name = "Wynfuscate"
     version = "5"
-    markers = (
+    banner_markers = (
         "Wynfuscate",
         "wynfuscate",
         "Wynf",
@@ -598,28 +635,29 @@ class AztupHandler(FamilyHandler):
     key = "aztup"
     display_name = "AztupBrew"
     version = "2"
-    markers = ("AztupBrew", "aztupbrew", "Aztup Brew", "aztup")
+    banner_markers = ("AztupBrew", "aztupbrew", "Aztup Brew", "aztup")
     version_pattern = r"aztup(?:brew)?\s*v?(\d+(?:\.\d+)*)"
 
 
 class XenHandler(FamilyHandler):
     key = "xen"
     display_name = "Xen Obfuscator"
-    markers = ("Xen Obfuscator", "xen_obf", "obfuscated by xen")
+    banner_markers = ("Xen Obfuscator", "xen_obf", "obfuscated by xen")
     version_pattern = r"xen(?:\s+obfuscator)?\s*v?(\d+(?:\.\d+)*)"
 
 
 class SynapseHandler(FamilyHandler):
     key = "synapse-protected"
     display_name = "Synapse-protected payload"
-    markers = ("Synapse", "syn.protect", "synapse secure")
+    markers = ("syn.protect",)
+    banner_markers = ("Synapse", "synapse secure")
     structural = (r"syn\s*\.\s*protect(_gui)?",)
 
 
 class HyperionHandler(FamilyHandler):
     key = "hyperion"
     display_name = "Hyperion (Roblox client)"
-    markers = ("Hyperion", "Byfron", "hyperion-protected")
+    banner_markers = ("Hyperion", "Byfron", "hyperion-protected")
 
 
 class LuauVmHandler(FamilyHandler):

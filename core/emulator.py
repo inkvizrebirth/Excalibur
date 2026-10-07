@@ -24,6 +24,7 @@ capabilities are removed rather than confined:
 from __future__ import annotations
 
 import hashlib
+import os
 import logging
 import time
 import zlib
@@ -120,8 +121,34 @@ local function __protez_guard_record(kind, chunk, name)
     pcall(__protez_record, kind .. ':unreadable', '', tostring(name or '') .. ' (' .. size .. ' bytes)')
   end
 end
+local function __protez_normalise(chunk)
+  -- The payload may be Luau (numeric separators, type arrows, continue) while
+  -- the portable backend is Lua 5.1.  The host lowers it when it can; the
+  -- original chunk is what gets recorded, this is an execution-only copy.
+  local fn = rawget(_G, '__protez_normalise_luau')
+  if type(fn) ~= 'function' or type(chunk) ~= 'string' then return nil end
+  local ok, lowered = pcall(fn, chunk)
+  if ok and type(lowered) == 'string' and lowered ~= chunk then return lowered end
+  return nil
+end
+
+local function __protez_load_any(chunk, chunkname)
+  local fn, err = __protez_real_loadstring(chunk, chunkname)
+  if fn ~= nil then return fn, err end
+  local lowered = __protez_normalise(chunk)
+  if lowered then
+    local second, second_err = __protez_real_loadstring(lowered, chunkname)
+    if second ~= nil then
+      __protez_guard_record('luau-lowered', chunk, chunkname)
+      return second, second_err
+    end
+  end
+  return fn, err
+end
+
 local function __protez_safe_loadstring(chunk, chunkname)
   __protez_guard_record('loadstring', chunk, chunkname)
+  if type(chunk) == 'string' then return __protez_load_any(chunk, chunkname) end
   return __protez_real_loadstring(chunk, chunkname)
 end
 loadstring = __protez_safe_loadstring
@@ -130,7 +157,7 @@ load = function(chunk, chunkname, mode, environment)
   -- not, so route strings through loadstring and keep the capture.
   if type(chunk) == 'string' then
     __protez_guard_record('load', chunk, chunkname)
-    return __protez_real_loadstring(chunk, chunkname)
+    return __protez_load_any(chunk, chunkname)
   end
   return __protez_real_load(chunk, chunkname, mode, environment)
 end
@@ -371,6 +398,65 @@ class LuaEmulator:
         self._prelude = prelude if prelude is not None else build_lua_prelude(
             self.profile, roblox=roblox, script_key=script_key
         )
+
+    # ------------------------------------------------------------------
+    def _luau_ready(self, runtime: Any, source: str) -> tuple[str, tuple[str, ...]]:
+        """Return source the Lua 5.1 backend can actually compile.
+
+        Every obfuscator in the Luraph family emits Luau: numeric separators
+        (``0Xf5__e``), type arrows (``->``), ``continue``, compound assignment.
+        Lua 5.1 rejects all of it, so a wrapper that would run fine under an
+        executor failed here at the first line -- in the sweep this was the
+        whole Luraph v14.6/v15.0 fixture set.
+
+        The raw source is tried first (its layout is the one diagnostics should
+        quote); only when it does not compile is the Luau lowering applied, and
+        then only if the lowered source *does* compile.  Nothing is executed
+        twice: the probe is ``loadstring``, which never runs the chunk.
+        """
+        if not source.strip():
+            return source, ()
+        try:
+            from core.devirt.luau_normalize import luau_only_features, normalize_luau
+        except Exception as exc:  # noqa: BLE001 - normaliser is optional
+            self.logger.debug("Luau normaliser unavailable: %s", exc)
+            return source, ()
+
+        def compiles(text: str) -> bool:
+            try:
+                loader = runtime.eval("loadstring")
+                outcome = loader(text)
+            except Exception:  # noqa: BLE001 - a failed probe is just "no"
+                return False
+            # ``loadstring`` returns ``(nil, message)`` on a syntax error; the
+            # bridge hands that back as a tuple, so "not None" is not enough.
+            if isinstance(outcome, tuple):
+                return bool(outcome) and outcome[0] is not None
+            return outcome is not None
+
+        if compiles(source):
+            return source, ()
+        # The lowering is attempted whenever the raw source does not compile:
+        # the feature detector knows the common markers but not every construct
+        # (an if-expression, for one), and a missed marker would leave the run
+        # failing on a syntax error it could have handled.
+        features = luau_only_features(source)
+        try:
+            normalized = normalize_luau(source)
+        except Exception as exc:  # noqa: BLE001 - keep the original then
+            return source, (f"Luau syntax could not be lowered ({exc})",)
+        if normalized.source == source or not compiles(normalized.source):
+            if not features:
+                return source, ()
+            return source, (
+                "the loader uses Luau syntax the Lua 5.1 backend cannot compile: "
+                + ", ".join(features[:6]),
+            )
+        note = (
+            "Luau syntax lowered to plain Lua before the run: "
+            + ", ".join(normalized.applied or features[:6])
+        )
+        return normalized.source, (note,)
 
     # ------------------------------------------------------------------
     def run(self, source: str, *, depth: int = 0) -> EmulatorResult:
@@ -721,7 +807,12 @@ class LuaEmulator:
             return True
 
         try:
-            runtime = lua_module.LuaRuntime(unpack_returned_tuples=True)
+            # Lua strings are byte strings.  ``latin-1`` is the only codec that
+            # round-trips every byte, so a Roblox loader may hand the host raw
+            # binary (dumped chunks, packed tables) without failing the run.
+            runtime = lua_module.LuaRuntime(
+                unpack_returned_tuples=True, encoding="latin-1"
+            )
         except Exception as exc:  # noqa: BLE001
             return EmulatorResult(
                 status="unavailable", error=str(exc), profile=self.profile.key
@@ -744,16 +835,62 @@ class LuaEmulator:
         globals_table["__protez_decompile"] = decompile
         globals_table["__protez_input"] = input_event
 
+        def normalise_luau(chunk: Any) -> str | None:
+            """Lower Luau-only syntax in a captured payload, for ``loadstring``."""
+            try:
+                from core.devirt.luau_normalize import normalize_luau
+
+                lowered = normalize_luau(str(chunk)).source
+            except Exception as exc:  # noqa: BLE001 - a payload that cannot be
+                # lowered still gets recorded; it simply cannot be executed.
+                self.logger.debug("Luau lowering failed for a payload: %s", exc)
+                return None
+            return lowered if lowered != str(chunk) else None
+
+        globals_table["__protez_normalise_luau"] = normalise_luau
+        # Luau ships string.pack/unpack; Lua 5.1 does not, and Roblox loaders
+        # probe for them before they decode anything (IronBrew3 refuses to run).
+        try:
+            from core.luau_compat import install_string_pack
+
+            install_string_pack(runtime)
+        except Exception as exc:  # noqa: BLE001 - a missing gap must not fail the run
+            self.logger.debug("string.pack compat install failed: %s", exc)
+
         status = "completed"
         error: str | None = None
+        # The Luau check runs before the bootstrap replaces ``loadstring``: the
+        # probe compiles a copy of the whole script, and going through the
+        # instrumented loader would record that copy as a payload capture.
+        variant, luau_notes = self._luau_ready(runtime, source)
         try:
             runtime.execute((_SAFE_OS + "\n" + _LUA_BOOTSTRAP).encode("utf-8"))
             runtime.execute(VM_DUMP_LUA.encode("utf-8"))
             # The step budget is installed last so the bootstrap itself runs free.
             runtime.execute("debug.sethook()")
-            script = self._prelude + "\n" + source
-            runtime.execute(script.encode("utf-8", "replace"))
+            if os.environ.get("PROTEZ_EMU_DIAGNOSE"):
+                # A loader that dies on "arithmetic on a nil value" usually read
+                # a global this environment does not define.  Recording the
+                # misses turns that hunt into a list.
+                runtime.execute(
+                    b"local __protez_missing = {}\n"
+                    b"setmetatable(_G, { __index = function(_, key)\n"
+                    b"  if type(key) == 'string' then\n"
+                    b"    __protez_missing[key] = (__protez_missing[key] or 0) + 1\n"
+                    b"  end\n"
+                    b"  return nil\n"
+                    b"end })\n"
+                    b"rawset(_G, '__protez_missing', __protez_missing)"
+                )
+            script = self._prelude + "\n" + variant
+            # The bridge is latin-1, so the script must travel back as the very
+            # bytes the file had; ``utf-8`` would inflate every byte above 0x7f.
+            runtime.execute(script.encode("latin-1", "replace"))
         except Exception as exc:  # noqa: BLE001 - LuaError and Python errors alike
+            if os.environ.get("PROTEZ_EMU_TB"):
+                import traceback
+
+                traceback.print_exc()
             status = "limit" if state["stopped"] else "error"
             error = str(exc)
             if state["stopped"]:
@@ -778,6 +915,19 @@ class LuaEmulator:
 
         duration = time.monotonic() - started
         notes = [f"portable backend: {runtime_label}", f"executor profile: {self.profile.label}"]
+        if os.environ.get("PROTEZ_EMU_DIAGNOSE"):
+            try:
+                missing = runtime.eval("__protez_missing")
+                entries = [(str(key), int(value)) for key, value in (missing or {}).items()]
+            except Exception:  # noqa: BLE001 - diagnostics must never fail a run
+                entries = []
+            entries.sort(key=lambda item: (-item[1], item[0]))
+            if entries:
+                notes.append(
+                    "globals the loader read but the environment does not define: "
+                    + ", ".join(f"{name} ({count})" for name, count in entries[:12])
+                )
+        notes.extend(note for note in luau_notes if note not in notes)
         if state["fetches"]:
             notes.append(f"{len(state['fetches'])} HTTP request(s) issued by the loader")
         if state["writes"]:

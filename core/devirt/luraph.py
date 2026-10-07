@@ -3,8 +3,8 @@
 Luraph v14/v15 compresses the payload into a long-bracket stream, ships its own
 VM interpreter as a second stream, and interprets a private instruction format.
 ``core.luraph_static`` already unpacks the container; ``core.luraph_devirtualizer``
-lifts the v15 format with the vendored analyser when it is installed.  What this
-module adds is the middle ground: given the unpacked container it
+lifts the v14.7-v14.9 and v15 layouts with the vendored analyser when it is
+installed.  What this module adds is the middle ground: given the unpacked container it
 
 * lifts the payload when it is a Lua 5.1 chunk after all,
 * recovers source hidden in the decoded streams,

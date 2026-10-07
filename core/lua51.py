@@ -38,6 +38,13 @@ __all__ = [
 LUA51_SIGNATURE = b"\x1bLua"
 LUAU_SIGNATURE_PREFIXES = (b"\x01\x02\x03", b"RSB1", b"RSB2")
 
+#: Instructions one prototype may cost the structured walk before the lifter
+#: stops structuring and says so in the output.  An obfuscated jump table has
+#: overlapping branch layouts, and descending into them recursively used to
+#: blow up combinatorially: a 112-instruction prototype took minutes of CPU and
+#: looked like a hang.  The cap keeps lifting predictable.
+_WALK_STEP_BUDGET = 200_000
+
 
 class BytecodeError(ValueError):
     """The data is not a supported Lua 5.1 bytecode chunk."""
@@ -452,6 +459,14 @@ class _FunctionLifter:
         self.parameters = {index: f"p{index + 1}" for index in range(proto.num_params)}
         self.loops: dict[int, _LoopInfo] = {}
         self._active_loops: set[int] = set()
+        # A structured walk that re-enters the region it is already inside can
+        # never terminate: an overlapping branch layout (obfuscated jump table)
+        # makes ``_branch_layout`` produce ranges that nest back into the
+        # current one.  The set below remembers the active regions, and the
+        # step budget is the backstop for regions that are merely enormous.
+        self._active_ranges: set[tuple[int, int, int]] = set()
+        self.walk_budget = _WALK_STEP_BUDGET
+        self.budget_exhausted = False
         self._count_writes()
         self._find_loops()
 
@@ -738,8 +753,34 @@ class _FunctionLifter:
         return "\n".join(self.lines)
 
     def _walk(self, start: int, end: int, loop: _LoopInfo | None) -> None:
+        if not 0 <= start < end:
+            return
+        key = (start, end, loop.header if loop is not None else -1)
+        if key in self._active_ranges:
+            # The same region is already being lifted further up the stack: the
+            # jump table overlaps, so descending again would never terminate.
+            self._emit(f"-- region L{self.instructions[start].offset // 4}-"
+                       f"L{self.instructions[end - 1].offset // 4} is part of an "
+                       f"overlapping branch layout (not repeated)")
+            return
+        self._active_ranges.add(key)
+        try:
+            self._walk_region(start, end, loop)
+        finally:
+            self._active_ranges.discard(key)
+
+    def _walk_region(self, start: int, end: int, loop: _LoopInfo | None) -> None:
         index = start
         while 0 <= index < end:
+            self.walk_budget -= 1
+            if self.walk_budget <= 0:
+                if not self.budget_exhausted:
+                    self.budget_exhausted = True
+                    remaining = len(self.instructions) - index
+                    self._emit(f"-- lifting stopped at the step budget with "
+                               f"{remaining} instruction(s) of this prototype left: "
+                               f"the jump table is too irregular to structure")
+                return
             instruction = self.instructions[index]
             offset = instruction.offset
             name = instruction.name

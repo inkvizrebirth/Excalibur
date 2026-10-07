@@ -11,7 +11,9 @@ Luraph v14/v15          static container unpack, then VM introspection with
                         opcode names read from Luraph's own interpreter
 MoonSec V2/V3           bytecode-VM recovery (static container or runtime
                         table), plus the vendored v3 tool in the pipeline
-WeAreDevs v2.4          bytecode-VM recovery
+WeAreDevs v2.4 / WRD    static string-pool recovery (permuted-base64 pool,
+                        triple-reversal shuffle, alphabet map), then
+                        bytecode-VM recovery
 IronBrew 2/3            bytecode-VM recovery
 PSU v1.0                bytecode-VM recovery
 Nexus v2.0              concatenated-literal reassembly, then bytecode-VM
@@ -47,7 +49,10 @@ __all__ = [
 _STRATEGIES: dict[str, tuple[tuple[str, str], ...]] = {
     "luraph": (("core.devirt.luraph", "devirtualize"),),
     "moonsec": (("core.devirt.bytecode_vm", "devirtualize"),),
-    "wearedevs": (("core.devirt.bytecode_vm", "devirtualize"),),
+    "wearedevs": (
+        ("core.devirt.wrd", "devirtualize"),
+        ("core.devirt.bytecode_vm", "devirtualize"),
+    ),
     "ironbrew": (("core.devirt.bytecode_vm", "devirtualize"),),
     "psu": (("core.devirt.bytecode_vm", "devirtualize"),),
     "aztup": (("core.devirt.bytecode_vm", "devirtualize"),),
@@ -78,6 +83,7 @@ _FALLBACK = (
 _METHOD_NAMES = {
     "core.devirt.luraph": "Luraph container unpack + VM introspection",
     "core.devirt.bytecode_vm": "Lua 5.1 bytecode reconstruction",
+    "core.devirt.wrd": "WRD/WeAreDevs string-pool recovery",
     "core.devirt.nexus": "literal reassembly + bytecode reconstruction",
     "core.devirt.prometheus": "control-flow flattening removal",
     "core.devirt.table_vm": "custom VM introspection",

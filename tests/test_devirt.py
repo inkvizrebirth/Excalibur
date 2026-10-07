@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -33,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from core.devirt import available_families, devirtualize, report_table  # noqa: E402
-from core.devirt import bytecode_vm, nexus, prometheus, table_vm  # noqa: E402
+from core.devirt import bytecode_vm, nexus, prometheus, table_vm, wrd  # noqa: E402
 from core.devirt.common import (  # noqa: E402
     chunk_from_values,
     find_lua51_chunk,
@@ -161,6 +162,68 @@ class NexusTests(_PayloadAssertions, _ChunkFixture, unittest.TestCase):
         result = nexus.devirtualize(loader)
         self.assertIsNotNone(result)
         self.assertPseudocode(result["source"])
+
+
+class WrdTests(unittest.TestCase):
+    """WeAreDevs/WRD hides the program's string constants, not its bytecode."""
+
+    sample = (Path(__file__).resolve().parent.parent
+              / "samples" / "real" / "wearedevs" / "0122989.lua")
+
+    def test_a_permuted_pool_is_decoded_into_readable_constants(self) -> None:
+        if not self.sample.is_file():  # the sample set is optional in a trimmed checkout
+            self.skipTest("no WRD sample in this checkout")
+        result = wrd.devirtualize(self.sample.read_text(encoding="latin-1"))
+        self.assertIsNotNone(result)
+        self.assertEqual(result["method"], "WRD/WeAreDevs static string-pool recovery")
+        self.assertGreaterEqual(result["confidence"], 0.9)
+        # A string pool is not source: the method must not claim one.
+        self.assertIsNone(result["source"])
+        self.assertIsNone(result["bytecode"])
+        self.assertTrue(result["partial"])
+        listing = result["listing"]
+        for name in ("string", "table", "math", "unpack", "gmatch"):
+            with self.subTest(token=name):
+                self.assertIn(name, listing)
+
+    def test_a_script_without_a_pool_is_left_alone(self) -> None:
+        self.assertIsNone(wrd.devirtualize("local t = {'abc', 'def'}\nprint(t[1])"))
+        self.assertIsNone(wrd.devirtualize(""))
+
+
+class LifterTerminationTests(unittest.TestCase):
+    """A jump-table-heavy chunk must not make the structured walk explode.
+
+    The MoonSec v3 fixture builds an interpreter at runtime and dumps its
+    131 KB chunk through ``string.dump``.  Lifting that chunk used to spend
+    minutes inside mutually-overlapping branch layouts -- it looked exactly
+    like a hang -- so the walk now refuses to re-enter a region it is already
+    lifting and gives up at a step budget instead.
+    """
+
+    sample = (Path(__file__).resolve().parent.parent
+              / "samples" / "real" / "moonsec" / "v3-0009ced43441079e.lua")
+
+    def test_overlapping_branch_layouts_terminate(self) -> None:
+        if not HAVE_LUA:
+            self.skipTest("lupa is required for the portable backend")
+        if not self.sample.is_file():
+            self.skipTest("no MoonSec v3 sample in this checkout")
+        from core import lua51
+        from core.emulator import LuaEmulator
+
+        result = LuaEmulator(timeout_seconds=8.0).run(
+            self.sample.read_text(encoding="latin-1"))
+        capture = next((item for item in result.captures if item.kind == "bytecode"), None)
+        self.assertIsNotNone(capture, "the fixture should dump its chunk while it runs")
+        raw = capture.text.encode("latin-1")
+        self.assertTrue(raw.startswith(b"\x1bLua"))
+
+        started = time.monotonic()
+        pseudocode = lua51.decompile(raw)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 20.0, "the structured walk must stay bounded")
+        self.assertIn("Recovered from Lua 5.1 bytecode", pseudocode)
 
 
 class TableVmTests(unittest.TestCase):

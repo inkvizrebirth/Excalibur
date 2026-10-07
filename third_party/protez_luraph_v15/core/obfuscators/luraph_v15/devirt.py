@@ -1,22 +1,3 @@
-"""
-Luraph v15 devirtualizer (front end + driver): lifts the VM protos
-captured by the harness (*.protos.json) back into Luau with real control
-flow. The IR and the back end are shared (ir.py, backend.py).
-
-    python obfuscators/luraph_v15/devirt.py <src> <protos.json> [--all OUT | --raw KEY | --lift KEY | --op ...]
-
-How it works (no hardcoded opcode table; handlers are randomized per build):
-  * vmmap.maker_info finds each closure maker and its VM closure. The static
-    VM model (VMModel) knows the closure prologue, the dispatch loops by mode
-    value (`if k==93 then while true do ...`) and the return code after the
-    handler function.
-  * For every instruction, luasym.Interp runs one iteration of the real
-    dispatch loop: operand arrays and helpers are concrete (from the dump),
-    registers are symbolic. Instruction decoders (self-modifying handlers)
-    simply run and the instruction is dispatched again. Branches on symbolic
-    conditions fork the run; the paths become an IR tree per instruction.
-  * The instruction graph is then structured into Luau (structure.py).
-"""
 import json
 import os
 import re
@@ -25,25 +6,21 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(HERE))     # deobf/: the shared modules
+ROOT = os.path.dirname(os.path.dirname(HERE))     
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from obfuscators.luraph_v15 import vmmap  # noqa: E402
-import backend  # noqa: E402
-import luasym as S  # noqa: E402
-from luasym import (LTable, Builtin, LuaFunc, Buf, Unsupported, Expr, Const, Reg, Pseudo, Global,  # noqa: E402
+from obfuscators.luraph_v15 import vmmap  
+import backend  
+import luasym as S  
+from luasym import (LTable, Builtin, LuaFunc, Buf, Unsupported, Expr, Const, Reg, Pseudo, Global,  
                     Upval, Index, Bin, Un, IfExp, TempVal, Vararg, ClosureExpr, Multi, TempTail,
                     VarargTail, SymList, TailCount, RegFile, EnvTable, UpContainer, Scope,
                     BreakSig, ReturnSig, YieldSig, is_sym)
-from luasym import ContinueSig  # noqa: E402
-from ir import (IRStmt, Assign, CallStmt, SetList, GenIter, Outcome, Next, Ret, Crash, Node,  # noqa: E402,F401
+from luasym import ContinueSig  
+from ir import (IRStmt, Assign, CallStmt, SetList, GenIter, Outcome, Next, Ret, Crash, Node,  
                 ForPrep, Close, Opaque, Vec, Missing, fmt_expr, fmt_any, fmt_tail, fmt_multi, fmt_const,
                 fmt_stmt, fmt_node)
-
-
-# --------------------------------------------------------------------------
-# captured data
 
 class PatchLog(dict):
     """A patch dict that remembers the keys written since the last `take()`
@@ -65,29 +42,69 @@ class PatchLog(dict):
         d, self.dirty = self.dirty, set()
         return d
 
+def _load_json_loose(path):
+    """Load a harness dump and repair trailing commas emitted when a run was
+    cut off mid-dump. The repair is string-aware: commas inside JSON strings
+    are never touched; only a comma whose next non-space token is `}` or `]`
+    is dropped."""
+    import json as _json
+    with open(path, encoding="utf-8") as f:
+        raw = f.read()
+    try:
+        return _json.loads(raw)
+    except ValueError:
+        pass
+    out = []
+    in_str = esc = False
+    n = len(raw)
+    i = 0
+    while i < n:
+        ch = raw[i]
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+            out.append(ch)
+        elif ch == ',':
+            j = i + 1
+            while j < n and raw[j] in " \t\r\n":
+                j += 1
+            if j < n and raw[j] in "}]":
+                i += 1
+                continue
+            out.append(ch)
+        else:
+            out.append(ch)
+        i += 1
+    return _json.loads("".join(out))
+
 
 class Dump:
     def __init__(self, path):
-        with open(path, encoding="utf-8") as f:
-            d = json.load(f)
+        d = _load_json_loose(path)
         self.raw = d
         self.tables = {}
         self.lfs = {}
-        self.shared = {}        # lfid -> number: Luraph runtime closures the lifted code uses (SharedFn)
-        self.buf_loc = {}       # id(Buf) -> (Buf, table id, key): where the buffer is stored
+        self.shared = {}        
+        self.buf_loc = {}       
         self._load_tables(d["tables"])
-        # bytes the lifted string decryptors wrote into VM buffers (id(Buf), offset) -> byte;
-        # the runtime needs them to decode constants of code that never ran
+
         self.buf_patch = PatchLog()
         self.misses = {}
-        self.vm_names = {"e"}     # capture names of the VM object (set by Program)
-        # the same for shared tables (e.g. the string pool's offset table): (tid, key) -> value
+        self.vm_names = {"e"}     
+
         self.tab_patch = PatchLog()
         self.tid_of = {id(t): tid for tid, t in self.tables.items()}
         self.lazy = {int(tid) for tid, t in d["tables"].items() if t.get("mt")}
-        # lazy table -> its decoder (the shared __index metamethod): see same_operand
+
         self.decoder = {int(tid): json.dumps(t["mtf"]) for tid, t in d["tables"].items() if t.get("mtf")}
-        # constants decoded for a decrypted operand value: "seq,name,slot@value" -> value
+
         self.overrides = {path: self.val(v) for path, v in d.get("overrides", [])}
         self.pid_of_table = {int(k): v for k, v in d["pid_of_table"].items()}
         self.protos = {}
@@ -95,16 +112,15 @@ class Dump:
             self.protos[key] = {k: self.val(v) for k, v in cap.items()}
         self._paths = None
         self.late = self._lazy_late(d)
-        # built now: the lifter writes into dump tables later
+
         self._by_operand = self._operand_facts()
-        # live requests (deob.py HarnessServer.fetch): fetcher(paths, patches)
-        # -> JSON, answered in the harness session that produced this dump
+
         self.fetcher = None
         self.fetched = set()
         self._fetched_any = False
-        self.fetch_time = [0.0, 0.0, 0.0, 0]    # patches, round trip, in the harness, patch bytes sent
-        self.extra_patches = (PatchLog(), PatchLog())   # stable patches of protos walked earlier this round
-        self._sent = {}         # stable patch key -> value the harness session has applied
+        self.fetch_time = [0.0, 0.0, 0.0, 0]    
+        self.extra_patches = (PatchLog(), PatchLog())   
+        self._sent = {}         
 
     def _lazy_late(self, d):
         """Lazy constants decoded at run time from an instruction's decoded
@@ -149,13 +165,12 @@ class Dump:
             return None
         self.fetched.add(rq)
         t0 = time.time()
-        # the harness keeps what it got applied: only new or changed entries
+
         bw, tw = self._patch_delta()
         send = "+" + format_patches(bw, tw) if bw or tw else "="
         t1 = time.time()
         try:
-            # a new reader's first request: the answer repeats every table
-            # made since the dump (an earlier reader may have got them)
+
             first = not self._fetched_any
             self._fetched_any = True
             d = json.loads(self.fetcher([("*" if first else "") + rq], send))
@@ -164,12 +179,12 @@ class Dump:
             ft[1] += time.time() - t1
             ft[2] += d.get("t", 0)
             ft[3] += len(send)
-        except Exception as ex:  # noqa: BLE001
+        except Exception as ex:  
             print("[!] live constant request failed (%s): back to constant rounds" % str(ex)[:200],
                   file=sys.stderr)
             self.fetcher = None
             return None
-        # (answers repeat every table made since the dump: load the new ones)
+
         new = {tid: t for tid, t in (d.get("tables") or {}).items() if int(tid) not in self.tables}
         self._load_tables(new)
         for tid, t in new.items():
@@ -192,7 +207,7 @@ class Dump:
             if t is not None and op:
                 self._add_operand(self._by_operand, t.tid, op, val)
             elif t is not None:
-                # a plain slot: in the table, as a dump would have it
+
                 k = int(last) if re.fullmatch(r"-?\d+", last) else last.encode("latin-1")
                 t.h[S.norm_key(k)] = val
             if isinstance(val, LTable) and self._paths is not None and val.tid not in self._paths \
@@ -295,7 +310,7 @@ class Dump:
         if old is None:
             by[key] = (sig, v)
         elif old[0] != sig:
-            by[key] = (None, None)      # disagree: never reuse
+            by[key] = (None, None)      
 
     def paths(self):
         """Shortest path to every table from a captured proto: [seq, name, key, key, ...]."""
@@ -309,10 +324,9 @@ class Dump:
                 for nm, v in cap.items():
                     if isinstance(v, LTable) and v.tid not in paths:
                         paths[v.tid] = [seq, nm]
-                        if nm not in self.vm_names:   # the VM object: requests only, don't walk into it
+                        if nm not in self.vm_names:   
                             queue.append(v)
-            # tables that only exist as a decoded-on-request value (child protos
-            # of code that never ran): reached through that request's path
+
             for rq, v in self.overrides.items():
                 if isinstance(v, LTable) and v.tid not in paths and not rq.startswith("!"):
                     paths[v.tid] = rq.split(",")
@@ -358,15 +372,13 @@ class Dump:
         src = v.get("src") or ""
         return Opaque(v.get("u"), bytes.fromhex(src).decode("utf-8", "replace") if src else "")
 
-
 class OpaqueFn:
     """A Lua function value from the dump; bound to its AST later if known."""
 
     def __init__(self, lfid):
         self.lfid = lfid
         self.node = None
-        self.pf_tid = None      # a VM closure: table id of its proto
-
+        self.pf_tid = None      
 
 class FrameArg(Global):
     """The caller's register frame passed as a call argument (a register
@@ -378,11 +390,9 @@ class FrameArg(Global):
         Global.__init__(self, "nil --[[ the caller's registers ]]")
         self.reg = reg
 
-
 class RuntimeMaker:
     """The closure maker looked up for a proto that exists only at runtime
     (ProtoLifter.index): calling it gives that value itself."""
-
 
 class SharedFn(Global):
     """A VM closure the payload gets from the VM object (`R[a] = vmobj[k]`).
@@ -394,7 +404,6 @@ class SharedFn(Global):
     def __init__(self, fn, n):
         Global.__init__(self, "luraph_runtime%d" % n)
         self.fn = fn
-
 
 class PlainProto:
     """A plain Lua function (e.g. preserved source) that captures outer locals."""
@@ -424,22 +433,20 @@ class PlainProto:
             text = text[:start] + " " + rep + " " + text[end:]
         return text
 
-
-# --------------------------------------------------------------------------
-# static model of one VM (one closure maker)
-
 def iter_nodes(n):
-    """Every dict node under n, pre-order (iterative: the AST is deep)."""
     stack = [n]
-    pop, push = stack.pop, stack.extend
+    pop = stack.pop
     while stack:
-        n = pop()
-        if type(n) is dict:
-            yield n
-            push(reversed([v for v in n.values() if type(v) is dict or type(v) is list]))
-        elif type(n) is list:
-            push(reversed(n))
-
+        curr = pop()
+        if type(curr) is dict:
+            yield curr
+            for v in reversed(curr.values()):
+                t = type(v)
+                if t is dict or t is list:
+                    stack.append(v)
+        elif type(curr) is list:
+            for v in reversed(curr):
+                stack.append(v)
 
 class VMModel:
     def __init__(self, info, dispatch_nodes, ctor_funcs):
@@ -452,7 +459,7 @@ class VMModel:
         for k, nm in vmmap._decls_in(self.maker).items():
             self.maker_decls.setdefault(nm, []).append(k)
         body = self.vm["body"]["body"]
-        # prologue ... local V,c,I,j,J = T(function(...) <loops> end, ...) ; post
+
         self.tcall_idx = None
         for i, st in enumerate(body):
             if st["type"] == "AstStatLocal" and len(st["values"]) == 1 \
@@ -463,13 +470,13 @@ class VMModel:
                     self.tcall_idx = i
                     break
         if self.tcall_idx is not None:
-            # handlers run inside a protected call; the code after it returns
+
             self.prologue = body[:self.tcall_idx]
             self.tstat = body[self.tcall_idx]
             self.post = body[self.tcall_idx + 1:]
             self.inner = self.tstat["values"][0]["args"][0]
         else:
-            # the loops sit directly in the VM closure; handlers return directly
+
             self.prologue = []
             self.tstat = None
             self.post = None
@@ -484,63 +491,61 @@ class VMModel:
         self.special = {}
         self.kstack_key = None
         self.kstack_link = None
-        # the link may go through a copy: `ad=K; K={[7]=ad,...}`
+
         alias = {}
-        for n in iter_nodes(self.inner):
-            if n.get("type") in ("AstStatAssign", "AstStatLocal"):
-                for var, val in zip(n["vars"], n["values"]):
-                    loc = var["location"] if n["type"] == "AstStatLocal" else \
-                        var["local"]["location"] if var["type"] == "AstExprLocal" else None
-                    if loc and val["type"] == "AstExprLocal":
-                        alias.setdefault(loc, set()).add(val["local"]["location"])
-        for n in iter_nodes(self.inner):
-            if n.get("type") != "AstStatAssign":
-                continue
-            for var, val in zip(n["vars"], n["values"]):
-                if var["type"] != "AstExprLocal" or val["type"] != "AstExprTable":
-                    continue
-                me = var["local"]["location"]
-                if me not in vm_decls:
-                    continue
-                link = None
-                saved = []
-                for it in val["items"]:
-                    v = it["value"]
-                    if v["type"] == "AstExprLocal" and it["kind"] == "general" and \
-                            (v["local"]["location"] == me or alias.get(v["local"]["location"]) == {me}):
-                        link = it["key"]["value"]
-                    elif v["type"] == "AstExprLocal":
-                        saved.append(v["local"])
-                if link is not None:
-                    self.kstack_key = me
-                    self.kstack_link = S.fix_int(link)
-                    for loc in saved:
-                        self.special[loc["location"]] = ("pseudo", loc["name"])
-        # open upvalues: `local q = N; if q then for f in next, q, nil do`
-        iterated = set()        # locals iterated with a generic for somewhere
-        for n in iter_nodes(self.inner):
-            if n.get("type") == "AstStatForIn" and len(n["values"]) >= 2 and \
-                    n["values"][1]["type"] == "AstExprLocal":
-                iterated.add(n["values"][1]["local"]["location"])
-        for n in iter_nodes(self.inner):
-            if n.get("type") != "AstStatLocal":
-                continue
-            for var, val in zip(n["vars"], n["values"]):
-                if val["type"] == "AstExprLocal" and val["local"]["location"] in vm_decls \
-                        and val["local"]["location"] not in self.special \
-                        and var["location"] in iterated:
-                    self.special[val["local"]["location"]] = "sink"
-        # ... or iterated directly (`for q in next, S, nil do ... S[q] = nil`,
-        # fetched.lua's first VM): without this its boxes look like live
-        # frame slots, and a closed-over local merges with later uses of its
-        # register
+        iterated = set()
         cleared = set()
+        table_assigns = []
+        local_copies = []
+
         for n in iter_nodes(self.inner):
-            if n.get("type") == "AstStatAssign":
-                for var, val in zip(n["vars"], n["values"]):
-                    if var["type"] == "AstExprIndexExpr" and var["expr"]["type"] == "AstExprLocal" \
-                            and val["type"] == "AstExprConstantNil":
-                        cleared.add(var["expr"]["local"]["location"])
+            t = n.get("type")
+            if t == "AstStatAssign":
+                vars_, vals_ = n["vars"], n["values"]
+                for var, val in zip(vars_, vals_):
+                    vt = var["type"]
+                    if vt == "AstExprLocal":
+                        vloc = var["local"]["location"]
+                        valt = val["type"]
+                        if valt == "AstExprLocal":
+                            alias.setdefault(vloc, set()).add(val["local"]["location"])
+                        elif valt == "AstExprTable" and vloc in vm_decls:
+                            table_assigns.append((vloc, val["items"]))
+                    elif vt == "AstExprIndexExpr":
+                        if var["expr"]["type"] == "AstExprLocal" and val["type"] == "AstExprConstantNil":
+                            cleared.add(var["expr"]["local"]["location"])
+            elif t == "AstStatLocal":
+                vars_, vals_ = n["vars"], n["values"]
+                for var, val in zip(vars_, vals_):
+                    if val["type"] == "AstExprLocal":
+                        alias.setdefault(var["location"], set()).add(val["local"]["location"])
+                        if val["local"]["location"] in vm_decls:
+                            local_copies.append((var["location"], val["local"]["location"]))
+            elif t == "AstStatForIn":
+                vals_ = n["values"]
+                if len(vals_) >= 2 and vals_[1]["type"] == "AstExprLocal":
+                    iterated.add(vals_[1]["local"]["location"])
+
+        for me, items in table_assigns:
+            link = None
+            saved = []
+            for it in items:
+                v = it["value"]
+                if v["type"] == "AstExprLocal" and it["kind"] == "general" and \
+                        (v["local"]["location"] == me or alias.get(v["local"]["location"]) == {me}):
+                    link = it["key"]["value"]
+                elif v["type"] == "AstExprLocal":
+                    saved.append(v["local"])
+            if link is not None:
+                self.kstack_key = me
+                self.kstack_link = S.fix_int(link)
+                for loc in saved:
+                    self.special[loc["location"]] = ("pseudo", loc["name"])
+
+        for var_loc, val_loc in local_copies:
+            if val_loc not in self.special and var_loc in iterated:
+                self.special[val_loc] = "sink"
+
         for loc in iterated & cleared:
             if loc in vm_decls and loc not in self.special:
                 self.special[loc] = "sink"
@@ -548,9 +553,6 @@ class VMModel:
     def is_dispatch(self, node):
         return id(node) in self.dispatch
 
-    # The maker is called as maker(vm, proto, upvals) in one layout; another
-    # repeats parameter names, function(g, d, d, d, d, j): only the last `d`
-    # is visible (the proto) and the upvalue list follows it.
     def proto_index(self):
         return self.info.get("proto_index", 1)
 
@@ -559,51 +561,298 @@ class VMModel:
 
     def maker_args(self, vmobj, proto, upvals):
         n = len(self.maker["args"])
-        vals = [None] * max(n, 3)
+        vals = [None] * max(n, 3, self.proto_index() + 1, self.upvals_index() + 1)
         vals[0], vals[self.proto_index()], vals[self.upvals_index()] = vmobj, proto, upvals
         return vals
 
     def proto_of(self, cap):
-        p = cap.get("self")
-        return p if p is not None else cap.get(self.maker["args"][self.proto_index()]["name"])
+        p = cap.get(self.maker["args"][self.proto_index()]["name"])
+        return p if p is not None else cap.get("self")
 
     def vmobj_of(self, cap):
         return cap.get(self.maker["args"][0]["name"])
 
-
 def find_ctor_funcs(root):
-    """Functions in the top-level `setmetatable({...})` table constructor: key -> AstExprFunction."""
-    best = None
-    for n in iter_nodes(root):
-        if n.get("type") == "AstExprTable":
-            fns = sum(1 for it in n["items"] if it["value"]["type"] == "AstExprFunction")
-            if best is None or fns > best[0]:
-                best = (fns, n)
+    """Functions in every `setmetatable({...})`-style table constructor:
+    key -> AstExprFunction. Luraph can ship several ctor tables (one per VM
+    family); every function in any of them can be bound to an OpaqueFn, so
+    keys from all tables merge (int keys of later tables offset by their
+    position to avoid collisions)."""
     out = {}
-    if best:
+    tables = []
+    for n in iter_nodes(root):
+        if n.get("type") != "AstExprTable":
+            continue
+        fns = sum(1 for it in n["items"] if it["value"]["type"] == "AstExprFunction")
+        if fns:
+            tables.append((fns, n))
+    tables.sort(key=lambda t: -t[0])
+    for rank, (_, table) in enumerate(tables):
         pos = 0
-        for it in best[1]["items"]:
+        for it in table["items"]:
             if it["kind"] == "item":
-                pos += 1        # positional items: t[1], t[2], ...
+                pos += 1
             if it["value"]["type"] != "AstExprFunction":
                 continue
             if it["kind"] == "item":
-                out[pos] = it["value"]
+                out.setdefault(pos if rank == 0 else 100000 * (rank + 1) + pos, it["value"])
             elif it["kind"] == "record":
-                out[it["key"]["value"].encode("latin-1")] = it["value"]
+                out.setdefault(it["key"]["value"].encode("latin-1"), it["value"])
             elif it["kind"] == "general" and it["key"]["type"] == "AstExprConstantNumber":
-                out[S.fix_int(it["key"]["value"])] = it["value"]
+                out.setdefault(S.fix_int(it["key"]["value"]), it["value"])
             elif it["kind"] == "general" and it["key"]["type"] == "AstExprConstantString":
-                out[it["key"]["value"].encode("latin-1")] = it["value"]
+                out.setdefault(it["key"]["value"].encode("latin-1"), it["value"])
     return out
 
+LIBS = ("bit32", "string", "table", "math", "buffer", "utf8", "coroutine", "os", "task")
 
-# --------------------------------------------------------------------------
-# IR (the shared classes are in ir.py)
+def _builtin_chain(e, top=None):
+    """`bit32.band`-style chained index -> a Builtin name. The chain root is
+    either a library global or a local bound to the VM's top-level object
+    table (`C.I`, `C._.format`, ...), whose aliases are followed in `top`."""
+    names = []
+    root = None
+    e = vmmap.unwrap_group(e)
+    while isinstance(e, dict):
+        t = e.get("type")
+        if t == "AstExprIndexName":
+            names.append(e["index"])
+            e = e["expr"]
+        elif t == "AstExprIndexExpr" and e["index"].get("type") == "AstExprConstantString":
+            names.append(e["index"]["value"])
+            e = e["expr"]
+        elif t == "AstExprGlobal":
+            root = ("global", e["global"])
+            break
+        elif t == "AstExprLocal":
+            root = ("local", vmmap.decl_key(e["local"]))
+            break
+        else:
+            return None
+    if root is None:
+        return None
+    names.reverse()
+    kind, rk = root
+    if kind == "global":
+        name = ".".join([rk] + names)
+        return name if name in S.CONCRETE or rk in LIBS else None
+    v = top.get(rk) if isinstance(top, dict) else None
+    if v is None:
+        return None
+    for nm in names:
+        v = v.get(nm) if isinstance(v, dict) else None
+        if v is None:
+            return None
+    return v if isinstance(v, str) else None
+
+def _top_table(root):
+    """The VM's top-level object table (`return({...})(...)`): for every field
+    a resolution entry -- a builtin alias name, a lib-table dict, or None for
+    methods. -> ({decl_key of nothing: dict} irrelevant here) the dict mapping
+    its own field names, or None."""
+    best, best_n = None, 0
+    for n in iter_nodes(root):
+        if isinstance(n, dict) and n.get("type") == "AstExprTable":
+            fns = sum(1 for it in n["items"] if it["value"]["type"] == "AstExprFunction")
+            if fns > best_n:
+                best, best_n = n, fns
+    if best is None or best_n < 4:
+        return None
+
+    def field(v):
+        v = vmmap.unwrap_group(v)
+        t = v.get("type")
+        if t == "AstExprFunction":
+            return None
+        if t == "AstExprTable":
+            out = {}
+            for it in v["items"]:
+                if it["kind"] == "record" and it["value"].get("type") != "AstExprFunction":
+                    out[it["key"]["value"]] = field(it["value"])
+            return out or None
+        nm = _builtin_chain(v)
+        if nm:
+            return nm
+        return None
+
+    out = {}
+    for it in best["items"]:
+        if it["kind"] != "record":
+            continue
+        out[it["key"]["value"]] = field(it["value"])
+    return out or None
+
+def _bind_value(v, env):
+    """A static value for a helper-table entry: functions bind to their AST
+    nodes, library chains become Builtins, table constructors recurse."""
+    v = vmmap.unwrap_group(v)
+    t = v.get("type")
+    if t == "AstExprFunction":
+        return LuaFunc(v, env)
+    if t == "AstExprTable":
+        tab = LTable()
+        pos = 0
+        for it in v["items"]:
+            val = it["value"]
+            if it["kind"] == "item":
+                pos += 1
+                x = _bind_value(val, env)
+                if x is not None:
+                    tab.set(pos, x)
+            elif it["kind"] == "record":
+                x = _bind_value(val, env)
+                if x is not None:
+                    tab.set(it["key"]["value"].encode("latin-1"), x)
+            elif it["kind"] == "general":
+                k = it["key"]
+                if k.get("type") == "AstExprConstantNumber":
+                    x = _bind_value(val, env)
+                    if x is not None:
+                        tab.set(S.fix_int(k["value"]), x)
+                elif k.get("type") == "AstExprConstantString":
+                    x = _bind_value(val, env)
+                    if x is not None:
+                        tab.set(k["value"].encode("latin-1"), x)
+        return tab
+    name = _builtin_chain(v, getattr(_bind_value, "_top", None))
+    if name is None:
+        return None
+    if "." not in name and name in LIBS:
+        lib = LTable()
+        for nm in list(S.CONCRETE):
+            if nm.startswith(name + "."):
+                lib.set(nm.split(".", 1)[1].encode("latin-1"), Builtin(nm))
+        return lib
+    return Builtin(name)
+
+def _free_env(root, info):
+    """Statically resolve the maker's free locals. This variant keeps the VM's
+    helpers in a runtime-built table (Y), a parameter of the enclosing method
+    instead of a ctor-table argument. Every method that names a parameter Y
+    fills the same runtime table (the keys never collide), so all
+    `Y[k1][k2]... = v` assignments in the file merge into one LTable; chained
+    values resolve through the top-level object table (`C.I` = string.sub).
+    -> Scope keyed by the free locals' declaration locations, or None."""
+    maker = info["maker"]
+    decls = vmmap._decls_in(maker)
+    free = {}
+    stack = [info["vm"]]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, dict):
+            if n.get("type") == "AstExprLocal":
+                k = vmmap.decl_key(n["local"])
+                if k not in decls:
+                    free.setdefault(k, n["local"]["name"])
+            stack.extend(n.values())
+        elif isinstance(n, list):
+            stack.extend(n)
+    if not free:
+        return None
+    top = _top_table(root)
+    _bind_value._top = top
+    names = set(free.values())
+    hits = []
+    wholes = []
+    for n in iter_nodes(root):
+        if not (isinstance(n, dict) and n.get("type") in ("AstStatAssign", "AstStatLocal")):
+            continue
+        if n.get("type") == "AstStatAssign":
+            pairs = list(zip(n["vars"], n["values"]))
+        else:
+            pairs = list(zip(n["vars"] or [], n["values"] or []))
+        for var, val in pairs:
+            if not isinstance(var, dict) or not isinstance(val, dict):
+                continue
+            if val.get("type") in ("AstExprTable", "AstExprFunction") and var.get("type") == "AstExprLocal" \
+                    and var["local"]["name"] in names:
+                # a whole binding (`local q = { function... }` / `local dec =
+                # function ... end`) of a free local: the initializer builds
+                # the helper inline, so bind it from the AST instead of the
+                # unbound dump closure
+                wholes.append((vmmap.loc(n), var, val))
+                continue
+            path = []
+            e = vmmap.unwrap_group(var)
+            while isinstance(e, dict) and e.get("type") == "AstExprIndexExpr":
+                ix = e["index"]
+                if ix.get("type") == "AstExprConstantNumber":
+                    path.append(S.fix_int(ix["value"]))
+                elif ix.get("type") == "AstExprConstantString":
+                    path.append(ix["value"].encode("latin-1"))
+                else:
+                    path = None
+                    break
+                e = vmmap.unwrap_group(e["expr"])
+            if not path or not isinstance(e, dict) or e.get("type") != "AstExprLocal" \
+                    or e["local"]["name"] not in names:
+                continue
+            hits.append((vmmap.loc(n), path[::-1], val, vmmap.decl_key(e["local"])))
+    env = Scope()
+    whole_tabs = {}
+    whole_fns = {}
+    for (l1, c1, _, _), var, val in sorted(wholes):
+        built = _bind_value(val, env)
+        if isinstance(built, LTable):
+            whole_tabs[vmmap.decl_key(var["local"])] = built
+        elif isinstance(built, LuaFunc):
+            whole_fns[vmmap.decl_key(var["local"])] = built
+    helper = LTable()
+    per_decl = {}
+
+    def _fill(tab, path, val):
+        for k in path[:-1]:
+            nxt = tab.h.get(S.norm_key(k))
+            if not isinstance(nxt, LTable):
+                nxt = LTable()
+                tab.set(k, nxt)
+            tab = nxt
+        key = path[-1]
+        if val.get("type") == "AstExprConstantNil":
+            tab.h.pop(S.norm_key(key), None)
+            return
+        v = _bind_value(val, env)
+        if v is not None:
+            tab.set(key, v)
+
+    for (l1, c1, _, _), path, val, hloc in sorted(hits):
+        tab = whole_tabs.get(hloc)
+        if tab is None:
+            tab = per_decl.setdefault(hloc, LTable())
+            _fill(helper, path, val)
+        _fill(tab, path, val)
+    for k, name in free.items():
+        if k in whole_tabs:
+            env.vars[k] = whole_tabs[k]
+        elif k in whole_fns:
+            env.vars[k] = whole_fns[k]
+    if helper.h:
+        for k, name in free.items():
+            if k in env.vars:
+                continue
+            if name in ("Y", "y") and name in names:
+                env.vars[k] = helper
+                break
+    statics = dict(per_decl)
+    for k, t in whole_tabs.items():
+        statics.setdefault(k, t)
+    info["static_tables"] = {k: t for k, t in statics.items() if getattr(t, "h", None)}
+    top_ltab = None
+    if top is not None:
+        for n in iter_nodes(root):
+            if isinstance(n, dict) and n.get("type") == "AstExprTable":
+                fns = sum(1 for it in n["items"] if it["value"]["type"] == "AstExprFunction")
+                if fns >= 4:
+                    top_ltab = _bind_value(n, env)
+                    break
+    if top_ltab is not None:
+        for k, name in free.items():
+            if name == "C" and k not in env.vars:
+                env.vars[k] = top_ltab
+    return env if env.vars else None
 
 class VMCrash(Unsupported):
     pass
-
 
 class Overlay:
     """Path-sensitive writes to the proto's instruction arrays and buffers.
@@ -650,16 +899,13 @@ class Overlay:
         o.h = self.h
         return o
 
-
 def _differs(a, b):
     return type(a) is not type(b) or not S.lua_eq(a, b)
-
 
 def _hv(v):
     if isinstance(v, (int, float, bytes, bool)) or v is None:
         return v
     return id(v)
-
 
 class State:
     """(mode, pc, loop-stack, known jump-register values, array overlay) at an
@@ -668,8 +914,8 @@ class State:
 
     def __init__(self, mode, pc, kstack, jregs=(), ov=None, packs=(), locs=()):
         self.mode, self.pc, self.kstack, self.jregs, self.ov = mode, pc, kstack, jregs, ov
-        self.packs = packs    # ((reg, SymList), ...): registers holding table.pack(...) results
-        self.locs = locs      # ((decl, value), ...): carried loop-function locals (Stepper.carry)
+        self.packs = packs    
+        self.locs = locs      
 
     def key(self, link):
         d = 0
@@ -682,19 +928,16 @@ class State:
         return (self.mode, self.pc, d, self.jregs, self.ov.h if self.ov is not None else 0,
                 tuple((r, fmt_expr(l)) for r, l in self.packs), self.locs)
 
+WALK_MAX_ERRORS = 100    
+WALK_RESTARTS = 64       
+WALK_LIMIT = int(os.environ.get("DEVIRT_WALK_LIMIT", 250000))       
 
-# --------------------------------------------------------------------------
-
-WALK_MAX_ERRORS = 100    # request walks only (see Program._walk)
-WALK_RESTARTS = 64       # walks per function (each new jump register / carried local restarts it;
-                         # a stack VM finds its return-address slots one at a time)
-MAX_STACK_DEPTHS = 8     # stack VM: distinct stack depths per pc (see Program._walk)
-STACK_WALK_MAX = 30000   # stack VM: states per function before giving up on the carried stack pointer
-
+MAX_STACK_DEPTHS = 8     
+STACK_WALK_MAX = 30000   
 
 class ProtoLifter:
     """Steps the instructions of one proto."""
-    walk_only = False   # set for request-collecting walks (no text is produced)
+    walk_only = False   
 
     def __init__(self, vm, dump, vmobj, proto, upvals, globals_tab):
         self.vm = vm
@@ -706,48 +949,52 @@ class ProtoLifter:
         self.temp_prefix = ""
         self.tcount = 0
         self.proto_arrays = set()
-        self.reg_arrays = set()      # bases of register-resident arrays (see reg_array)
+        self.reg_arrays = set()      
         self.children = []
         self.requests = set()
         self.jump_regs = set()
         self.jvals = {}
         self.jread = set()
-        self.stack_base = None       # stack VM: registers above this are its operand stack (Stepper.carry)
-        self.captured_regs = set()   # registers captured by closures (calls may change them)
-        self.frame_uses = set()      # (upvalue, register) read/written through captured frames
-        self.packs = {}         # reg -> SymList (from the state; copied on first read per run)
+        self.stack_base = None       
+        self.captured_regs = set()   
+        self.frame_uses = set()      
+        self.packs = {}         
         self.pack_copies = {}
         self.pack_read = set()
-        self.pack_unstable = set()   # (reg, text) packs left out of walk states (see Program._walk)
-        self.pack_killed = set()     # (reg, text) unread packs overwritten somewhere
-        self.ov = None          # overlay of the current run (child of the state's)
+        self.pack_unstable = set()   
+        self.pack_killed = set()     
+        self.ov = None          
         self.ov_base = None
         self.in_prologue = False
         self.cur_scope = None
         self.reg_prefix = "r"
-        self.jstack = None           # LPH_JIT functions: the loop stack (JitFrame)
+        self.jstack = None           
         self.proto = proto
         for v in proto.h.values():
             if isinstance(v, LTable):
                 self.proto_arrays.add(id(v))
         self.making = False
         if isinstance(proto, JitProto):
-            # a function an LPH_JIT function defines: its environment is
-            # where it was made
+
             self.maker_scope = proto.env
             return
-        # run the closure maker itself: maker(e, proto, upvals) returns the VM
-        # closure, whose environment is the maker scope with every array bound
+
         it = S.Interp(self)
         self.making = True
-        r = it.call_lua(LuaFunc(vm.maker, Scope()), Multi(vm.maker_args(vmobj, proto, upvals)))
+        env = getattr(vm, "free_env", None) or Scope()
+        self._prepare_maker_env(env, vm, proto)
+        r = it.call_lua(LuaFunc(vm.maker, env), Multi(vm.maker_args(vmobj, proto, upvals)))
         self.making = False
         f = r.first() if isinstance(r, Multi) else r
         if not isinstance(f, LuaFunc) or f.node is not vm.vm:
             raise Unsupported("closure maker did not return the VM closure")
         self.maker_scope = f.env
 
-    # ---- setup: run the closure prologue
+    def _prepare_maker_env(self, env, vm, proto):
+        """Hook for engine variants that must seed the maker's lexical scope
+        (v14 factories close over their installing initializer's locals)."""
+        return env
+
     def initial_state(self):
         self.in_prologue = True
         cs = Scope(self.maker_scope)
@@ -764,7 +1011,6 @@ class ProtoLifter:
         return tuple(sorted(((r, l) for r, l in self.packs.items() if r not in self.pack_read
                              and (r, fmt_expr(l)) not in self.pack_unstable), key=lambda kv: kv[0]))
 
-    # ---- hooks used by luasym.Interp
     def is_dispatch(self, node):
         return self.vm.is_dispatch(node)
 
@@ -782,9 +1028,7 @@ class ProtoLifter:
             del self.jvals[st.target.n]
         if isinstance(st, Assign) and isinstance(st.target, Reg) and st.target.n in self.jump_regs \
                 and self.stack_base is not None and isinstance(st.target.n, int) and st.target.n > self.stack_base:
-            # a stack VM's operand stack slot (above the frame's locals) that
-            # held a return address or mode: it holds data too, so the
-            # statements all stay (dead stores are dropped later)
+
             v = st.value
             if isinstance(v, Const) and isinstance(v.v, int) and not isinstance(v.v, bool):
                 self.jvals[st.target.n] = v.v
@@ -807,7 +1051,7 @@ class ProtoLifter:
         if sp == "sink":
             return OPENUPS
         if sp[0] == "reg":
-            # a local of an LPH_JIT function (JitModel)
+
             return self.index(REGFILE, sp[1], it)
         if sp[0] == "jstack":
             return self.jstack
@@ -821,7 +1065,7 @@ class ProtoLifter:
         if sp == "sink":
             return
         if sp[0] in ("reg", "jstack", "upval") and self.in_prologue:
-            return      # (an LPH_JIT prologue run again: its writes belong to the entry)
+            return      
         if sp[0] == "upval":
             self.emit(Assign(Upval(sp[1]), self.value_of(v)))
             return
@@ -832,14 +1076,11 @@ class ProtoLifter:
                 self.jstack = JIT_BOTTOM
                 return
             if isinstance(v, JitFrame):
-                self.jstack = v         # pop
+                self.jstack = v         
                 return
             link = [k for k, x in v.h.items() if isinstance(x, JitFrame)] if isinstance(v, LTable) else []
             if isinstance(v, LTable) and v.tid is None and len(link) <= 1:
-                # push: the other slots become loop variables of the new
-                # depth. It links to the current frame, or (a loop right
-                # after another one) replaces the top frame, or starts over
-                # at the bottom (a literal nil link)
+
                 parent = v.h[link[0]] if link else JIT_BOTTOM
                 fr = JitFrame(link[0] if link else None, parent.depth + 1)
                 if link:
@@ -857,14 +1098,13 @@ class ProtoLifter:
             if isinstance(v, Multi):
                 v = v.first()
             if isinstance(v, JitFrame):
-                # a loop-stack frame passing through a register (`v = N[k]; N = v`)
+
                 self.jvals[sp[1]] = v
                 return
             if isinstance(self.jvals.get(sp[1]), JitFrame):
                 del self.jvals[sp[1]]
             if isinstance(v, LTable) and v.tid is None and v.h:
-                # a table constructor, as one expression: its items may read
-                # the register it is assigned to (`t = {t[2], t[3], t[4], t[1]}`)
+
                 keys = sorted(v.h, key=lambda k: (not isinstance(k, int), repr(k)))
                 seq = keys == list(range(1, len(keys) + 1))
                 items = [(None if seq else self.as_expr(k), self.value_of(v.h[k])) for k in keys]
@@ -915,7 +1155,7 @@ class ProtoLifter:
                 sc = fn.env.lookup(loc)
                 v = sc.vars[loc] if sc is not None else None
                 if not is_sym(v):
-                    continue        # a fixed value: read through the environment
+                    continue        
                 self.tmp_regs = getattr(self, "tmp_regs", 0) + 1
                 r = Reg(JIT_TMP + self.tmp_regs)
                 self.emit(Assign(r, self.value_of(v)))
@@ -937,7 +1177,7 @@ class ProtoLifter:
         when a table store came first) is copied into a fresh register
         first."""
         regs = set()
-        stored = False          # an earlier target stores into a table
+        stored = False          
         out = list(vals)
         for i, tg in enumerate(targets):
             x = out[i]
@@ -966,8 +1206,7 @@ class ProtoLifter:
     def global_value(self, name):
         v = self.globals_tab.get(name.encode("latin-1"))
         if v is None:
-            # "Hardcode Globals" bakes script globals into handlers
-            # (`R[a] = assert`): the value is the script's global.
+
             return Global(name)
         return v
 
@@ -986,13 +1225,12 @@ class ProtoLifter:
         return Reg(REG_ARRAY + a.v), b
 
     def library_name(self, t):
-        for k, v in self.globals_tab.h.items():
-            if v is t and isinstance(k, bytes):
-                return k.decode("latin-1")
-        return None
+        if not hasattr(self, "_lib_names"):
+            self._lib_names = {id(v): k.decode("latin-1") for k, v in self.globals_tab.h.items() if isinstance(k, bytes)}
+        return self._lib_names.get(id(t))
 
     def set_global(self, name, v):
-        # "Hardcode Globals" handler store (`deepcopy = R[a]`)
+
         self.emit(Assign(Global(name), self.value_of(v)))
 
     def varargs(self, scope):
@@ -1010,12 +1248,14 @@ class ProtoLifter:
             return Upval(v.idx)
         if isinstance(v, Expr):
             return v
-        if isinstance(v, Vec):
-            return v
         if v is None or isinstance(v, (bool, int, float, bytes)):
             return Const(v)
         if isinstance(v, Multi):
             return self.as_expr(v.first())
+        if isinstance(v, SymList):
+            return v
+        if isinstance(v, Vec):
+            return v
         if isinstance(v, EnvTable):
             return Global("_ENV")
         if isinstance(v, LuaFunc) and isinstance(self.vm, JitModel):
@@ -1023,14 +1263,21 @@ class ProtoLifter:
         if isinstance(v, OpaqueFn) and v.pf_tid is not None and v.node is None:
             n = self.dump.shared.setdefault(v.lfid, len(self.dump.shared) + 1)
             return SharedFn(v, n)
+        if isinstance(v, OpaqueFn):
+            if v.node is not None:
+                clo = self.plain_closure(LuaFunc(v.node, Scope()))
+                if clo is not None:
+                    return clo
+                return Opaque("function", self.plain_function_text(v.node) or "function(...) end")
+            n = self.dump.shared.setdefault(v.lfid, len(self.dump.shared) + 1)
+            return SharedFn(v, n)
         if isinstance(v, Buf):
-            # a buffer constant (LPH_ENCFUNC: the encrypted function)
+
             t = self.new_temp()
             self.emit(CallStmt(t, Global("buffer.fromstring"), Multi([Const(bytes(v.data))])))
             return TempVal(t, 1)
         if isinstance(v, Builtin) and v.fn is None:
-            # a library function as a value (`R[a] = tonumber` with Hardcode
-            # Globals, `local char = string.char`)
+
             return Global(v.name)
         if isinstance(v, LuaFunc):
             clo = self.plain_closure(v)
@@ -1039,6 +1286,7 @@ class ProtoLifter:
             text = self.plain_function_text(v)
             if text is not None:
                 return Opaque("function", text)
+            return Opaque("function", "function(...) end")
         raise Unsupported("value %r in an expression" % (v,))
 
     def plain_closure(self, fn):
@@ -1124,7 +1372,7 @@ class ProtoLifter:
         """A trivial function Luraph compiles to plain Lua instead of bytecode
         (Script42: a closure op whose maker is `function() return function()
         return {} end end`): its source text, if it reads no outer locals."""
-        node = fn.node
+        node = fn.node if not isinstance(fn, dict) else fn
         lines = getattr(self.vm, "src_lines", None)
         if not isinstance(node, dict) or node.get("type") != "AstExprFunction" or not lines:
             return None
@@ -1144,6 +1392,14 @@ class ProtoLifter:
 
     def sym_binop(self, op, a, b):
         if isinstance(a, SymList) or isinstance(b, SymList):
+            if op == "Eq":
+                if not isinstance(a, SymList) or not isinstance(b, SymList):
+                    return False
+                return a is b
+            if op == "Ne":
+                if not isinstance(a, SymList) or not isinstance(b, SymList):
+                    return True
+                return a is not b
             raise Unsupported("arith on packed list")
         return Bin(op, self.as_expr(a), self.as_expr(b))
 
@@ -1151,6 +1407,8 @@ class ProtoLifter:
         if isinstance(a, SymList):
             if op == "Len":
                 return a.count_expr()
+            if op == "Not":
+                return False
             raise Unsupported("unop on packed list")
         return Un(op, self.as_expr(a))
 
@@ -1158,7 +1416,6 @@ class ProtoLifter:
         b = rhs()
         return Bin("And" if kind == "and" else "Or", self.as_expr(a), self.as_expr(b))
 
-    # indexing
     def index(self, obj, key, it):
         if isinstance(obj, Multi):
             obj = obj.first()
@@ -1220,13 +1477,11 @@ class ProtoLifter:
         if isinstance(obj, LTable):
             if is_sym(key) and obj is self.vmobj and isinstance(key, Index) and isinstance(key.key, Index) \
                     and key.key.obj == key.obj and isinstance(key.key.key, Const):
-                # the maker of a proto computed at runtime (`vmobj[P[P[k]]]`,
-                # LPH_ENCFUNC's decrypted function): the closure is that value
+
                 return RuntimeMaker()
             if is_sym(key):
                 if self.walk_only and any(isinstance(x, Missing) for x in walk_expr(key)):
-                    # a closure op reading its not yet decoded proto
-                    # (`P[P[1]]`): requested already, walk on
+
                     return Missing(None)
                 if os.environ.get("DEVIRT_TB"):
                     print("   table tid=%s path=%s items=%s" % (obj.tid, self.dump.paths().get(obj.tid), str(list(obj.h.items())[:12])), file=sys.stderr)
@@ -1235,12 +1490,10 @@ class ProtoLifter:
             if self.ov_base is not None and obj.tid is not None:
                 v = self.cur_ov().get((id(obj), S.norm_key(key)), v)
             if v is None and (obj.tid, S.norm_key(key)) in self.dump.late:
-                # decoded at run time for this instruction's decoded operand
+
                 return self.dump.late[(obj.tid, S.norm_key(key))]
             if obj.tid in self.dump.lazy and isinstance(key, int) and self.ov_base is not None:
-                # lazy constants are decoded from the instruction's operand
-                # (obj[0] is that operand array): if this path decrypted the
-                # operand, the constant must be decoded for the new value
+
                 k0 = obj.get(0)
                 if isinstance(k0, LTable):
                     base = k0.get(key)
@@ -1260,7 +1513,7 @@ class ProtoLifter:
                         got = self.dump.fetch(rq)
                         if got is not None:
                             return got
-                        # (a failed decode stays unknown; asked again next round)
+
                         self.dump.miss("override failed" if rq in self.dump.overrides else "override requested")
                         return Missing(key)
             if v is None and obj.tid in self.dump.lazy and isinstance(key, (int, bytes)):
@@ -1269,7 +1522,7 @@ class ProtoLifter:
                 if path is not None and not (isinstance(k, str) and (k.isdigit() or "," in k or ";" in k)):
                     rq = ",".join(str(x) for x in path + [k])
                     if self.dump.overrides.get(rq) is not None:
-                        # decoded inside a table that exists only as a request result
+
                         return self.dump.overrides[rq]
                     k0 = obj.get(0)
                     op = k0.get(key) if isinstance(k0, LTable) and isinstance(key, int) else None
@@ -1304,6 +1557,8 @@ class ProtoLifter:
             return None
         if key in lst.extra:
             return lst.extra[key]
+        if is_sym(key):
+            return Index(self.as_expr(lst), self.as_expr(key))
         raise Unsupported("packed list index %r" % (key,))
 
     def newindex(self, obj, key, v, it):
@@ -1365,14 +1620,14 @@ class ProtoLifter:
             if id(obj) in self.proto_arrays:
                 self.mutated = True
             if self.ov_base is not None and obj.tid is not None:
-                # tables from the dump are shared by all paths: path-local writes
+
                 self.write_ov((id(obj), S.norm_key(key)), v, obj.get(key))
                 return
             obj.set(key, v)
             return
         if isinstance(obj, SymList):
             if key == lst_nkey(obj):
-                return  # count updates are implied by the list shape
+                return  
             if isinstance(key, int) and key >= 1:
                 while len(obj.items) < key and obj.tail is None:
                     obj.items.append(None)
@@ -1395,8 +1650,7 @@ class ProtoLifter:
         self.ov.set(key, v, base)
 
     def check_decision(self, cond):
-        # (forking both ways here in request walks was tried: same functions
-        # per round on StealAnEgg, but walks into junk code; not worth it)
+
         if any(isinstance(x, Missing) for x in walk_expr(cond)):
             raise Unsupported("needs a constant that is not decoded yet")
 
@@ -1414,19 +1668,21 @@ class ProtoLifter:
             return v
         if isinstance(v, LTable):
             if v is self.proto:
-                # only Luraph's LPH_CRASH() expansion touches the VM's own
-                # proto (it scrambles it, then spins forever)
+
                 raise VMCrash()
             if v.h:
                 lib = self.library_name(v)
                 if lib is not None:
-                    # a whole library as a value (`R[a] = string`, Hardcode Globals)
+
                     return Global(lib)
+                nkey = b"n"
+                if all(isinstance(k, int) or k == nkey for k in v.h):
+                    items = [self.value_of(v.h.get(i)) for i in range(1, max((k for k in v.h if isinstance(k, int)), default=0) + 1)]
+                    return SymList(items, None, nkey=nkey if nkey in v.h else None)
                 raise Unsupported("storing a non-empty VM table into a register")
             return S.NewTable()
         return self.as_expr(v)
 
-    # calls
     def call_builtin(self, fn, args, it, stat):
         name = fn.name
         a = args
@@ -1469,8 +1725,7 @@ class ProtoLifter:
             vals = a.items
             if a.tail is not None or any(is_sym(x) or isinstance(x, (SymList, Multi)) for x in vals):
                 if name.startswith("bit32.") and a.tail is None and all(is_sym(x) or isinstance(x, int) for x in vals):
-                    # a handler for the script's own bit32 call (`x = bit32.bxor(y, K)`
-                    # compiled into a dedicated opcode): the real call
+
                     t = self.new_temp()
                     self.emit(CallStmt(t, Global(name), Multi([self.value_of(x) for x in vals])))
                     return Multi([], TempTail(t))
@@ -1496,7 +1751,7 @@ class ProtoLifter:
             self.write_ov((id(b), off), int(args[2]) & 255, b.data[off])
             return Multi([])
         if name.startswith("buffer.write") or name.startswith("buffer.read"):
-            # wider accesses: only safe when the overlay has no bytes of this buffer
+
             if any(k[0] == id(b) for k in self._ov_keys()):
                 raise Unsupported("wide buffer access after in-place decryption")
         return NotImplemented
@@ -1530,11 +1785,11 @@ class ProtoLifter:
                 j = t.length()
             return Multi([t.get(n) for n in range(i, j + 1)])
         if isinstance(t, Expr):
-            # a table in a register (e.g. a table.pack result read a second
-            # time): a real unpack call
+
             tt = self.new_temp()
             self.emit(CallStmt(tt, Global("table.unpack"),
-                               Multi([self.value_of(x) if x is not None else Const(None) for x in a.items], a.tail)))
+                               Multi([self.value_of(x) if not isinstance(x, SymList) else x
+                                         for x in a.items], a.tail)))
             return Multi([], TempTail(tt))
         raise Unsupported("unpack %r" % (t,))
 
@@ -1543,7 +1798,7 @@ class ProtoLifter:
         if dst is None:
             dst = src
         if isinstance(src, SymList) and src is dst:
-            # shift right in place: move(d, 1, count, T, d)
+
             if f == 1 and isinstance(t, int):
                 src.items = [None] * (t - 1) + src.items
                 return dst
@@ -1551,12 +1806,12 @@ class ProtoLifter:
         if is_sym(f) or is_sym(t):
             raise Unsupported("table.move with symbolic positions")
         if is_sym(e) and isinstance(src, SymList) and f == 1 and isinstance(dst, Expr) and isinstance(t, int):
-            # SETLIST with a multret tail: tbl[t...] = unpack(list)
+
             self.emit(SetList(dst, t, Multi([self.value_of(x) if x is not None else Const(None) for x in src.items],
                                             src.tail)))
             return dst
         if is_sym(e) and isinstance(src, Expr) and isinstance(dst, Expr):
-            # a pack held in a register that is no longer tracked: the real call
+
             tt = self.new_temp()
             self.emit(CallStmt(tt, Global("table.move"),
                                Multi([self.value_of(x) if x is not None else Const(None) for x in a.items])))
@@ -1614,14 +1869,13 @@ class ProtoLifter:
                 return it.call_lua(LuaFunc(node, Scope()), args)
             if fn.pf_tid is None:
                 raise Unsupported("call of unknown VM function lf%d" % fn.lfid)
-            # a VM closure kept in the VM object: an ordinary call (as_expr)
+
         if isinstance(fn, Multi):
             fn = fn.first()
         if isinstance(fn, (GenIterMaker,)):
             return Multi([])
         if self.walk_only and any(isinstance(x, Missing) for x in walk_expr(fn)):
-            # e.g. a closure handler using its not yet decoded proto: the
-            # proto is requested already, the rest of the function still counts
+
             return Multi([Missing(None)])
         fe = self.as_expr(fn) if not isinstance(fn, (ClosureExpr,)) else fn
         t = self.new_temp()
@@ -1642,9 +1896,7 @@ class ProtoLifter:
         ups = vals[ui] if len(vals) > ui else None
         if self.walk_only and not isinstance(proto, LTable) and \
                 any(isinstance(x, Missing) for x in walk_expr(proto)):
-            # the child proto is requested already; walking on finds the
-            # constants the rest of this function needs in the same round
-            # (stopping here asked for one closure per round: a long chain)
+
             return Missing(None)
         if not isinstance(proto, LTable):
             raise Unsupported("closure of non-proto")
@@ -1664,10 +1916,8 @@ class ProtoLifter:
         self.children.append(c)
         return c
 
-
 def lst_nkey(lst):
     return lst.nkey if lst.nkey is not None else b"n"
-
 
 def pad(items, n):
     items = list(items[:n])
@@ -1675,23 +1925,19 @@ def pad(items, n):
         items.append(None)
     return items
 
-
 class OpenUps:
     """Luraph's table of open upvalue boxes (register -> box). Reads give a
     MaybeBox (a by-reference capture of that register); storing nil into it
     is the close op: the captured local's scope ends there."""
 
-
 OPENUPS = OpenUps()
-
 
 class MaybeBox:
     def __init__(self, reg):
         self.reg = reg
 
-    def __repr__(self):     # (stable: structure.merge_equivalent compares text)
+    def __repr__(self):     
         return "box(r%s)" % self.reg
-
 
 class UpList:
     """The upvalue list of the proto being lifted. y[i] is a BoxProxy, or a
@@ -1707,13 +1953,9 @@ class UpList:
             b = self.boxes[i] = FrameProxy(i) if i in self.frames else BoxProxy(i)
         return b
 
-
 REGFILE = RegFile()
 
-# `s[k] = s`: a register holding the VM frame itself (jvals marker). Closures
-# capture it by value and read the parent's locals as upv[i][reg].
 FRAME = "<frame>"
-
 
 class FrameProxy:
     """Upvalue i holding the parent's register frame: upv[i][r] is the
@@ -1725,7 +1967,6 @@ class FrameProxy:
     def __repr__(self):
         return "frameproxy(%s)" % (self.idx,)
 
-
 class BoxProxy:
     """Upvalue i. Luraph keeps shared upvalues in boxes read as box[a][box[b]];
     by-value upvalues are used directly (y[i], y[i][k])."""
@@ -1736,14 +1977,12 @@ class BoxProxy:
     def __repr__(self):
         return "boxproxy(%s)" % (self.idx,)
 
-
 class BoxPart(Expr):
     """box[k] of upvalue `idx`: either half of a box access, or (if used any
     other way) the by-value upvalue indexed with constant k."""
 
     def __init__(self, idx, k):
         self.idx, self.k = idx, k
-
 
 def walk_expr(e):
     stack = [e]
@@ -1754,9 +1993,6 @@ def walk_expr(e):
             stack += [v for v in x.__dict__.values() if isinstance(v, Expr)]
             if isinstance(x, S.NewTable):
                 stack += [y for kv in x.items for y in kv if isinstance(y, Expr)]
-
-
-# ---- register facts for the constant propagation in Program._walk
 
 def meet(a, b):
     """Facts true on both paths: equal facts stay; a constant and a
@@ -1774,7 +2010,6 @@ def meet(a, b):
             out[r] = ("t",) if ta else ("f",)
     return out
 
-
 def fact_of(value):
     """Fact for a register assigned `value` (an IR expression)."""
     if isinstance(value, Const):
@@ -1782,11 +2017,10 @@ def fact_of(value):
         if isinstance(v, (int, float, bytes, bool)) or v is None:
             return ("c", v)
     if isinstance(value, ClosureExpr):
-        return ("t", value)     # (frame_call evaluates calls of it)
+        return ("t", value)     
     if isinstance(value, (S.NewTable, Vec, Opaque)):
         return ("t",)
     return None
-
 
 def eval_fact(e, facts):
     """Concrete value of an IR expression under the facts, or a truthiness
@@ -1818,14 +2052,12 @@ def eval_fact(e, facts):
                 return None
     return None
 
-
 def truth_of(f):
     if f is None:
         return None
     if f[0] == "c":
         return S.truthy(f[1])
     return f[0] == "t"
-
 
 def edge_facts(cond, taken, facts):
     """Facts implied by taking one side of a branch on `cond`."""
@@ -1847,7 +2079,6 @@ def edge_facts(cond, taken, facts):
                 f[c.b.n] = ("c", c.a.v)
     return f
 
-
 def apply_stmt_facts(st, facts, lf):
     if isinstance(st, Assign) and isinstance(st.target, Reg):
         fv = fact_of(st.value)
@@ -1866,15 +2097,15 @@ def apply_stmt_facts(st, facts, lf):
             elif prev is None:
                 st.frame_eval = writes
             if not st.frame_eval:
-                facts.clear()       # it may write any register
+                facts.clear()       
                 return
             for r, v in st.frame_eval.items():
                 facts[r] = ("c", v)
-        # a call can change registers captured by closures (upvalue boxes)
-        for r in list(facts):
-            if r in lf.captured_regs:
-                del facts[r]
 
+        if lf.captured_regs:
+            for r in list(facts):
+                if r in lf.captured_regs:
+                    del facts[r]
 
 def frame_call(st, facts, lf):
     """A call that gets the caller's register frame (FrameArg), of a closure
@@ -1917,9 +2148,8 @@ def frame_call(st, facts, lf):
         if not isinstance(k, int) or not isinstance(v, (bytes, int, float, bool)):
             return None
         out[k] = v
-    c.frame_evaluated = True    # (codegen.drop_dead_packs drops it once unused)
+    c.frame_evaluated = True    
     return out
-
 
 def drop_idle_closes(order, captured):
     """Close ops of registers no closure of this function captures: no-ops
@@ -1933,7 +2163,6 @@ def drop_idle_closes(order, captured):
         if any(isinstance(x, Close) and x.reg not in captured for x in n.stmts):
             n.stmts = [x for x in n.stmts if not (isinstance(x, Close) and x.reg not in captured)]
         stack += [n.then, n.els]
-
 
 def apply_frame_calls(order):
     """Evaluated frame-writing calls (frame_call) -> the register writes."""
@@ -1952,7 +2181,6 @@ def apply_frame_calls(order):
                     new.append(x)
             n.stmts = new
         stack += [n.then, n.els]
-
 
 def propagate(node, facts, succ, lf):
     """Walk one instruction's IR tree under the facts, collecting feasible
@@ -1981,7 +2209,6 @@ def propagate(node, facts, succ, lf):
             succ.append((n.outcome.state, f))
     return None
 
-
 def expr_regs(e):
     """Registers read by an expression."""
     out = []
@@ -1996,17 +2223,12 @@ def expr_regs(e):
                 stack += [y for kv in x.items for y in kv if isinstance(y, Expr)]
     return out
 
-
 class GenIterMaker:
     """coroutine.wrap(helper) of Luraph's generic-for: called once with
     (vm, f, s, ctl); then stored as the loop state and called per iteration."""
 
     def __init__(self):
         self.args = None
-
-
-# --------------------------------------------------------------------------
-# stepping
 
 class _AccessLog(dict):
     """A scope's variables that remember which ones were read before being
@@ -2027,15 +2249,14 @@ class _AccessLog(dict):
         self.written.add(k)
         dict.__setitem__(self, k, v)
 
-
 class Stepper:
     def __init__(self, vm, lifter):
         self.vm = vm
         self.lf = lifter
         cs = lifter.initial_state()
         self.cs = cs
-        # locate mode / pc variables from the dispatch loops
-        self.loops = []   # (index in inner body, if-node, while-node)
+
+        self.loops = []   
         for i, st in enumerate(vm.inner_body):
             if st["type"] == "AstStatIf":
                 tb = st["thenbody"]["body"]
@@ -2043,9 +2264,7 @@ class Stepper:
                     self.loops.append((i, st, tb[0]))
         self.mode_decl = None
         if not self.loops:
-            # small scripts: Luraph emits only the opcodes used, sometimes all
-            # in one mode, and then the loop sits in the function without a
-            # mode `if` (mode is always 0 then)
+
             for i, st in enumerate(vm.inner_body):
                 if st["type"] == "AstStatWhile" and vm.is_dispatch(st):
                     self.loops.append((i, None, st))
@@ -2055,9 +2274,7 @@ class Stepper:
         w = self.loops[0][2]
         pcname = w["body"]["body"][0]["values"][0]["index"]["local"]
         self.pc_decl = pcname["location"]
-        # mode test of each loop: `if MODE==K then`, or `if a then` with
-        # `local a = MODE==K` earlier in the loop function (evaluated here
-        # directly, since the state's mode is set after the prologue ran)
+
         self.conds = {}
         for i, st, _ in self.loops:
             if st is None:
@@ -2071,12 +2288,7 @@ class Stepper:
                 self.mode_decl = mv["local"]["location"]
         self.first_inner = self.loops[0][0]
         self.gov = Overlay()
-        # Loop-function locals that carry a value from one instruction to the
-        # next (a stack VM's stack pointer: `local M=G` in the prologue,
-        # handlers `M+=1;R[M]=...`). Found while walking: a prologue local a
-        # handler reads before writing it and some handler writes, holding
-        # an integer. Their values are part of the state (State.locs); a new
-        # one restarts the walk (`new_carry`, like a new jump register).
+
         self.carry = set()
         self.read_first = set()
         self.written = set()
@@ -2084,15 +2296,18 @@ class Stepper:
         self.new_carry = False
         self.fixed_decls = {d for d in (self.pc_decl, self.mode_decl, vm.kstack_key) if d}
         self.sp_cands = self._stack_pointer_candidates()
+        if not hasattr(vm, "_mode_loop_cache"):
+            vm._mode_loop_cache = {}
+        self._mode_loop_cache = vm._mode_loop_cache
 
     def _stack_pointer_candidates(self):
         """Prologue locals the handlers use directly as a register index
         (`R[M]`): only these can be a stack pointer. (A register VM's
         multret top is carried too, but the lifter models it otherwise.)"""
-        # (per VM: every function of the VM runs the same loop function)
+
         cache = self.vm.__dict__.setdefault("_sp_cands", {})
         if None not in cache:
-            # every local indexing a local: `x[y]` (which x is the register file is per call)
+
             pairs = set()
             for _, _, w in self.loops:
                 for n in iter_nodes(w):
@@ -2123,8 +2338,7 @@ class Stepper:
         ks = inner.lookup(self.vm.kstack_key) if self.vm.kstack_key else None
         locs = self._carried(inner)
         if locs:
-            # a carried local indexes the registers: a stack pointer, whose
-            # initial value is the frame size (the slots above: operand stack)
+
             self.lf.stack_base = min(v for _, v in locs)
         return State(mode, pc, ks.vars[self.vm.kstack_key] if ks else None, locs=locs)
 
@@ -2167,8 +2381,7 @@ class Stepper:
         lf.mutated = False
         lf.jvals = dict(state.jregs) if state is not None else {}
         lf.jread = set()
-        # one overlay per proto: Luraph's in-place decryptors dominate the code
-        # they decrypt, so applying them in visiting order is what the VM does
+
         lf.ov_base = self.gov
         lf.ov = None
         lf.packs = dict(state.packs) if state is not None else {}
@@ -2178,11 +2391,14 @@ class Stepper:
         it.decisions = list(decisions)
         cs, inner = self._fresh_scopes(state, it)
         inner.vars = acc = _AccessLog(inner.vars)
-        loop_i = None
-        for i, st, w in self.loops:
-            if st is None or S.truthy(it.eval(self.conds[i], inner)):
-                loop_i = (i, st, w)
-                break
+        loop_i = self._mode_loop_cache.get(state.mode) if state is not None else None
+        if loop_i is None:
+            for i, st, w in self.loops:
+                if st is None or S.truthy(it.eval(self.conds[i], inner)):
+                    loop_i = (i, st, w)
+                    break
+            if loop_i is not None and state is not None:
+                self._mode_loop_cache[state.mode] = loop_i
         if loop_i is None:
             raise Unsupported("mode %r selects no dispatch loop" % (state.mode,))
         i, st, w = loop_i
@@ -2196,7 +2412,7 @@ class Stepper:
                 it.exec_block(w["body"]["body"], Scope(inner))
                 outcome = ("next",)
             except BreakSig:
-                # rest of the loop's if-body, then the following statements
+
                 try:
                     if st is not None:
                         it.exec_block(st["thenbody"]["body"][1:], Scope(inner))
@@ -2223,8 +2439,7 @@ class Stepper:
             locs = self._carried(inner)
             sb = lf.stack_base
             if sb is not None and locs:
-                # operand stack slots: a value stays known while it is on the
-                # stack (reads peek, they don't consume it); above the top it is dead
+
                 top = max(v for _, v in locs)
                 jr = tuple(sorted((k, v) for k, v in lf.jvals.items() if k not in lf.jread
                                   and not (isinstance(k, int) and k > top)))
@@ -2282,7 +2497,7 @@ class Stepper:
                 if len(paths) == 1:
                     writes = self.lf.ov
             if writes is not None:
-                # commit this instruction's in-place writes (decryption) once
+
                 self.gov.d.update(writes.d)
                 dump = self.lf.dump
                 for k, v in writes.d.items():
@@ -2292,7 +2507,7 @@ class Stepper:
                         dump.tab_patch[(dump.tid_of[k[0]], k[1])] = v
             if len(paths) == 1 and not paths[0][2] and isinstance(paths[0][3], Next) \
                     and self.lf.mutated and paths[0][3].state.pc == state.pc:
-                # a decoder rewrote this instruction: dispatch it again
+
                 state = paths[0][3].state
                 continue
             node = build_tree(paths, 0, 0)
@@ -2300,10 +2515,8 @@ class Stepper:
             return node
         raise Unsupported("instruction keeps re-decoding itself")
 
-
-JIT_ENTRY = -(1 << 40)     # pc of a JIT function's entry: its prologue (JitStepper)
-JIT_TMP = 900000           # registers for parallel assignments (ProtoLifter.parallel_values)
-
+JIT_ENTRY = -(1 << 40)     
+JIT_TMP = 900000           
 
 def jit_maker_parts(node):
     """LPH_JIT functions are VM-object methods `function(g, upvals, P) local
@@ -2331,7 +2544,6 @@ def jit_maker_parts(node):
     if not pis or not any(st["type"] == "AstStatWhile" for st in inner["body"]["body"]):
         return None
     return pis[-1], inner
-
 
 class JitModel(VMModel):
     """An LPH_JIT function (jit_maker_parts), lifted like a one-mode VM: one
@@ -2365,7 +2577,7 @@ class JitModel(VMModel):
                 break
         if self.pc_decl is None:
             raise Unsupported("LPH_JIT function without a state dispatch")
-        self.assigned = set()       # locals the loop assigns
+        self.assigned = set()       
         for n in iter_nodes(w):
             if n.get("type") == "AstStatAssign":
                 self.assigned |= {v["local"]["location"] for v in n["vars"] if v["type"] == "AstExprLocal"}
@@ -2374,8 +2586,7 @@ class JitModel(VMModel):
         self.params = [a["location"] for a in inner["args"]]
         self.locals = [v["location"] for st in self.inner_body[:self.wi] if st["type"] == "AstStatLocal"
                        for v in st["vars"]]
-        # the loop stack: a prologue local that table constructors link to
-        # (`R = {nil, N, limit, start - step, step}; N = R`)
+
         self.jstack = None
         for n in iter_nodes(w):
             if n.get("type") == "AstExprTable":
@@ -2383,9 +2594,7 @@ class JitModel(VMModel):
                     v = it["value"]
                     if v["type"] == "AstExprLocal" and v["local"]["location"] in self.locals:
                         self.jstack = v["local"]["location"]
-        # locals every step writes before reading them (Luraph reuses
-        # parameters and dead locals as scratch space) are values within one
-        # step, not registers
+
         live = _jit_live_in(w, self.pc_decl, set(self.params + self.locals))
         self.special = {}
         if self.jstack is not None:
@@ -2393,7 +2602,6 @@ class JitModel(VMModel):
         for loc in self.params + self.locals:
             if loc not in (self.pc_decl, self.cond_decl) and loc not in self.special and loc in live:
                 self.special[loc] = ("reg", len(self.special) + 1)
-
 
 class JitFrame(LTable):
     """One entry of an LPH_JIT function's loop stack (`N = {..., N, ...}`,
@@ -2405,9 +2613,7 @@ class JitFrame(LTable):
         LTable.__init__(self)
         self.link, self.depth = link, depth
 
-
 JIT_BOTTOM = JitFrame(None, 0)
-
 
 class JitProto(LTable):
     """The "proto" of a function an LPH_JIT function defines (a Lua closure,
@@ -2419,10 +2625,8 @@ class JitProto(LTable):
         LTable.__init__(self)
         self.env, self.upmap = env, upmap
 
-
 _JIT_NESTED = {}
-_JIT_TAGGED = {}       # tag -> JitModel of a nested function (collect_requests)
-
+_JIT_TAGGED = {}       
 
 def _jit_nested_model(node):
     if id(node) not in _JIT_NESTED:
@@ -2435,8 +2639,10 @@ def _jit_nested_model(node):
             _JIT_NESTED[id(node)] = (node, None)
     return _JIT_NESTED[id(node)][1]
 
-
 def _declared_in(node):
+    cache = node.get("_decl_in")
+    if cache is not None:
+        return cache
     out = {a["location"] for a in node.get("args", [])}
     for n in iter_nodes(node):
         t = n.get("type")
@@ -2448,8 +2654,8 @@ def _declared_in(node):
             out.add(n["name"]["location"])
         elif t == "AstExprFunction":
             out |= {a["location"] for a in n["args"]}
+    node["_decl_in"] = out
     return out
-
 
 def _jit_live_in(w, pc_decl, cands):
     """Candidates (declarations) some step of the dispatch loop `w` reads
@@ -2521,7 +2727,7 @@ def _jit_live_in(w, pc_decl, cands):
         return done
 
     def leaves(stmts, done):
-        # the dispatch tree: its branches are further dispatch or leaves
+
         if len(stmts) == 1 and is_dispatch(stmts[0]):
             st = stmts[0]
             leaves(st["thenbody"]["body"], done)
@@ -2540,7 +2746,6 @@ def _jit_live_in(w, pc_decl, cands):
     expr(w["condition"], set())
     return live
 
-
 def _fixed_value(v):
     """A prologue local's value that is the same on every entry (the
     environment, library functions, constants, dump tables): kept as a value."""
@@ -2552,7 +2757,6 @@ def _fixed_value(v):
     if isinstance(v, SymList):
         return not v.items and v.tail is None
     return False
-
 
 class JitStepper(Stepper):
     """Stepper for a JitModel. The entry (pc JIT_ENTRY) runs the prologue
@@ -2617,11 +2821,11 @@ class JitStepper(Stepper):
         lf.tcount = 0
         lf.temp_prefix = tprefix
         lf.mutated = False
-        lf.jvals = dict(state.jregs)
+        lf.jvals = dict(state.jregs) if state is not None else {}
         lf.jread = set()
         lf.ov_base = self.gov
         lf.ov = None
-        lf.packs = dict(state.packs)
+        lf.packs = dict(state.packs) if state is not None else {}
         lf.pack_copies = {}
         lf.pack_read = set()
         it = S.Interp(lf)
@@ -2631,7 +2835,7 @@ class JitStepper(Stepper):
         try:
             cs, inner = self._fresh_scopes(state, it, entry)
             if not entry:
-                lf.out = []         # (the prologue's statements belong to the entry)
+                lf.out = []         
                 ended = False
                 try:
                     it.exec_block(vm.inner_body[vm.wi]["body"]["body"], Scope(inner))
@@ -2657,7 +2861,6 @@ class JitStepper(Stepper):
         return it, Next(State(0, pc, lf.jstack, jr, None,
                               lf.state_packs()))
 
-
 def _jit_forloop(node, lf):
     """An LPH_JIT numeric-for header (`c, s, l = N[..]; u = c + s; N[c] = u;
     if (s <= 0 and u >= l) or (s > 0 and u <= l) then var = u; body else
@@ -2682,8 +2885,7 @@ def _jit_forloop(node, lf):
         if t is None or e is None or t.cond is not None or e.cond is not None:
             return
         f = fmt_expr(sm)
-        # the counter store comes before the compare's fork, or in both
-        # branches; the loop variable's store is missing when it is unused
+
         if side.stmts and len(t.stmts) <= 1 and not e.stmts:
             a1, a3 = side.stmts[0], side.stmts[0]
             a2 = t.stmts[0] if t.stmts else None
@@ -2712,20 +2914,18 @@ def _jit_forloop(node, lf):
         side.then.stmts = [Assign(Reg(var), cnt)]
         side.els.stmts = []
 
-
 def make_stepper(vm, lifter):
     return JitStepper(vm, lifter) if isinstance(vm, JitModel) else Stepper(vm, lifter)
 
-
 def build_tree(paths, d, start):
     """paths share decisions[:d]; statements before `start` were emitted already."""
-    if len(paths) == 1 and len(paths[0][0]) <= d:
+    if len(paths) == 1 and len(paths[0]) <= d:
         taken, dlog, out, oc = paths[0]
         return Node(out[start:], outcome=oc)
-    # all paths make decision d at the same point
+
     p0 = paths[0]
     if len(p0[0]) <= d:
-        # some path ends here while others continue: shouldn't happen (deterministic)
+
         taken, dlog, out, oc = p0
         return Node(out[start:], outcome=oc)
     _, cond, _ = p0[1][d][1], p0[1][d][2], None
@@ -2737,11 +2937,6 @@ def build_tree(paths, d, start):
     els = build_tree(fp, d + 1, at) if fp else None
     return Node(stmts, cond=cond, then=then, els=els)
 
-
-# --------------------------------------------------------------------------
-# --------------------------------------------------------------------------
-# driver
-
 def chunk_key(src):
     """Same key as deob.chunk_key / srcKey() in envlog.luau (the __maker tag prefix)."""
     h = 0
@@ -2749,9 +2944,7 @@ def chunk_key(src):
         h = (h * 31 + b) % 2147483648
     return "%d_%d" % (len(src), h)
 
-
-_SOURCE_CACHE = {}      # source text -> static analysis (the same in every constant round)
-
+_SOURCE_CACHE = {}      
 
 def analyze_source(path):
     """AST, VM models and constructor functions of one VM source file. Depends
@@ -2766,14 +2959,16 @@ def analyze_source(path):
     disp = vmmap.find_dispatchers(root)
     ctor = find_ctor_funcs(root)
     vms = {}
-    for info in vmmap.maker_info(root):
-        # dispatch loops inside this VM closure
-        ids = {id(n) for n in iter_nodes(info["vm"])}
+    for info in vmmap.maker_info(root, disp):
+        vm_node = info["vm"]
+        ids = {id(n) for n in iter_nodes(vm_node)}
         inside = [d["node"] for d in disp if id(d["node"]) in ids]
         tag = "%s@%d,%d" % ((key,) + tuple(info["at"]))
-        vms[tag] = VMModel(info, inside, ctor)
-        vms[tag].tag = tag
-    # LPH_JIT functions: makers in the VM object returning plain Lua
+        vm = VMModel(info, inside, ctor)
+        vm.tag = tag
+        vm.free_env = _free_env(root, info)
+        vms[tag] = vm
+
     for k, node in ctor.items():
         parts = jit_maker_parts(node)
         if parts is not None:
@@ -2783,14 +2978,12 @@ def analyze_source(path):
                 continue
             jm.tag = "%s@jit:%s" % (key, k.decode("latin-1") if isinstance(k, bytes) else k)
             vms[jm.tag] = jm
-    # a closure op picks the child's interpreter through the VM object
-    # (`g[C[C[4]]](g, upvals, C)`): it can be the maker of another VM
+
     siblings = {id(vm.maker): vm for vm in vms.values()}
     for vm in vms.values():
         vm.siblings = siblings
     hit = _SOURCE_CACHE[text] = (root, text.split("\n"), vms, ctor)
     return hit
-
 
 class Program:
     def __init__(self, source_path, dump_path, chunk_paths=()):
@@ -2809,7 +3002,7 @@ class Program:
                 self.ctors[id(vm)] = ctor
                 vm.src_lines = lines
         self.dump.vm_names = {vm.maker["args"][0]["name"] for vm in self.vms.values()}
-        # bind Lua function values of the VM object to their AST
+
         for cap in self.dump.protos.values():
             try:
                 e = cap.get(self.vm_of(cap).maker["args"][0]["name"])
@@ -2819,6 +3012,8 @@ class Program:
             if isinstance(e, LTable):
                 for k, v in e.h.items():
                     if isinstance(v, OpaqueFn) and v.node is None and k in ctor:
+                        v.node = ctor[k]
+                    elif isinstance(v, OpaqueFn) and v.node is None and isinstance(k, int) and k in ctor:
                         v.node = ctor[k]
         g = LTable()
         for lib in ("bit32", "string", "table", "math", "buffer"):
@@ -2861,22 +3056,24 @@ class Program:
         Returns (entry, [(key, node)], restart)."""
         s0 = st.initial()
         link = vm.kstack_link
-        nodes = {}          # key -> Node
-        states = {}         # key -> State
-        facts = {}          # key -> dict of incoming facts
+        nodes = {}          
+        states = {}         
+        facts = {}          
         order = []
         self.pred = {}
-        self.edges = {}     # key -> set of successor keys (feasible)
+        self.edges = {}     
         work = [s0.key(link)]
         states[work[0]] = s0
         facts[work[0]] = {}
         inwork = {work[0]}
-        pack_sets = {}      # key without packs -> packs of its first state
-        pending = set()     # new jump registers of a stack VM (one restart for all)
-        depth_at = {}       # stack VM: (mode, pc) -> carried locals (the stack depth)
-        hubs = set()        # stack VM: (mode, pc) of pop-and-jump instructions
+        pack_sets = {}      
+        pending = set()     
+        depth_at = {}       
+        hubs = set()        
         steps = 0
         nerr = 0
+        unique_seen = 0
+        plateau = 0
         while work and len(order) < limit:
             k = work.pop()
             inwork.discard(k)
@@ -2898,23 +3095,28 @@ class Program:
                     node.error = str(e)
                     nerr += 1
                 if getattr(st, "new_carry", False):
-                    # a VM local turned out to carry state between
-                    # instructions: walk again with it in the states
+
                     st.new_carry = False
                     return s0, order, True
                 nodes[k] = node
                 order.append((k, node))
+                if len(order) % 5000 == 0:
+                    seen_now = len(set((kk[0], kk[1]) for kk, _ in order))
+                    if seen_now == unique_seen:
+                        plateau += 5000
+                        if plateau >= 25000:
+                            break
+                    else:
+                        unique_seen = seen_now
+                        plateau = 0
                 if lf.walk_only and nerr > WALK_MAX_ERRORS:
-                    # a request walk that forked on a not yet decoded
-                    # constant into junk code: keep what it asked for so far
+
                     break
             steps += 1
             if steps > limit * 20:
                 break
             if lf.stack_base is not None and len(order) > STACK_WALK_MAX and getattr(st, "carry", None):
-                # a stack VM function whose states multiply (subroutine calls
-                # inlined per call site, counters on the stack): walk it the
-                # old way (stack pointer not carried; pops read stale slots)
+
                 st.carry = set()
                 st.no_carry = True
                 lf.stack_base = None
@@ -2929,20 +3131,17 @@ class Program:
                     regs = {r.n for x in (ns.pc, ns.mode) if not isinstance(x, int)
                             for r in expr_regs(x)} - lf.jump_regs
                     if regs and lf.stack_base is not None:
-                        # stack VM: finish the walk first, collecting every
-                        # new return-address slot (one restart for all)
+
                         pending |= regs
                         continue
                     if regs:
-                        # computed jump through a register: track its constant values
+
                         lf.jump_regs |= regs
                         return s0, order, True
                     node.error = "symbolic next pc/mode: %s / %s" % (fmt_any(ns.pc), fmt_any(ns.mode))
                     continue
                 if ns.locs:
-                    # compiled stack code has few stack depths per pc (one,
-                    # except at a shared pop-and-jump, a "hub"); ever new ones
-                    # are a path where the stack grows each round: cut it off
+
                     if ns.pc != s.pc + 1 and s.locs and ns.locs < s.locs:
                         hubs.add((s.mode, s.pc))
                     seen_locs = depth_at.setdefault((ns.mode, ns.pc), set())
@@ -2953,9 +3152,7 @@ class Program:
                         continue
                     seen_locs.add(ns.locs)
                 nk = ns.key(link)
-                # a long-lived unread pack (the entry's `...`) killed inside a
-                # loop gives the loop a second copy: leave such packs out of the
-                # states (the register still holds the table.pack) and restart
+
                 core = nk[:5]
                 seen = pack_sets.setdefault(core, nk[5])
                 if seen != nk[5]:
@@ -3002,7 +3199,7 @@ def show_op(prog, key, mode, pc, force_op=None):
                 v = lf.maker_scope.vars[keys[0]]
                 if isinstance(v, LTable) and id(v) in lf.proto_arrays:
                     arrs[nm] = v
-        # the loop's opcode array is named in the dispatch statement; resolve via VM scope aliases
+
         opname = d["arr"]
         cs = st.cs
         it = S.Interp(lf)
@@ -3017,7 +3214,6 @@ def show_op(prog, key, mode, pc, force_op=None):
         print(vmmap.text_of(lines, blk) if blk else "<no handler>")
         return
     print("no loop for mode", mode)
-
 
 def main():
     import argparse
@@ -3064,13 +3260,8 @@ def main():
                 print(line)
         print("-- %d constant requests" % len(lf.requests))
 
-
-# --------------------------------------------------------------------------
-# whole functions -> Luau
-
 REG_PREFIX = "rstuvwxyzabcdefghijklmnopq"
-REG_ARRAY = 1000000     # register-resident arrays: Reg(REG_ARRAY + base)
-
+REG_ARRAY = 1000000     
 
 class FunctionLifter:
     """Lifts one proto (and, recursively, the closures it creates) to Luau lines."""
@@ -3088,7 +3279,7 @@ class FunctionLifter:
         lf.reg_prefix = prefix
         st = make_stepper(vm, lf)
         for _ in range(WALK_RESTARTS):
-            s0, order, restart = self.prog._walk(vm, lf, st, 400000)
+            s0, order, restart = self.prog._walk(vm, lf, st, WALK_LIMIT)
             if not restart:
                 break
         self.prog.requests |= lf.requests
@@ -3135,7 +3326,7 @@ class FunctionLifter:
             lf.walk_only = True
             st = make_stepper(cvm, lf)
             for _ in range(WALK_RESTARTS):
-                _, _, restart = self.prog._walk(cvm, lf, st, 400000)
+                _, _, restart = self.prog._walk(cvm, lf, st, WALK_LIMIT)
                 if not restart:
                     break
         except Unsupported:
@@ -3171,11 +3362,11 @@ class FunctionLifter:
         fmap = getattr(c, "frame_map", {})
         for i, e in enumerate(c.upvals, 1):
             if isinstance(e, RegFile):
-                # the parent's frame: upv[i][r] is the parent's local r
+
                 for r in fmap.get(i, ()):
                     upnames[(i, r)] = capnames.get(r, "nil")
             elif isinstance(e, FrameProxy):
-                # a frame the parent got as its own upvalue
+
                 for r in fmap.get(i, ()):
                     upnames[(i, r)] = parent_names.get(("up", (e.idx, r)), "upv%d_%d" % (e.idx, r))
             elif isinstance(e, LTable):
@@ -3184,7 +3375,7 @@ class FunctionLifter:
                 if any(isinstance(v, RegFile) for v in vals) and ints:
                     upnames[i] = capnames.get(ints[0], "nil")
                 else:
-                    # a box of the parent's own upvalue list
+
                     ups = [v for v in vals if isinstance(v, UpContainer)]
                     upnames[i] = parent_names.get(("up", ups[0].idx), "upv%d" % ups[0].idx) if ups else "nil"
             elif isinstance(e, Reg):
@@ -3198,8 +3389,7 @@ class FunctionLifter:
         params = ["..."]
         fidx = [i for i, e in enumerate(c.upvals, 1) if isinstance(e, (RegFile, FrameProxy))]
         cvm = getattr(c, "vm", None) or vm
-        # the same proto closed over at several sites (the walk visits a
-        # closure op once per state, tail duplication copies code): lift once
+
         ckey = (id(proto), id(cvm), tuple(fidx), depth, tuple(sorted(upnames.items(), key=repr)))
         memo = self.__dict__.setdefault("_closure_memo", {})
         if ckey in memo:
@@ -3216,7 +3406,6 @@ class FunctionLifter:
         f.captures = set(upnames.values())
         return f
 
-
 def stmt_exprs(st):
     import codegen as CG
     out = []
@@ -3229,7 +3418,6 @@ def stmt_exprs(st):
         out.append(st.tbl)
         out += list(st.values.items)
     return out
-
 
 def collect_regs(body):
     import codegen as CG
@@ -3282,11 +3470,9 @@ def collect_regs(body):
     blk(body)
     return regs
 
-
 def refine_loops(body):
     """Placeholder: loop shapes (for / while cond) are recognized later."""
     return body
-
 
 def _vm_roots(prog):
     """[(maker tag, [(seq, pid, cap), ...] sorted)] with the payload VM last, and its tag."""
@@ -3294,21 +3480,15 @@ def _vm_roots(prog):
     for key, cap in prog.dump.protos.items():
         if cap.get("__maker") is None:
             continue
-        # the root of a VM is the first proto it made a closure of
+
         by_vm.setdefault(cap["__maker"], []).append((cap.get("__seq") or 0, key, cap))
-    # the payload is the VM created last (Luraph's loader VM makes its
-    # closures first; a payload that stopped early may have fewer protos):
-    # it comes last and the file ends by running it
+
     vms = sorted(by_vm.items(), key=lambda kv: min(x[0] for x in kv[1]))
     payload = vms[-1][0] if vms else None
     vms.sort(key=lambda kv: kv[0] == payload)
     for _, lst in vms:
         lst.sort(key=lambda x: (x[0], x[1]))
-    # The script's main function is the proto Luraph's bootstrap root (pid 1)
-    # called last; the runtime records it. Usually it is the root of the VM
-    # made last, but each proto picks its interpreter, so the bootstrap and
-    # the script can share one VM implementation (the root of that VM is
-    # then the bootstrap) and later VMs may belong to script functions.
+
     rc = prog.dump.raw.get("root_callee")
     for tag, lst in vms:
         hit = [x for x in lst if rc is not None and str(x[1]) == str(rc)]
@@ -3320,13 +3500,11 @@ def _vm_roots(prog):
             break
     return vms, payload
 
-
 def program_roots(prog):
     """[(tag, pid, cap)] of the root protos lift_program lifts, in order."""
     vms, payload = _vm_roots(prog)
     loaders = bool(os.environ.get("DEVIRT_LOADERS"))
     return [(tag, lst[0][1], lst[0][2]) for tag, lst in vms if tag == payload or loaders]
-
 
 def lift_program(source, protos_path, chunk_paths=(), fetch=None):
     """The root proto of every VM -> Luau text (plus stats and constant requests)."""
@@ -3338,12 +3516,10 @@ def lift_program(source, protos_path, chunk_paths=(), fetch=None):
     out = []
     vms, payload = _vm_roots(prog)
     payload_pid = None
-    # Luraph's loader VMs are not part of the script (never called): lifted
-    # only on request (DEVIRT_LOADERS=1, as local functions). The payload is
-    # the chunk's own code: written at top level unless loaders are shown.
+
     loaders = bool(os.environ.get("DEVIRT_LOADERS"))
     for tag, lst in vms:
-        _, pid, cap = lst[0]          # pid: the proto key (a number, or t<table id>)
+        _, pid, cap = lst[0]          
         where = tag.decode("latin-1")
         if tag != payload and not loaders:
             if os.environ.get("DEVIRT_DEBUG"):
@@ -3366,8 +3542,9 @@ def lift_program(source, protos_path, chunk_paths=(), fetch=None):
         lines = fl.lift(vm, vmobj, proto, UpList(), {}, 0)
         if tag == payload and not loaders:
             out.append("")
-            if fl.params:
-                out.append("local %s = ..." % ", ".join(fl.params))
+            params = [p for p in fl.params if p != "..."]
+            if params:
+                out.append("local %s = ..." % ", ".join(params))
             out += lines
             payload_pid = None
             continue
@@ -3377,7 +3554,7 @@ def lift_program(source, protos_path, chunk_paths=(), fetch=None):
         out.append("")
     if payload_pid is not None:
         out.append("return vm_root_%s(...)" % payload_pid)
-    # Luraph runtime functions the script calls (SharedFn): stubs up front
+
     shared = []
     for n in sorted(prog.dump.shared.values()):
         shared += ["-- Luraph runtime function (from the VM object, not part of the script: not lifted).",
@@ -3391,18 +3568,14 @@ def lift_program(source, protos_path, chunk_paths=(), fetch=None):
     text = backend.polish("\n".join(out))
     return text, fl.stats, prog.requests, buffer_patches(prog.dump)
 
-
 finish_text = backend.finish_text
 
-
 LAST_DUMP = []
-
 
 def buffer_patches(dump):
     """The lifter's in-place string decryption as a request for the runtime:
     "path,to,holder,key/offset:hexbytes/...;..." (only bytes that differ)."""
     return format_patches(*stable_patches(dump))
-
 
 def stable_patches(dump):
     """dump.buf_patch / tab_patch keyed by table path instead of object id
@@ -3422,7 +3595,6 @@ def stable_patches(dump):
             tw[(",".join(str(x) for x in paths[tid]), key)] = v
     return bw, tw
 
-
 def format_patches(bw, tw):
     per = {}
     for (path, key, off), v in bw.items():
@@ -3436,15 +3608,14 @@ def format_patches(bw, tw):
             else:
                 runs.append((off, [bs[off]]))
         out.append(holder + "".join("/%d:%s" % (off, bytes(b).hex()) for off, b in runs))
-    out.sort()      # (table ids differ between runs: compare by path)
-    # table entries: "path/=key:number/..."
+    out.sort()      
+
     tabs = {}
     for (path, key), v in tw.items():
         tabs.setdefault(path, []).append((key, v))
     tab_out = [path + "".join("/=%d:%s" % (k, S.fmt_num(v)) for k, v in sorted(kv))
                for path, kv in tabs.items()]
     return ";".join(out + sorted(tab_out))
-
 
 def same_patches(old, new):
     """Whether `old` (the patches of an earlier round, paths of that run's
@@ -3472,7 +3643,6 @@ def same_patches(old, new):
             out.append("%s,%s" % (cur(path), key) + sep + rest)
     return ";".join(sorted(out) + sorted(tabs)) == new
 
-
 class WalkCache:
     """Results of walking single protos (collect_requests), kept across
     constant rounds by the proto's table path. A walk that asked for no
@@ -3481,8 +3651,7 @@ class WalkCache:
     table (ties), so stored paths are resolved by walking them (PathResolver)."""
 
     def __init__(self):
-        self.entries = {}       # (path of the proto, id(vm)) -> entry
-
+        self.entries = {}       
 
 class PathResolver:
     """A table path as written by Dump.paths() ("seq,name,key,..." with
@@ -3518,7 +3687,6 @@ class PathResolver:
                 t = None
         self.memo[path] = t
         return t
-
 
 def collect_requests(source, protos_path, chunk_paths=(), cache=None, fetch=None):
     """What an intermediate constant round needs from lift_program, without
@@ -3587,7 +3755,6 @@ def collect_requests(source, protos_path, chunk_paths=(), cache=None, fetch=None
     prog.requests = requests
     return stats, requests, format_patches(bw, tw)
 
-
 def _walk_one(prog, vm, vmobj, proto, pkey):
     dump = prog.dump
     saved = dump.buf_patch, dump.tab_patch
@@ -3599,7 +3766,7 @@ def _walk_one(prog, vm, vmobj, proto, pkey):
         lf.walk_only = True
         st = make_stepper(vm, lf)
         for _ in range(WALK_RESTARTS):
-            s0, order, restart = prog._walk(vm, lf, st, 400000)
+            s0, order, restart = prog._walk(vm, lf, st, WALK_LIMIT)
             if not restart:
                 break
     except Unsupported:
@@ -3622,7 +3789,6 @@ def _walk_one(prog, vm, vmobj, proto, pkey):
         all(isinstance(c, str) for c in ent["children"])
     return ent
 
-
 def _translate(ent, res, pkey):
     """A cached entry's paths -> this dump: (child tables, buffer patches,
     table patches), patches keyed by the current shortest path (the one the
@@ -3644,9 +3810,7 @@ def _translate(ent, res, pkey):
         out.append(nd)
     return kids, out[0], out[1]
 
-
 run_big_stack = backend.run_big_stack
-
 
 if __name__ == "__main__":
     run_big_stack(main)

@@ -228,5 +228,75 @@ class PreludeRuntimeTests(unittest.TestCase):
         )
 
 
+class LuauLibraryTests(unittest.TestCase):
+    """Luau libraries an obfuscated loader reaches for while it runs."""
+
+    def setUp(self) -> None:
+        from core.luau_compat import install_string_pack
+
+        self.runtime = lua51.LuaRuntime(unpack_returned_tuples=True, encoding="latin-1")
+        install_string_pack(self.runtime)
+        self.runtime.execute(
+            build_lua_prelude(get_profile("universal")).encode("latin-1")
+        )
+
+    def _run(self, script: str) -> None:
+        self.runtime.execute(script.encode("latin-1"))
+
+    def test_buffer_round_trips_the_way_luraph_v15_writes_it(self) -> None:
+        self._run(
+            """
+            local chunk = buffer.create(8)
+            buffer.writeu8(chunk, 0, 27)
+            buffer.writeu8(chunk, 1, 76)
+            buffer.writeu32(chunk, 2, 4294967295)
+            assert(buffer.len(chunk) == 8, "len")
+            assert(buffer.readu8(chunk, 0) == 27, "u8")
+            assert(buffer.readu8(chunk, 1) == 76, "u8 second")
+            assert(buffer.readu32(chunk, 2) == 4294967295, "u32 wraps")
+            assert(buffer.tostring(chunk):byte(1) == 27, "tostring")
+            local text = buffer.fromstring("hello world")
+            buffer.copy(chunk, 0, text, 6, 5)
+            assert(buffer.tostring(chunk):sub(1, 5) == "world", "copy")
+            buffer.fill(text, 0, 65, 3)
+            assert(buffer.readstring(text, 0, 3) == "AAA", "fill")
+            assert(buffer.readi8(text, 0) == 65, "i8")
+            local ok = pcall(function() buffer.readu8(chunk, 99) end)
+            assert(ok == false, "bounds are checked")
+            """
+        )
+
+    def test_vector_library_matches_luau_semantics(self) -> None:
+        self._run(
+            """
+            assert(type(vector) == "table", "vector table")
+            local a = vector.create(3, 4, 0)
+            local b = vector.create(0, 0, 2)
+            assert(vector.magnitude(a) == 5, "magnitude")
+            assert(vector.dot(a, b) == 0, "dot")
+            assert(vector.magnitude(vector.cross(a, b)) == 10, "cross")
+            assert(vector.normalize(a).x == 0.6, "normalize")
+            assert((a + b).z == 2, "vector arithmetic")
+            assert(vector.floor(vector.create(1.7, -0.2, 3.9)).y == -1, "floor")
+            assert(vector.zero.x == 0 and vector.one.y == 1, "constants")
+            """
+        )
+
+    def test_remaining_standard_library_gaps_are_filled(self) -> None:
+        self._run(
+            """
+            assert(type(string.pack) == "function", "string.pack")
+            assert(string.pack("B", 27):byte(1) == 27, "string.pack works")
+            assert(type(table.move) == "function", "table.move")
+            assert(#table.move({ 1, 2, 3, 4 }, 2, 3, 1) == 4, "table.move returns the table")
+            assert(type(table.clone) == "function", "table.clone")
+            assert(type(math.noise) == "function", "math.noise")
+            assert(type(bit32.byteswap) == "function", "bit32.byteswap")
+            assert(type(coroutine.close) == "function", "coroutine.close")
+            assert(type(utf8.charpattern) == "string", "utf8.charpattern")
+            """
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

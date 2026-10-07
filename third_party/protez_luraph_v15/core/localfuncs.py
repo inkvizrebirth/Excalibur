@@ -1,31 +1,23 @@
-"""
-`local f = function(...) ... end`  ->  `local function f(...) ... end`
-(text pass on finished Luau, after names.py).
-
-The two differ only in whether `f` inside the body refers to the new local,
-so the rewrite is done only when the body never references that local.
-"""
 import json
+
+import ast_cli
 import os
 import subprocess
 import tempfile
 
-import ast_cli
-
 HERE = os.path.dirname(os.path.abspath(__file__))
 BIN_DIR = os.path.join(HERE, "..", "bin") if os.path.exists(os.path.join(HERE, "..", "bin")) else os.path.join(HERE, "bin")
-
 
 def _ast(text):
     with tempfile.NamedTemporaryFile("w", suffix=".luau", delete=False, encoding="utf-8", newline="\n") as f:
         f.write(text)
         path = f.name
     try:
-        out = ast_cli.parse_file(path)
+        out = subprocess.run([str(ast_cli.binary()), path],
+                             capture_output=True).stdout
     finally:
         os.remove(path)
     return json.loads(out.decode("latin-1"))["root"]
-
 
 def _walk(n, fn):
     if isinstance(n, dict):
@@ -36,7 +28,6 @@ def _walk(n, fn):
     elif isinstance(n, list):
         for v in n:
             _walk(v, fn)
-
 
 def rewrite(text):
     root = _ast(text)
@@ -59,12 +50,11 @@ def rewrite(text):
     _walk(root, visit)
     lines = text.split("\n")
     for l, c, name in hits:
-        s = lines[l].encode("utf-8")        # luau-ast columns are byte offsets
+        s = lines[l].encode("utf-8")        
         head = ("local %s = function(" % name).encode("utf-8")
         if s[c:c + len(head)] == head:
             lines[l] = (s[:c] + ("local function %s(" % name).encode("utf-8") + s[c + len(head):]).decode("utf-8")
     return "\n".join(lines)
-
 
 if __name__ == "__main__":
     import sys

@@ -260,5 +260,25 @@ class AvailabilityTests(unittest.TestCase):
         self.assertEqual(emulator_available(), HAVE_LUA)
 
 
+
+class LuauSourceTests(unittest.TestCase):
+    """A loader written in Luau must run on the Lua 5.1 backend."""
+
+    def test_luau_only_syntax_runs_end_to_end(self) -> None:
+        loader = """
+        local total = 0
+        for index = 1, 3 do
+          local step = if index % 2 == 0 then 1_0 else 2_0
+          total += step
+        end
+        print("total", total // 3)
+        """
+        result = LuaEmulator(profile="universal").run(loader)
+        self.assertEqual(result.status, "completed", result.error)
+        printed = [capture.text for capture in result.captures if capture.kind == "print"]
+        self.assertTrue(any("16" in text for text in printed), printed)
+        self.assertTrue(any("Luau syntax lowered" in note for note in result.notes), result.notes)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import os
 import re
@@ -24,6 +25,12 @@ MAX_DEVIRT_ROUNDS = 8
 MAX_TRAP_RUNS = 3
 _ENVLOG_BEGIN = "\x00ENVLOG-BEGIN\n"
 _ENVLOG_END = "\x00ENVLOG-END"
+_LURAPH_V14_BANNER = re.compile(r"luraph\s+obfuscator\s+v?14[.\d]*", re.IGNORECASE)
+_LURAPH_V15_BANNER = re.compile(r"luraph\s+obfuscator\s+v?15[.\d]*", re.IGNORECASE)
+# `local S=(...)[[LPH]]...` wrappers end with `end}):t()(...)`: a method fetch
+# on the table the wrapper returned, which is v14's entry shape.
+_V14_ENTRY_TAIL = re.compile(r"\}\s*\)\s*:\s*[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\(\s*\.\.\.\s*\)\s*;?\s*$")
+_V15_ENTRY_MARKERS = re.compile(r"LPH_(?:ENCSTR|ENCFUNC|CRASH|NO_VIRTUALIZE)")
 
 
 class LuraphDevirtualizationError(RuntimeError):
@@ -257,22 +264,155 @@ def _build_sandbox_harness(harness, source: str, cfg, chunks) -> str:
     return harness.build_harness(from_latin1(source), cfg, decoded_chunks)
 
 
-def _import_vendor():
+def luraph_family(source: str) -> str:
+    """Which shipped Luraph front end owns this wrapper.
+
+    v14.7/14.8/14.9 (Luraph's method-based state-machine VM, protos as closure
+    factories) and v15 (flat dispatch loops) share one analysis engine, but the
+    mapper, the runtime capture and the lift differ, so the family is decided
+    before anything runs.  The banner is authoritative when it is present; a
+    stripped banner is recognised by the v14 entry call the wrapper ends with
+    (`...}):t()(...)`, a method lookup on the returned table) or by the
+    interpreter's initializer shape.
+    """
+    head = source[:8192]
+    if _LURAPH_V14_BANNER.search(head):
+        return "luraph_v14"
+    if _LURAPH_V15_BANNER.search(head):
+        return "luraph_v15"
+    stripped = source.rstrip()
+    if _V14_ENTRY_TAIL.search(stripped[-4096:]):
+        return "luraph_v14"
+    if _V15_ENTRY_MARKERS.search(stripped[-4096:]):
+        return "luraph_v15"
+    return "luraph_v15"
+
+
+def _import_vendor(family: str = "luraph_v15"):
     if not VENDOR_CORE.is_dir():
-        raise LuraphDevirtualizationError("the Luraph v15 lifter files are missing from this Protez build")
+        raise LuraphDevirtualizationError("the Luraph lifter files are missing from this Protez build")
     core_path = str(VENDOR_CORE)
     if core_path not in sys.path:
         sys.path.insert(0, core_path)
     try:
         harness = importlib.import_module("harness")
         driver = importlib.import_module("obfuscators.luraph_v15.driver")
-        devirt = importlib.import_module("obfuscators.luraph_v15.devirt")
         backend = importlib.import_module("backend")
+        if family == "luraph_v14":
+            devirt = importlib.import_module("obfuscators.luraph_v14.devirt")
+            vmmap = importlib.import_module("obfuscators.luraph_v14.vmmap")
+            plugin = importlib.import_module("obfuscators.luraph_v14.driver")
+        else:
+            devirt = importlib.import_module("obfuscators.luraph_v15.devirt")
+            vmmap = None
+            plugin = None
     except Exception as exc:
         raise LuraphDevirtualizationError(
-            f"could not load the Luraph v15 analysis engine: {type(exc).__name__}: {exc}"
+            f"could not load the Luraph {family} analysis engine: {type(exc).__name__}: {exc}"
         ) from exc
-    return harness, driver, devirt, backend
+    return harness, driver, devirt, backend, vmmap, plugin
+
+
+class _V14Route:
+    """Point the shared engine at the v14 mapper and lifter for one lift.
+
+    ``patch_entries`` (the runtime instrumentation) and ``patch_entries``'s
+    helper lookups resolve the v15 mapper through
+    ``obfuscators.luraph_v15.vmmap``, and the shared driver's ``lift`` is a
+    module global: both are swapped for the v14 plugin here and restored
+    afterwards, so the process can lift either family, in any order.
+    """
+
+    def __init__(self, driver, vmmap, plugin, devirt):
+        self.driver = driver
+        self.vmmap = vmmap
+        self.plugin = plugin
+        self.devirt = devirt
+        self._saved = []
+
+    def __enter__(self):
+        package = importlib.import_module("obfuscators.luraph_v15")
+        self._saved.append((package, "vmmap", getattr(package, "vmmap", None)))
+        package.vmmap = self.vmmap
+        v15_lift = self.driver.lift
+
+        def lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath, chunk_paths):
+            return v15_lift(job, runner, patched, cfg, chunks, run_text, ppath, dpath,
+                            chunk_paths, self.devirt)
+
+        self._saved.append((self.driver, "lift", v15_lift))
+        self.driver.lift = lift
+        # The v14 dump predates the harness' root ranking: Protez ranks the
+        # payload root itself, because the dump's rootCallee is the anti-tamper
+        # proto. Engines without the hook (older/newer vendor code) keep theirs.
+        if hasattr(self.devirt, "_lift_candidates"):
+            self._saved.append((self.devirt, "_lift_candidates", self.devirt._lift_candidates))
+            self.devirt._lift_candidates = _v14_root_candidates
+        # A v14 container is one flat prototype namespace per VM, so lifting
+        # only the ranked root would emit the bootstrap and drop the script's
+        # own protos: every proto is lifted instead.
+        if hasattr(self.devirt, "lift_program_all"):
+            self._saved.append((self.devirt, "lift_program", self.devirt.lift_program))
+            self.devirt.lift_program = self.devirt.lift_program_all
+        return self
+
+    def __exit__(self, *_exc):
+        for owner, name, previous in reversed(self._saved):
+            setattr(owner, name, previous)
+        self._saved.clear()
+        return False
+
+
+def _v14_root_candidates(protos_path: str) -> list[int]:
+    """Payload-root candidates for a captured v14 prototype graph.
+
+    The runtime capture reports `root_callee` as the first proto the entry
+    method calls, which in the v14 layout is Luraph's anti-tamper proto
+    (thousands of opcodes, a deep stack) rather than the program.  Luraph
+    numbers the program root first, so the plausible protos are ranked by
+    prototype number, skipping the anti-tamper-shaped ones, and the dump's own
+    root is pointed at the best candidate: the lifter still tries each
+    candidate and keeps the cleanest result, so a wrong ranking costs time,
+    never output quality.  A dump that already carries the harness' ranked
+    roots (`root_candidates`, v15 captures) keeps that order.
+    """
+    try:
+        data = json.loads(Path(protos_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    harness_ranked = [int(pid) for pid in (data.get("root_candidates") or []) if str(pid).isdigit()]
+    protos = data.get("protos") or {}
+    tables = data.get("tables") or {}
+    ranked: list[tuple[int, int]] = []
+    for key, proto in protos.items():
+        if not key.isdigit() or not isinstance(proto, dict):
+            continue
+        ops = proto.get("H")
+        if not isinstance(ops, dict) or "t" not in ops:
+            continue
+        table = tables.get(str(ops["t"]))
+        if not table:
+            continue
+        count = len(table.get("arr") or [])
+        maxstack = proto.get("K")
+        if not isinstance(maxstack, (int, float)):
+            maxstack = 0
+        if count < 64 or maxstack >= 80:
+            continue
+        ranked.append((int(key), count))
+    ranked.sort()
+    candidates = [pid for pid, _count in ranked]
+    if harness_ranked:
+        return harness_ranked + [pid for pid in candidates if pid not in harness_ranked]
+    if candidates and data.get("root_callee") not in candidates:
+        # the capture's own root is anti-tamper shaped: make the best candidate
+        # the default so the lifter's first walk is the program, not the trap
+        data["root_callee"] = candidates[0]
+        try:
+            Path(protos_path).write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+        except OSError:
+            pass
+    return candidates
 
 
 def _install_analysis_deadline(backend, deadline: float) -> None:
@@ -316,7 +456,7 @@ def _install_analysis_deadline(backend, deadline: float) -> None:
     backend.run_big_stack = run_big_stack
 
 
-def devirtualize_luraph_v15(
+def devirtualize_luraph(
     source: str,
     *,
     source_name: str,
@@ -325,24 +465,28 @@ def devirtualize_luraph_v15(
     timeout_seconds: float,
     total_budget_seconds: float,
     logger: logging.Logger,
+    family: str = "auto",
 ) -> LuraphDevirtualizationResult:
+    if family == "auto":
+        family = luraph_family(source)
+    label = "Luraph v14" if family == "luraph_v14" else "Luraph v15"
     source_bytes = source.encode("utf-8")
     if len(source_bytes) > MAX_LURAPH_V15_SOURCE_BYTES:
         raise LuraphDevirtualizationError(
-            f"Luraph v15 VM lifting is limited to {MAX_LURAPH_V15_SOURCE_BYTES // (1024 * 1024)} MiB; "
+            f"{label} VM lifting is limited to {MAX_LURAPH_V15_SOURCE_BYTES // (1024 * 1024)} MiB; "
             "the bounded static and runtime report is still available"
         )
 
     ast_tool = tools_dir / ("luau-ast.exe" if os.name == "nt" else "luau-ast")
     if not ast_tool.is_file():
         raise LuraphDevirtualizationError(
-            "the pinned Luau AST parser is missing; repair Protez's native runtime before lifting Luraph v15"
+            f"the pinned Luau AST parser is missing; repair Protez's native runtime before lifting {label}"
         )
 
     started = time.monotonic()
     deadline = started + total_budget_seconds
     vendor_source = source_bytes.decode("latin-1")
-    harness, driver, devirt, backend = _import_vendor()
+    harness, driver, devirt, backend, vmmap, plugin = _import_vendor(family)
     previous_backend_big_stack = backend.run_big_stack
     previous_big_stack = devirt.run_big_stack
     previous_lift_program = devirt.lift_program
@@ -428,7 +572,11 @@ def devirtualize_luraph_v15(
             )
             job = _Job(source_path, vendor_source, trace_path, args)
             try:
-                returned_path = driver.run(job)
+                if family == "luraph_v14":
+                    with _V14Route(driver, vmmap, plugin, devirt):
+                        returned_path = driver.run(job)
+                else:
+                    returned_path = driver.run(job)
             except SystemExit as exc:
                 detail = str(exc).strip() or "the family lifter rejected this wrapper shape"
                 raise LuraphDevirtualizationError(detail) from exc
@@ -471,7 +619,7 @@ def devirtualize_luraph_v15(
                         pass
                 return LuraphDevirtualizationResult(
                     source=lifted,
-                    route="luraph-v15-vm-lifter",
+                    route=("luraph-v14-vm-lifter" if family == "luraph_v14" else "luraph-v15-vm-lifter"),
                     run_results=tuple(run_results),
                     trace_source=trace_source,
                     source_bytes=len(source_bytes),
@@ -501,3 +649,9 @@ def devirtualize_luraph_v15(
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = previous
+
+
+def devirtualize_luraph_v15(source: str, **kwargs) -> LuraphDevirtualizationResult:
+    """Lift a v15 wrapper (kept as the stable entry point for older callers)."""
+    kwargs.pop("family", None)
+    return devirtualize_luraph(source, family="luraph_v15", **kwargs)
