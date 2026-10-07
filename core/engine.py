@@ -28,7 +28,7 @@ from typing import Callable, Iterable, Sequence
 from core.deobfuscator import deobfuscate_source
 from core.devirt import DevirtResult
 from core.devirt import devirtualize as devirtualize_family
-from core.emulator import EmulatorResult, LuaEmulator, emulator_available
+from core.emulator import EmulatorResult, LuaEmulator, backend_terminates, emulator_available
 from core.families import (
     FamilyOutcome,
     best_family,
@@ -648,6 +648,24 @@ class RecoveryEngine:
         return time.monotonic() + self.max_seconds
 
     def _run_emulator(self, source: str, fetcher: PayloadFetcher) -> EmulatorResult | None:
+        # A loader that swallows the step budget loops forever *inside one Lua
+        # call*, where neither the budget nor the pipeline deadline can reach it.
+        # Run the script in a disposable child first: if that child has to be
+        # killed, the backend is skipped instead of freezing the whole app.
+        verdict = backend_terminates(source, timeout_seconds=self.emulator_timeout, logger=self.logger)
+        if verdict is False:
+            note = (
+                "portable backend skipped: the loader caught the step budget and kept running "
+                "inside one call"
+            )
+            self.logger.warning(note)
+            return EmulatorResult(
+                status="unavailable",
+                error=note,
+                runtime="Lua 5.1 (lupa)",
+                profile=self.profile.label,
+                notes=(note,),
+            )
         try:
             emulator = LuaEmulator(
                 profile=self.profile,

@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import tempfile
+import os
+import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
-from core.emulator import LuaEmulator, classify_chunk, emulator_available
+from core.emulator import (
+    LuaEmulator,
+    backend_terminates,
+    classify_chunk,
+    emulator_available,
+)
 
 try:
     from lupa import lua51  # noqa: F401
@@ -278,6 +286,56 @@ class LuauSourceTests(unittest.TestCase):
         printed = [capture.text for capture in result.captures if capture.kind == "print"]
         self.assertTrue(any("16" in text for text in printed), printed)
         self.assertTrue(any("Luau syntax lowered" in note for note in result.notes), result.notes)
+
+
+class BackendProbeTests(unittest.TestCase):
+    """A loader that swallows the step budget must not freeze the host.
+
+    ``while true do pcall(...) end`` keeps running after the budget error is
+    caught, and the interpreter cannot be interrupted from inside the same Lua
+    state.  The probe runs the script in a disposable child first and reports
+    whether it returned, so the engine can skip a hopeless run instead of
+    hanging the application.
+    """
+
+    def setUp(self) -> None:
+        if os.name == "nt" or not hasattr(os, "fork"):
+            self.skipTest("process isolation needs fork")
+        if not emulator_available():
+            self.skipTest("lupa is required for the portable backend")
+
+    def test_a_script_that_returns_is_reported_as_runnable(self) -> None:
+        verdict = backend_terminates(
+            "local t = {} for i = 1, 3 do t[i] = i * 2 end print(#t)\n",
+            timeout_seconds=10.0,
+        )
+        self.assertIs(verdict, True)
+
+    def test_a_budget_swallowing_loop_does_not_run_forever(self) -> None:
+        # The escalation has to neuter the loader's own pcall, otherwise the
+        # budget error is caught and the loop retries until the host dies.
+        verdict = backend_terminates(
+            "while true do pcall(function() local x = 1 end) end\n",
+            timeout_seconds=10.0,
+            max_instructions=200,
+        )
+        self.assertIs(verdict, True)
+
+    def test_a_child_that_never_returns_is_killed_and_reported(self) -> None:
+        import core.emulator as emulator_module
+
+        def hang(self, source):  # noqa: ANN001 - test double
+            time.sleep(60)
+            raise AssertionError("the probe should have killed this child")
+
+        original_slack = emulator_module.PROBE_SLACK_SECONDS
+        emulator_module.PROBE_SLACK_SECONDS = 0.0
+        with unittest.mock.patch.object(emulator_module.LuaEmulator, "run", hang):
+            try:
+                verdict = backend_terminates("print('hi')\n", timeout_seconds=0.3)
+            finally:
+                emulator_module.PROBE_SLACK_SECONDS = original_slack
+        self.assertIs(verdict, False)
 
 
 if __name__ == "__main__":

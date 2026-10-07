@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import os
 import logging
+import signal
 import time
 import zlib
 from dataclasses import dataclass, field
@@ -48,6 +49,7 @@ from core.vm_dump import (
 )
 
 __all__ = [
+    "backend_terminates",
     "EmulatorCapture",
     "EmulatorResult",
     "EmulatorUnavailable",
@@ -63,6 +65,9 @@ __all__ = [
 HOOK_STEP = 500
 
 MAX_INSTRUCTIONS = 80_000_000 // HOOK_STEP
+#: Once the budget is spent, re-escalate this often: a loader that keeps catching
+#: the error gets its newly created handlers neutered as well.
+ESCALATE_EVERY = 2_000
 MAX_CAPTURES = 200
 MAX_VM_TABLES = 160
 MAX_CAPTURE_BYTES = 8 * 1024 * 1024
@@ -70,7 +75,70 @@ MAX_PRINT_LINES = 400
 
 _LUA_BOOTSTRAP = r"""
 -- Python callables arrive as callable userdata; wrap them in Lua closures.
-local __protez_step_fn = function() __protez_step() end
+local __protez_real_pcall = pcall
+local __protez_real_xpcall = xpcall
+local __protez_real_resume = coroutine and coroutine.resume
+local __protez_real_wrap = coroutine and coroutine.wrap
+
+-- A loader that wraps its own loop in ``pcall`` swallows the step budget and
+-- keeps running (AztupBrew does exactly that), which used to hang the whole
+-- process: the error was caught, the loop retried, the hook raised again.
+-- Once the budget is spent the hook is allowed to *edit* the paused script:
+-- every reachable ``pcall``/``xpcall``/``coroutine.resume`` reference is
+-- replaced by a function that raises, so the next error propagates out of the
+-- chunk instead of being caught.  This only ever runs after the budget is gone.
+local __protez_fatal_fn = function()
+  error('Protez step budget exceeded', 2)
+end
+
+local function __protez_patch_table(target)
+  if type(target) ~= 'table' then return end
+  local seen = 0
+  for key, value in pairs(target) do
+    if value == __protez_real_pcall or value == __protez_real_xpcall
+       or value == __protez_real_resume or value == __protez_real_wrap then
+      rawset(target, key, __protez_fatal_fn)
+    end
+    seen = seen + 1
+    if seen > 256 then break end
+  end
+end
+
+local function __protez_neuter()
+  rawset(_G, 'pcall', __protez_fatal_fn)
+  rawset(_G, 'xpcall', __protez_fatal_fn)
+  if coroutine then
+    coroutine.resume = __protez_fatal_fn
+    coroutine.wrap = __protez_fatal_fn
+  end
+  for level = 2, 200 do
+    local info = debug.getinfo(level, 'f')
+    if info == nil then break end
+    local fn = info.func
+    if fn ~= nil then
+      local index = 1
+      while true do
+        local name, value = debug.getupvalue(fn, index)
+        if name == nil then break end
+        if value == __protez_real_pcall or value == __protez_real_xpcall
+           or value == __protez_real_resume or value == __protez_real_wrap then
+          debug.setupvalue(fn, index, __protez_fatal_fn)
+        elseif type(value) == 'table' then
+          __protez_patch_table(value)
+        end
+        index = index + 1
+      end
+    end
+  end
+end
+
+local function __protez_step_fn()
+  local verdict = __protez_step()
+  if verdict == 'escalate' then
+    __protez_neuter()
+    error('Protez step budget exceeded', 0)
+  end
+end
 local __protez_print_fn = function(text) __protez_record_print(text) end
 local __protez_clock_fn = function() return __protez_clock() end
 local __protez_time_fn = function() return __protez_time() end
@@ -316,6 +384,92 @@ def _as_mapping(value: Any) -> dict[str, Any]:
     return converted
 
 
+#: Slack added to the probe's wall clock before its child is killed: the budget
+#: is enforced inside Lua, and this covers process start-up and a slow tail.
+PROBE_SLACK_SECONDS = 5.0
+
+
+def backend_terminates(
+    source: str,
+    *,
+    timeout_seconds: float,
+    max_instructions: int | None = None,
+    logger: logging.Logger | None = None,
+) -> bool | None:
+    """Whether the portable backend finishes this script instead of hanging.
+
+    A loader that catches the step-budget error and keeps looping cannot be
+    stopped from inside its own Lua state: one C call (or a hook the script
+    cleared) freezes the interpreter, and the library cannot take control back.
+    The only reliable stop is process-level, so the script is first run in a
+    forked child that is killed when the wall clock runs out.  ``None`` means
+    process isolation is unavailable (Windows), and the caller should keep the
+    previous behaviour of running the backend in-process.
+    """
+    if os.name == "nt" or not hasattr(os, "fork"):
+        return None
+    read_fd, write_fd = os.pipe()
+    try:
+        pid = os.fork()
+    except OSError as exc:  # pragma: no cover - fork limits are environmental
+        os.close(read_fd)
+        os.close(write_fd)
+        if logger is not None:
+            logger.debug("Portable backend probe could not fork: %s", exc)
+        return None
+    if pid == 0:  # pragma: no cover - the child never returns to the test suite
+        try:
+            os.close(read_fd)
+            verdict = b"0"
+            try:
+                if max_instructions is None:
+                    emulator = LuaEmulator(timeout_seconds=timeout_seconds)
+                else:
+                    emulator = LuaEmulator(
+                        timeout_seconds=timeout_seconds, max_instructions=max_instructions
+                    )
+                emulator.run(source)
+                verdict = b"1"
+            except BaseException:  # noqa: BLE001 - a failed probe is a "no"
+                verdict = b"0"
+            os.write(write_fd, verdict)
+            os.close(write_fd)
+        finally:
+            os._exit(0)
+
+    os.close(write_fd)
+    deadline = time.monotonic() + timeout_seconds + PROBE_SLACK_SECONDS
+    finished = False
+    while time.monotonic() < deadline:
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:  # pragma: no cover - the child vanished
+            done = pid
+        if done == pid:
+            finished = True
+            break
+        time.sleep(0.05)
+    if not finished:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:  # pragma: no cover - already gone
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:  # pragma: no cover
+            pass
+    verdict = b""
+    try:
+        verdict = os.read(read_fd, 1)
+    except OSError:  # pragma: no cover - nothing was written
+        verdict = b""
+    finally:
+        os.close(read_fd)
+    # Only a child that *returned a result* counts: a killed child, or one that
+    # raised before finishing, must not be re-run in this process.
+    return finished and verdict == b"1"
+
+
 def emulator_available() -> bool:
     """True when the optional ``lupa`` runtime can be imported."""
     try:
@@ -477,6 +631,7 @@ class LuaEmulator:
         captures: list[EmulatorCapture] = []
         state = {
             "instructions": 0,
+            "escalations": 0,
             "stopped": None,
             "fetches": [],
             "requests": [],
@@ -552,14 +707,28 @@ class LuaEmulator:
                 EmulatorCapture(kind="print", text=str(text), chunk_name="", binary=False)
             )
 
-        def step_hook() -> None:
+        def step_hook() -> str | None:
+            """Count a step and stop a script that keeps catching the stop.
+
+            The first trip hands the decision back to Lua, which neuters every
+            ``pcall`` it can reach before raising: otherwise a loader that wraps
+            its loop in ``pcall`` simply retries and the run never ends.  While
+            the script keeps running, every later trip escalates again, so
+            handlers created since the last pass are caught too.
+            """
             state["instructions"] += 1
-            if state["instructions"] > self.max_instructions:
-                state["stopped"] = "instruction budget"
-                raise RuntimeError("Protez step budget exceeded")
-            if time.monotonic() > deadline:
-                state["stopped"] = "time budget"
-                raise RuntimeError("Protez time budget exceeded")
+            if state["stopped"] is None:
+                if state["instructions"] > self.max_instructions:
+                    state["stopped"] = "instruction budget"
+                elif time.monotonic() > deadline:
+                    state["stopped"] = "time budget"
+            if state["stopped"] is not None:
+                escalations = state["escalations"]
+                if escalations == 0 or state["instructions"] - escalations >= ESCALATE_EVERY:
+                    state["escalations"] = state["instructions"]
+                    return "escalate"
+                raise RuntimeError(f"Protez stopped by the {state['stopped']}")
+            return None
 
         def clock() -> float:
             return time.monotonic() - started

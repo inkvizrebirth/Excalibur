@@ -25,6 +25,17 @@
   `([[MoonSec V3]]):gsub(...)` left a string where Lua needs a prefix expression.
   A replacement is now spaced or parenthesised exactly when the surrounding text
   requires it.
+- The portable backend can no longer freeze the application.  A loader that
+  catches the step-budget error inside its own `pcall` and keeps looping (the
+  AztupBrew fixture did) runs forever inside one Lua call, where neither the
+  instruction budget nor the pipeline deadline can reach it.  The backend now
+  runs the script in a forked child first and only touches the loader in this
+  process when that child returned; a child that has to be killed makes the run
+  report the backend as skipped instead of hanging the GUI.  On the way the
+  budget itself got harder to swallow: when it is spent, the step hook neuters
+  every `pcall`/`xpcall`/`coroutine.resume` it can reach in the paused script
+  (globals, upvalues and one level of their tables), so the next raise cannot be
+  caught, and it re-escalates whenever the loader rebuilds its handlers.
 - The expression parser no longer accepts a truncated span.  On an IronBrew3
   fixture it stopped parsing inside a function body (`105 or yz==((function()`)
   and the "fold" deleted the body's head; a span is now only trusted when its
