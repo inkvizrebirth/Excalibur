@@ -62,7 +62,8 @@ def lower(entry_key, order, D, link, prefix, upnames, closure):
         body = IDI.inline_const_locals(body)
         body = IDI.fold_single_use(body)    
     body = VR.declare(body, (), own)
-    body = VR.limit_locals(body)
+    body = VR.hoist_function_level_temps(body)
+    body = VR.scope_locals(body)
     params = VR.extract_params(body)
     rend = CG.Renderer(names)
     return rend.block(body, ""), params, nerr, sr.fallbacks

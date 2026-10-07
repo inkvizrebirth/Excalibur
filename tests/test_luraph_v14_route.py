@@ -287,5 +287,69 @@ class V14LiftOracleTests(unittest.TestCase):
         self.assertLessEqual(devirt._scaffold_score(text), 120, text[:400])
 
 
+class LocalScopingTests(unittest.TestCase):
+    """The lifted output has to compile *and* keep every read in scope.
+
+    A large VM walk materializes thousands of multi-value calls as
+    `local t<id> = table.pack(...)`.  They count toward Luau's 200-local limit
+    (a lifted v14 chunk failed to compile over one of them), so the scoping
+    pass cuts the body into `do ... end` segments -- but a materialization that
+    the CFG structurer distributed over sibling blocks (the state-machine
+    fallback) is read in another arm, where the segment's `end` would take the
+    name out of scope.  Luau resolves an unknown name as a *global*, so the
+    result compiled and silently read nil.
+    """
+
+    @staticmethod
+    def _modules():
+        _add_vendor_to_path()
+        import codegen
+        import structure
+        import variables
+        from luasym import Global, NewTable
+
+        return codegen, structure, variables, Global, NewTable
+
+    def _call_multivalue(self, codegen, Global, NewTable):
+        import luasym
+
+        call = codegen.CallE(Global("table.pack"), codegen.Multi([codegen.Const(1)]))
+        return codegen.TempDef("7_1_1", call)
+
+    def test_materialization_read_in_a_sibling_branch_stays_in_scope(self) -> None:
+        codegen, structure, variables, Global, NewTable = self._modules()
+        temp = self._call_multivalue(codegen, Global, NewTable)
+        read = codegen.AssignS([Global("out")], codegen.Multi([codegen.TempVal("7_1_1", 1)]))
+        guard = codegen.Bin("CompareEq", codegen.LocalName("state"), codegen.Const(1))
+        body = [
+            codegen.LocalS(["state"], None),
+            structure.SIf(guard, structure.SBlock([temp]), structure.SBlock([])),
+            structure.SIf(codegen.Bin("CompareEq", codegen.LocalName("state"), codegen.Const(2)),
+                          structure.SBlock([read]), structure.SBlock([])),
+        ]
+        # the declaration moves to the block that contains the read, so both
+        # branches can see it; a `do ... end` around the declaring arm would
+        # have hidden it and Luau would resolve the name as a global nil.
+        variables.hoist_function_level_temps(body)
+        scoped = variables.scope_locals(body, budget=2)
+        text = "\n".join(codegen.Renderer().block(scoped, ""))
+        self.assertIn("t7_1_1", text, text)
+        self.assertNotIn("do\n", text, text)
+        self.assertLess(text.index("local t7_1_1"), text.index("out = t7_1_1[1]"), text)
+        self.assertIn("t7_1_1 = table.pack(", text, text)
+
+    def test_materialization_read_once_stays_a_local_in_its_block(self) -> None:
+        codegen, structure, variables, Global, NewTable = self._modules()
+        temp = self._call_multivalue(codegen, Global, NewTable)
+        read = codegen.AssignS([Global("out")], codegen.Multi([codegen.TempVal("7_1_1", 1)]))
+        body = [temp, read]
+        variables.hoist_function_level_temps(body)
+        scoped = variables.scope_locals(body, budget=2)
+        text = "\n".join(codegen.Renderer().block(scoped, ""))
+        self.assertIn("local t7_1_1 = table.pack(", text, text)
+        self.assertIn("out = t7_1_1[1]", text, text)
+        self.assertLess(text.index("local t7_1_1"), text.index("out = t7_1_1[1]"), text)
+
+
 if __name__ == "__main__":
     unittest.main()

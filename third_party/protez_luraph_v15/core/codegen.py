@@ -1425,6 +1425,19 @@ class Renderer:
         if isinstance(e, TailRef):
             return self.tail(e.tail)
         if isinstance(e, SymList):
+            # A wide literal list cannot be written as call arguments: every
+            # argument needs a register and Luau allows 255 per function, so a
+            # packed constant table of a few hundred entries aborts the
+            # compile with "Out of registers" (a Luraph VM routinely builds
+            # such tables from its own bytecode).  The same values inside a
+            # table constructor need no registers at all, and the count a
+            # `table.pack` would have stored is the literal's own length.
+            if e.tail is None and len(e.items) > 64:
+                items = ", ".join("(%s)" % self.expr(x) for x in e.items)
+                return (
+                    "(function() local t = { %s }; t.n = %d; return t end)()"
+                    % (items, len(e.items))
+                )
             return "table.pack(%s)" % self.multi(Multi(e.items, e.tail))
         if type(e).__name__ == "Opaque":
             return e.src or "nil --[[ %s ]]" % e.kind

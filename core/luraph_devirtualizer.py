@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import logging
@@ -20,6 +21,8 @@ from core.sandbox import Sandbox, SandboxResult
 VENDOR_ROOT = RESOURCE_ROOT / "third_party" / "protez_luraph_v15"
 VENDOR_CORE = VENDOR_ROOT / "core"
 MAX_LURAPH_V15_SOURCE_BYTES = 2 * 1024 * 1024
+HARNESS_STALL_SECONDS = 20.0
+
 MAX_TRACE_TEXT_BYTES = 32 * 1024 * 1024
 MAX_DEVIRT_ROUNDS = 8
 MAX_TRAP_RUNS = 3
@@ -215,10 +218,20 @@ class _ProtezRunner:
         self.sandbox.timeout_seconds = min(self.timeout_seconds, remaining)
         try:
             program = _build_sandbox_harness(harness, source, cfg, chunks)
+            # Development aid: keep the exact harness a run used so it can be
+            # replayed by hand (the vendored runtime heartbeats on stdout).
+            dump = os.environ.get("PROTEZ_DUMP_HARNESS")
+            if dump:
+                Path(dump).write_text(program, encoding="utf-8")
             result = self.sandbox.run(
                 program,
                 source_name=Path(self.job.input).name,
                 trace=False,
+                # The vendored runtime heartbeats while it works, so a payload
+                # whose VM spins without touching the environment stops
+                # reporting and can be given up on long before the wall
+                # timeout: its run carries no evidence either way.
+                stall_timeout_seconds=HARNESS_STALL_SECONDS,
             )
         except Exception as exc:
             return None, f"isolated Luau harness failed: {type(exc).__name__}: {exc}"
@@ -227,6 +240,11 @@ class _ProtezRunner:
             output = result.run_log_path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             return None, f"could not read isolated Luau harness output: {exc}"
+        if result.stalled:
+            return None, (
+                f"timed out after {result.duration_seconds:.1f} seconds (no harness output for "
+                f"{HARNESS_STALL_SECONDS:.0f}s: the script is stuck in a loop the tracer cannot see)"
+            )
         if result.timed_out:
             return None, f"timed out after {result.duration_seconds:.1f} seconds"
         if result.output_limited:
@@ -253,7 +271,13 @@ class _ProtezRunner:
 
 
 def _build_sandbox_harness(harness, source: str, cfg, chunks) -> str:
-    """Translate the vendor's byte-preserving internal strings back to UTF-8."""
+    """Translate the vendor's byte-preserving internal strings back to UTF-8.
+
+    The batch of runtime options is what the vendor's own ``run_once`` would
+    pass: in particular the heartbeat, which is the only thing that tells a
+    script working quietly in its own code apart from one spinning where
+    nothing can see it.
+    """
     def from_latin1(value: str) -> str:
         return value.encode("latin-1").decode("utf-8")
 
@@ -261,7 +285,9 @@ def _build_sandbox_harness(harness, source: str, cfg, chunks) -> str:
         key: from_latin1(value)
         for key, value in (chunks or {}).items()
     }
-    return harness.build_harness(from_latin1(source), cfg, decoded_chunks)
+    options = dict(cfg)
+    options.setdefault("heartbeat", getattr(harness, "HEARTBEAT", 2))
+    return harness.build_harness(from_latin1(source), options, decoded_chunks)
 
 
 def luraph_family(source: str) -> str:
@@ -313,6 +339,83 @@ def _import_vendor(family: str = "luraph_v15"):
     return harness, driver, devirt, backend, vmmap, plugin
 
 
+# Both knobs exist because a Luraph VM does most of its work in the script's
+# own code, where nothing touches the environment: the spin watchdog exists to
+# stop such a run early, and these decide how early.  The defaults are the
+# vendored ones; raising them costs wall time and buys a fuller capture.
+LURAPH_SPIN_CHECKS = int(os.environ.get("PROTEZ_LURAPH_SPIN_CHECKS", "24"))
+LURAPH_TIME_BUDGET = int(os.environ.get("PROTEZ_LURAPH_TIME_BUDGET", "8"))
+
+# The counter the vendored runtime's spin watchdog reads: it lives inside the
+# script's own VM loops, so a payload that spins without ever touching the
+# environment still reports (the watchdog keeps the heartbeat alive and stops
+# the run with the trace it has).  Same statement the vendor's `patch_spin`
+# inserts; only the way the loops are found differs.
+_V14_SPIN_COUNTER = "__SPIN.n=__SPIN.n+1;if __SPIN.n>=__SPIN.step then __SPIN.f()end;"
+
+_V14_LOOP_TYPES = ("AstStatWhile", "AstStatRepeat")
+
+
+def _v14_loop_inserts(vmmap, source: str, scratch_dir: Path) -> list[tuple[int, int]]:
+    """Heads of every loop body in `source`, from the pinned Luau parser.
+
+    The vendor's ``patch_spin`` recognises a single textual loop shape with a
+    regex (``while true do x = t[i];``).  A Luraph v14 wrapper dispatches
+    through several others -- ``while true do if s == ... then``,
+    ``while true do a, b = vm:step(...)``, ``repeat ... until false`` -- and a
+    regex cannot tell a loop from the same words inside a string literal, so
+    the positions come from the AST instead.  Any error returns no positions:
+    the runtime's own watchdog is still there as a backstop.
+    """
+
+    try:
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        path = scratch_dir / ("spin_%s.luau" % hashlib.sha256(source.encode("latin-1")).hexdigest()[:16])
+        path.write_bytes(source.encode("latin-1"))
+        root = vmmap.load_ast(str(path))
+    except Exception:
+        return []
+    positions: list[tuple[int, int]] = []
+
+    def visit(node) -> None:
+        if node.get("type") not in _V14_LOOP_TYPES:
+            return
+        body = node.get("body") or {}
+        location = body.get("location")
+        if not location:
+            return
+        try:
+            line, column = (int(part) for part in location.split(" - ")[0].split(","))
+        except ValueError:
+            return
+        positions.append((line, column))
+
+    vmmap.walk(root, visit)
+    return positions
+
+
+def _v14_spin_patch(vmmap, scratch_dir: Path):
+    """A drop-in replacement for the vendor's `patch_spin`, for the v14 route."""
+
+    def patch(source: str) -> str:
+        positions = _v14_loop_inserts(vmmap, source, scratch_dir)
+        if not positions:
+            return source
+        lines = source.split("\n")
+        for line, column in sorted(set(positions), reverse=True):
+            if line >= len(lines) or column > len(lines[line]):
+                continue
+            # The leading space matters: a loop head ends in a keyword
+            # (`do`, `repeat`) and gluing the counter to it turns both into one
+            # identifier, which deletes the loop and orphans every `break`.
+            lines[line] = (
+                lines[line][:column] + " " + _V14_SPIN_COUNTER + lines[line][column:]
+            )
+        return "\n".join(lines)
+
+    return patch
+
+
 class _V14Route:
     """Point the shared engine at the v14 mapper and lifter for one lift.
 
@@ -323,11 +426,20 @@ class _V14Route:
     afterwards, so the process can lift either family, in any order.
     """
 
-    def __init__(self, driver, vmmap, plugin, devirt):
+    def __init__(self, driver, vmmap, plugin, devirt, scratch_dir: Path | None = None,
+                 lift_wrapper=None):
         self.driver = driver
         self.vmmap = vmmap
         self.plugin = plugin
         self.devirt = devirt
+        self.scratch_dir = Path(scratch_dir) if scratch_dir is not None else Path(tempfile.gettempdir())
+        # Applied to the lift this route installs, so the caller's recorder (the
+        # one that collects lift statistics for the report) still sees the
+        # v14 lift: the route swaps the engine's entry point, and a recorder
+        # installed on the module before the route ran would silently never be
+        # called -- the report then claimed a wrapper nothing had been lifted
+        # from while its 27 prototypes sat in the output.
+        self.lift_wrapper = lift_wrapper
         self._saved = []
 
     def __enter__(self):
@@ -342,6 +454,13 @@ class _V14Route:
 
         self._saved.append((self.driver, "lift", v15_lift))
         self.driver.lift = lift
+        # The vendor's spin watchdog only recognises the v15 loop shape; the
+        # v14 wrappers need the AST-driven one or a spinning payload is
+        # indistinguishable from a payload that is merely slow.
+        self._saved.append((self.driver, "patch_spin", self.driver.patch_spin))
+        self.driver.patch_spin = _v14_spin_patch(self.vmmap, self.scratch_dir)
+        self._saved.append((self.driver, "SPIN_CHECKS", self.driver.SPIN_CHECKS))
+        self.driver.SPIN_CHECKS = LURAPH_SPIN_CHECKS
         # The v14 dump predates the harness' root ranking: Protez ranks the
         # payload root itself, because the dump's rootCallee is the anti-tamper
         # proto. Engines without the hook (older/newer vendor code) keep theirs.
@@ -353,7 +472,10 @@ class _V14Route:
         # own protos: every proto is lifted instead.
         if hasattr(self.devirt, "lift_program_all"):
             self._saved.append((self.devirt, "lift_program", self.devirt.lift_program))
-            self.devirt.lift_program = self.devirt.lift_program_all
+            installed = self.devirt.lift_program_all
+            if self.lift_wrapper is not None:
+                installed = self.lift_wrapper(installed)
+            self.devirt.lift_program = installed
         return self
 
     def __exit__(self, *_exc):
@@ -494,8 +616,13 @@ def devirtualize_luraph(
 
     _install_analysis_deadline(backend, deadline)
 
-    def record_lift(*args, **kwargs):
-        result = previous_lift_program(*args, **kwargs)
+    def make_record_lift(lift):
+        def record_lift(*args, **kwargs):
+            return _record(lift, *args, **kwargs)
+        return record_lift
+
+    def _record(lift, *args, **kwargs):
+        result = lift(*args, **kwargs)
         if isinstance(result, tuple) and len(result) == 4:
             _text, stats, requests, _buffer_patches = result
             dump = devirt.LAST_DUMP[-1] if devirt.LAST_DUMP else None
@@ -515,7 +642,7 @@ def devirtualize_luraph(
     # devirt cached backend.run_big_stack at import time, so patch its alias as
     # well as backend's implementation to enforce Protez's per-input deadline.
     devirt.run_big_stack = backend.run_big_stack
-    devirt.lift_program = record_lift
+    devirt.lift_program = make_record_lift(previous_lift_program)
 
     run_results: list[SandboxResult] = []
     sandbox = Sandbox(
@@ -564,22 +691,47 @@ def devirtualize_luraph(
                 studio=False,
                 port=0,
                 studio_wait=0,
-                budget=max(1, min(8, int(timeout_seconds))),
+                budget=max(1, min(LURAPH_TIME_BUDGET, int(timeout_seconds))),
                 executor="Protez Offline",
                 input_text=None,
                 cfg=[],
                 strings=False,
             )
             job = _Job(source_path, vendor_source, trace_path, args)
-            try:
+
+            def lift_once():
                 if family == "luraph_v14":
-                    with _V14Route(driver, vmmap, plugin, devirt):
-                        returned_path = driver.run(job)
-                else:
-                    returned_path = driver.run(job)
+                    with _V14Route(driver, vmmap, plugin, devirt, scratch_dir=work,
+                                   lift_wrapper=make_record_lift):
+                        return driver.run(job)
+                return driver.run(job)
+
+            try:
+                returned_path = lift_once()
             except SystemExit as exc:
                 detail = str(exc).strip() or "the family lifter rejected this wrapper shape"
-                raise LuraphDevirtualizationError(detail) from exc
+                # A capture is a snapshot of a running script: which tables the
+                # runtime recorded (and how far it got) varies a little from run
+                # to run, and a v14 walk can come up empty on one snapshot and
+                # map the whole program on the next.  One retry, and only while
+                # there is budget left for it, is what keeps a fixture from
+                # reporting "cannot read" for a wrapper it just read.
+                retryable = "no closure makers" in detail or "dispatchers found" in detail
+                if retryable and deadline - time.monotonic() > 25.0:
+                    logger.info("Luraph %s lift found no program in this capture; retrying", label)
+                    for stale in (job.path(".protos.json"), job.path(".devirt.luau")):
+                        try:
+                            Path(stale).unlink()
+                        except OSError:
+                            pass
+                    try:
+                        returned_path = lift_once()
+                    except SystemExit as second:
+                        raise LuraphDevirtualizationError(
+                            str(second).strip() or detail
+                        ) from second
+                else:
+                    raise LuraphDevirtualizationError(detail) from exc
             except TimeoutError as exc:
                 raise LuraphDevirtualizationError(str(exc)) from exc
             except Exception as exc:

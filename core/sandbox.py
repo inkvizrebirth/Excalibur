@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -48,6 +49,7 @@ class SandboxResult:
     run_log_path: Path
     trace_token: str | None
     isolation_backend: str
+    stalled: bool = False
 
 
 class _PipeDrainer(threading.Thread):
@@ -72,6 +74,9 @@ class _PipeDrainer(threading.Thread):
         self.saved_bytes = 0
         self.error: OSError | None = None
         self.callback_error: Exception | None = None
+        # A run that stops producing output is not doing visible work: the
+        # heartbeat the harness prints is how a spinner is told from a worker.
+        self.last_output_at = time.monotonic()
 
     def run(self) -> None:
         try:
@@ -81,6 +86,7 @@ class _PipeDrainer(threading.Thread):
                     chunk = reader(64 * 1024)
                     if not chunk:
                         break
+                    self.last_output_at = time.monotonic()
                     self.total_bytes += len(chunk)
                     remaining = self._byte_limit - self.saved_bytes
                     if remaining > 0:
@@ -297,6 +303,9 @@ class _CaptureParser:
 class Sandbox:
     """Execute Luau in a networkless OS sandbox with bounded VM and process use."""
 
+    # Cached answer to "can a plain user build namespaces on this host?".
+    _UNSHARE_PROBE: bool | None = None
+
     def __init__(
         self,
         *,
@@ -331,9 +340,12 @@ class Sandbox:
         trace_token: str | None = None,
         output_line_callback: Callable[[bytes], None] | None = None,
         prelude: str | None = None,
+        stall_timeout_seconds: float | None = None,
     ) -> SandboxResult:
         if not isinstance(source, str):
             raise TypeError("source must be text")
+        if stall_timeout_seconds is not None and stall_timeout_seconds <= 0:
+            raise ValueError("stall_timeout_seconds must be positive")
         worker_source = f"{prelude}\n{source}" if prelude else source
         source_bytes = worker_source.encode("utf-8")
         if len(source_bytes) > self.max_input_bytes:
@@ -354,6 +366,7 @@ class Sandbox:
                 prelude=prelude,
                 trace_token=trace_token,
                 output_line_callback=output_line_callback,
+                stall_timeout_seconds=stall_timeout_seconds,
             )
 
     def _run_once(
@@ -366,6 +379,7 @@ class Sandbox:
         trace: bool,
         trace_token: str | None,
         output_line_callback: Callable[[bytes], None] | None,
+        stall_timeout_seconds: float | None = None,
     ) -> SandboxResult:
         native_host = self._resolve_native_host()
         if native_host is None:
@@ -434,7 +448,10 @@ class Sandbox:
             elif os.name == "posix":
                 command = self._linux_isolated_command(native_host, runner_path, worker_args, timeout)
                 stdin_mode = subprocess.DEVNULL
-                sandbox_backend = "bubblewrap namespaces"
+                names = {Path(part).name for part in command}
+                sandbox_backend = (
+                    "unshare namespaces" if "unshare" in names else "bubblewrap namespaces"
+                )
             else:
                 raise SandboxError(f"No isolated Luau worker is available on {os.name}")
 
@@ -493,6 +510,7 @@ class Sandbox:
                 input_writer.start()
             timed_out = False
             output_limited = False
+            stalled = False
             deadline = started + timeout
 
             while process.poll() is None:
@@ -502,6 +520,13 @@ class Sandbox:
                     break
                 if time.monotonic() >= deadline:
                     timed_out = True
+                    self._kill_process(process)
+                    break
+                if (
+                    stall_timeout_seconds is not None
+                    and time.monotonic() - drainer.last_output_at >= stall_timeout_seconds
+                ):
+                    stalled = True
                     self._kill_process(process)
                     break
                 time.sleep(0.025)
@@ -552,7 +577,13 @@ class Sandbox:
                 "Sandbox output exceeded %s bytes; process terminated",
                 f"{self.max_output_bytes:,}",
             )
-        if returncode != 0 and not timed_out and not output_limited:
+        if stalled:
+            self.logger.warning(
+                "Sandbox produced no output for %.0f seconds; process terminated "
+                "(the payload is spinning where it cannot be seen)",
+                stall_timeout_seconds,
+            )
+        if returncode != 0 and not timed_out and not output_limited and not stalled:
             self.logger.error(
                 "Luau process exited with code %s (see %s)",
                 returncode,
@@ -582,6 +613,7 @@ class Sandbox:
             run_log_path=run_log_path,
             trace_token=trace_token,
             isolation_backend=sandbox_backend,
+            stalled=stalled,
         )
 
     def _resolve_native_host(self) -> Path | None:
@@ -611,13 +643,11 @@ class Sandbox:
     ) -> list[str]:
         bwrap = shutil.which("bwrap")
         prlimit = shutil.which("prlimit")
-        if bwrap is None or prlimit is None:
-            missing = "bubblewrap" if bwrap is None else "prlimit"
+        if prlimit is None:
             raise SandboxError(
-                f"Linux dynamic analysis needs {missing}; install it to enable isolated execution."
+                "Linux dynamic analysis needs prlimit; install it to enable isolated execution."
             )
-
-        command = [
+        limits = [
             prlimit,
             f"--as={1024 * 1024 * 1024}",
             f"--cpu={max(1, math.ceil(timeout_seconds) + 1)}",
@@ -625,6 +655,18 @@ class Sandbox:
             "--nofile=64",
             "--core=0",
             "--",
+        ]
+        if bwrap is None:
+            unshare = self._linux_unshare_command(native_host, source_path, worker_args)
+            if unshare is not None:
+                return [*limits, *unshare]
+            raise SandboxError(
+                "Linux dynamic analysis needs bubblewrap, or unshare with unprivileged user "
+                "namespaces; install one of them to enable isolated execution."
+            )
+
+        command = [
+            *limits,
             bwrap,
             "--unshare-all",
             "--die-with-parent",
@@ -681,6 +723,128 @@ class Sandbox:
             ]
         )
         return command
+
+    @staticmethod
+    def _unprivileged_namespaces_available() -> bool:
+        """Whether this host lets a plain user build user/mount/pid/net namespaces.
+
+        bubblewrap is the first choice, but it is a package that is not installed
+        everywhere; Linux has answered the same question in userspace since 3.8
+        with ``unshare``.  The probe is cached because it costs a process.
+        """
+
+        cached = Sandbox._UNSHARE_PROBE
+        if cached is not None:
+            return cached
+        available = False
+        unshare = shutil.which("unshare")
+        if unshare is not None:
+            try:
+                probe = subprocess.run(
+                    [
+                        unshare,
+                        "--user",
+                        "--map-root-user",
+                        "--mount",
+                        "--pid",
+                        "--fork",
+                        "--net",
+                        "--",
+                        "true",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    check=False,
+                )
+                available = probe.returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                available = False
+        Sandbox._UNSHARE_PROBE = available
+        return available
+
+    def _linux_unshare_command(
+        self,
+        native_host: Path,
+        source_path: Path,
+        worker_args: list[str],
+    ) -> list[str] | None:
+        """The bubblewrap recipe rebuilt on ``unshare`` from util-linux.
+
+        Same guarantees: a private network namespace (no sockets), a private
+        mount namespace whose root holds nothing but read-only copies of the
+        interpreter's own runtime, the worker and the staged source, a private
+        PID namespace, and no privileges.
+        """
+
+        unshare = shutil.which("unshare")
+        if unshare is None or not self._unprivileged_namespaces_available():
+            return None
+        root = source_path.parent / "protez-root"
+        script_lines = [
+            "set -eu",
+            "mount --make-rprivate /",
+            f"mkdir -p {shlex.quote(str(root))}",
+            f"mount -t tmpfs -o mode=0755 tmpfs {shlex.quote(str(root))}",
+        ]
+        for name in ("usr", "lib", "lib64"):
+            script_lines.extend(
+                [
+                    f"mkdir -p {shlex.quote(str(root / name))}",
+                    f"if [ -d /{name} ]; then "
+                    f"mount --bind /{name} {shlex.quote(str(root / name))} && "
+                    f"mount -o remount,ro,bind {shlex.quote(str(root / name))}; fi",
+                ]
+            )
+        script_lines.append(f"mkdir -p {shlex.quote(str(root / 'etc'))}")
+        script_lines.append(
+            "if [ -f /etc/ld.so.cache ]; then "
+            f": > {shlex.quote(str(root / 'etc' / 'ld.so.cache'))} && "
+            f"mount --bind /etc/ld.so.cache {shlex.quote(str(root / 'etc' / 'ld.so.cache'))} && "
+            f"mount -o remount,ro,bind {shlex.quote(str(root / 'etc' / 'ld.so.cache'))}; fi"
+        )
+        for name, mode in (("dev", "0755"), ("tmp", "1777")):
+            script_lines.extend(
+                [
+                    f"mkdir -p {shlex.quote(str(root / name))}",
+                    f"mount -t tmpfs -o mode={mode} tmpfs {shlex.quote(str(root / name))}",
+                ]
+            )
+        script_lines.append(f"mkdir -p {shlex.quote(str(root / 'proc'))}")
+        script_lines.append(
+            f"mount -t proc none {shlex.quote(str(root / 'proc'))} 2>/dev/null || true"
+        )
+        for staged, target in ((native_host, "protez-native-host"), (source_path, "input.luau")):
+            destination = root / target
+            script_lines.extend(
+                [
+                    f": > {shlex.quote(str(destination))} && "
+                    f"mount --bind {shlex.quote(str(staged))} {shlex.quote(str(destination))} && "
+                    f"mount -o remount,ro,bind {shlex.quote(str(destination))}",
+                ]
+            )
+        worker = " ".join(
+            shlex.quote(part) for part in ("--source", "/input.luau", *worker_args)
+        )
+        chroot = shutil.which("chroot") or "/usr/sbin/chroot"
+        script_lines.append(
+            f"exec {shlex.quote(chroot)} {shlex.quote(str(root))} /usr/bin/env -i HOME=/tmp "
+            f"PATH=/usr/bin:/bin LANG=C LC_ALL=C /protez-native-host {worker}"
+        )
+        return [
+            unshare,
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--pid",
+            "--fork",
+            "--net",
+            "--",
+            "/bin/sh",
+            "-c",
+            "\n".join(script_lines),
+        ]
 
     @staticmethod
     def _minimal_environment() -> dict[str, str]:

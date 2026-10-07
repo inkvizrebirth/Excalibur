@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import sys
@@ -16,6 +17,21 @@ def patch_spin(src):
     operations only, plus that rare call (no locals: see patch_entries)."""
     return re.sub(r"while true do (?:local )?[A-Za-z_]+(?:,[A-Za-z_]+)*=[A-Za-z_]+\[[A-Za-z_]+\];",
                   lambda m: m.group(0) + "__SPIN.n=__SPIN.n+1;if __SPIN.n>=__SPIN.step then __SPIN.f()end;", src)
+
+def _capture_rank(raw):
+    """How much of the program a PROTOS dump maps: (protos with a closure
+    maker, protos, tables). Makers first: they are what the walk needs to find
+    the VM at all, so a dump that lost one ranks below a dump that has it."""
+    if not raw:
+        return (-1, -1, -1)
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return (-1, -1, -1)
+    protos = data.get("protos") or {}
+    makers = sum(1 for cap in protos.values()
+                 if isinstance(cap, dict) and cap.get("__maker") is not None)
+    return (makers, len(protos), len(data.get("tables") or {}))
 
 def patch_chunk(src, tmpdir):
     """Instrument a loadstring'd VM chunk like the main script."""
@@ -138,8 +154,26 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None, devir
         if not m or m.group(1).startswith("error:"):
             print("[!] constant request run gave no protos", file=sys.stderr)
             break
-        with open(ppath, "w", encoding="utf-8", newline="\n") as f:
-            f.write(m.group(1))
+        # A capture is a snapshot of a script that is allowed to abort (a spin
+        # watchdog, a tamper response): the forced-constant rerun decodes a few
+        # more lazy constants but can also stop earlier than the run it
+        # replaces, and a dump without the closure makers is worse than no new
+        # dump at all -- the walk then finds no VM and reports the whole
+        # wrapper as unreadable.  Keep whichever dump maps more of the file.
+        new_dump = m.group(1)
+        old_dump = ""
+        if os.path.exists(ppath):
+            try:
+                with open(ppath, encoding="utf-8", errors="replace") as f:
+                    old_dump = f.read()
+            except OSError:
+                old_dump = ""
+        if _capture_rank(new_dump) < _capture_rank(old_dump):
+            print("[*] the constant run captured less of the file (%s < %s); keeping the earlier dump"
+                  % (_capture_rank(new_dump), _capture_rank(old_dump)), file=sys.stderr)
+        else:
+            with open(ppath, "w", encoding="utf-8", newline="\n") as f:
+                f.write(new_dump)
     header = job.credit_header()
     prefix = (header + "\n") if header else ""
     job.write(dpath, prefix + devirt.finish_text(text) + "\n")

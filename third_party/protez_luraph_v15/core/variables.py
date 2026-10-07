@@ -352,11 +352,51 @@ def rename(entry, blocks, prefix, captured):
             b.values = ([ren_def(b.id, n, v) for v in b.values[0]], b.values[1])
     return names
 
+def reg_key(n):
+    """A name-like key for a register the lifter declared as a local.
+
+    A lifted proto keeps its VM registers in locals (`local v133 = ...`), and
+    those count toward the same 200-local limit as named locals, but they are
+    `Reg` nodes rather than `LocalName`s: without a key here every pass that
+    measures liveness or counts declarations simply did not see them, which is
+    how a lifted v14 chunk reached `v201` and failed to compile at all.
+    """
+    return ("reg", n if not isinstance(n, CG.Reg) else n.n)
+
+
+def temp_key(t):
+    """A name-like key for a materialized call (`local t<id> = table.pack(...)`).
+
+    The lifter materializes every multi-value call that cannot stay inline as
+    its own local, and a large VM walk makes thousands of them: one lifted
+    v14 chunk declared 2161 of them in a single function and the Luau compiler
+    refused the file ("Out of local registers ... exceeded limit 200").  They
+    are ordinary locals as far as scoping goes, so they are counted with the
+    named ones here; a key that is not a `str` also keeps them from being
+    hoisted in front of a segment, exactly like registers.
+    """
+    return ("temp", t)
+
+
 def names_in_expr(e):
     out = []
     for x in CG.walk(e):
         if isinstance(x, CG.LocalName):
             out.append(x.name)
+        elif isinstance(x, CG.Reg):
+            out.append(reg_key(x))
+        elif isinstance(x, CG.TempVal):
+            out.append(temp_key(x.t))
+        elif isinstance(x, CG.TempTail):
+            out.append(temp_key(x.t))
+        elif isinstance(x, CG.TailRef) and isinstance(x.tail, CG.TempTail):
+            # `walk` stops at a TailRef whose tail is not an InlineTail, so a
+            # materialized tail (`table.unpack(t<id>, ...)`) has to be read off
+            # the reference itself: a temp that is only read through one was
+            # invisible to liveness, and its `local` got scoped away from the
+            # read (Luau then resolves the name as a global and the lifted
+            # script silently reads nil).
+            out.append(temp_key(x.tail.t))
         elif isinstance(x, CG.FuncE):
             out += list(getattr(x, "captures", ()))
     return out
@@ -368,6 +408,8 @@ def stmt_names(st):
         for t in st.targets:
             if isinstance(t, CG.LocalName):
                 writes.append(t.name)
+            elif isinstance(t, CG.Reg):
+                writes.append(reg_key(t))
             else:
                 reads += names_in_expr(t)
         for v in st.values.items:
@@ -376,6 +418,9 @@ def stmt_names(st):
             reads += names_in_expr(CG.TailRef(st.values.tail))
     elif isinstance(st, (CG.CallS, CG.TempDef)):
         reads += names_in_expr(st.call)
+        if getattr(st, "call", None) is not None and getattr(st.call, "args", None) is not None \
+                and st.call.args.tail is not None:
+            reads += names_in_expr(CG.TailRef(st.call.args.tail))
     elif isinstance(st, CG.SetListS):
         reads += names_in_expr(st.tbl)
         for v in st.values.items:
@@ -570,8 +615,11 @@ def assigned_names(stmts, out, bound=frozenset()):
 def declared_here(st):
     if isinstance(st, CG.LocalS):
         return list(st.names)
+    if isinstance(st, CG.TempDef):
+        return [temp_key(st.t)]
     if isinstance(st, CG.AssignS) and getattr(st, "is_local", False):
-        return [t.name for t in st.targets if isinstance(t, CG.LocalName)]
+        return [t.name if isinstance(t, CG.LocalName) else reg_key(t)
+                for t in st.targets if isinstance(t, (CG.LocalName, CG.Reg))]
     return []
 
 def names_anywhere(st):
@@ -579,23 +627,174 @@ def names_anywhere(st):
     occurrences(st.body if isinstance(st, DoBlock) else [st], (), occ)
     return set(occ)
 
-def limit_locals(stmts, outer=0, budget=180):
+def _local_graph(body):
+    """Where each name is declared and read, block by block.
+
+    Returns (parent, reads, defs): `parent[list id]` the enclosing list (None
+    at the function body), `reads[name]` the ids of the lists a name is read
+    in, `defs[name]` the (list, index) of the statement declaring it -- for the
+    names the lifter declares itself (a `LocalS`, a local assignment, or a
+    materialized call).  One pass, because both the scoping guard and the
+    hoisting below need the same picture of the function.
+    """
+    parent, reads, defs, slot = {}, {}, {}, {}
+
+    def walk(stmts, up):
+        parent[id(stmts)] = up
+        for i, st in enumerate(stmts):
+            for nm in names_anywhere(st):
+                reads.setdefault(nm, set()).add(id(stmts))
+            for nm in declared_here(st):
+                if isinstance(nm, tuple):
+                    defs.setdefault(nm, (stmts, i))
+            if isinstance(st, ST.SIf):
+                for child in (st.then, st.els):
+                    slot[id(child)] = (id(stmts), i)
+                    walk(child, id(stmts))
+            elif isinstance(st, ST.SLoop):
+                slot[id(st.body)] = (id(stmts), i)
+                walk(st.body, id(stmts))
+            elif isinstance(st, DoBlock):
+                slot[id(st.body)] = (id(stmts), i)
+                walk(st.body, id(stmts))
+
+    walk(body, None)
+    return parent, reads, defs, slot
+
+
+def _ancestors(parent, lst_id):
+    out = []
+    cur = lst_id
+    while cur is not None:
+        out.append(cur)
+        cur = parent.get(cur)
+    return out
+
+
+def _function_level_temps(body):
+    """Materializations that must stay function-level locals.
+
+    A `state machine` fallback (structure.py: the CFG could not be structured,
+    so one flat block is distributed over sibling `if state == k then` arms)
+    carries the same materialized call's `local t<id>` in one arm and its reads
+    in another.  A `do ... end` around the declaring arm would take the name
+    out of scope for the read, and Luau resolves an unknown name as a global
+    -- the lifted script would then compile and silently read nil.  Returns the
+    temp keys whose reads reach a statement list outside their declaring list.
+    """
+    parent, reads, defs, _slot = _local_graph(body)
+    out = set()
+    for nm, lists in reads.items():
+        declaring = defs.get(nm)
+        if declaring is None:
+            continue
+        owner = id(declaring[0])
+        for lst in lists:
+            seen = lst
+            while seen is not None and seen != owner:
+                seen = parent.get(seen)
+            if seen is None:
+                out.add(nm)
+                break
+    return out
+
+
+def _all_lists(body, out=None):
+    out = [] if out is None else out
+    out.append(body)
+    for st in body:
+        if isinstance(st, ST.SIf):
+            _all_lists(st.then, out)
+            _all_lists(st.els, out)
+        elif isinstance(st, ST.SLoop):
+            _all_lists(st.body, out)
+        elif isinstance(st, DoBlock):
+            _all_lists(st.body, out)
+    return out
+
+
+def hoist_function_level_temps(body):
+    """Declare a materialization read outside its own block at the block that
+    contains every read.
+
+    The state-machine fallback turns one flat block into sibling
+    `if state == k then` arms, so a `local t<id>` the walk put in one arm and
+    reads in the next is out of scope: the lifted file still compiles (Luau
+    resolves the name as a global) and silently reads nil at run time.  The
+    declaration moves up to the innermost common ancestor, which keeps the
+    value's lifetime intact.  `local t<id>` in front plus a plain assignment
+    where the statement was is what the renderer already knows how to print:
+    `TempVal` renders `t<id>[i]` and `TempTail` renders `table.unpack(t<id>,
+    ...)`, so the name has to stay `t<id>`.
+    """
+    parent, reads, defs, slot = _local_graph(body)
+    moved = {}
+    for nm, decl in defs.items():
+        lists = reads.get(nm)
+        if not lists or all(lst == id(decl[0]) for lst in lists):
+            continue
+        for cand in _ancestors(parent, id(decl[0])):
+            if all(cand in _ancestors(parent, lst) for lst in lists):
+                moved.setdefault(cand, []).append((nm, decl))
+                break
+    lists_by_id = {id(s): s for s in _all_lists(body)}
+    for lst_id, items in moved.items():
+        stmts = lists_by_id[lst_id]
+        where = {}
+        for nm, (dlist, di) in items:
+            # where the declaring statement sits in the hoist target: walk the
+            # declaring list up until its parent is the target
+            first = None
+            seen = id(dlist)
+            while seen is not None and seen != lst_id:
+                parent_id, index = slot.get(seen, (None, None))
+                if parent_id == lst_id:
+                    first = index
+                    break
+                seen = parent_id
+            if first is None:
+                first = di if id(dlist) == lst_id else None
+            for i, st in enumerate(stmts):
+                if nm in names_anywhere(st):
+                    first = i if first is None else min(first, i)
+            if first is None:
+                continue
+            where.setdefault(first, []).append(nm)
+            statement = dlist[di]
+            dlist[di] = CG.AssignS(
+                [CG.LocalName("t%s" % nm[1])],
+                CG.Multi([CG.CallE(CG.Global("table.pack"),
+                                   CG.Multi([getattr(statement, "call", None)]))]),
+            )
+        for idx in sorted(where, reverse=True):
+            stmts.insert(idx, CG.LocalS(["t%s" % nm[1] for nm in where[idx]], None))
+    return body
+
+
+def scope_locals(stmts, outer=0, budget=180):
+    """`limit_locals` with the function-wide view it needs: the recursion only
+    ever sees one statement list, so which materializations are function-level
+    is decided once, here, before it starts cutting."""
+    return limit_locals(stmts, outer, budget, _function_level_temps(stmts))
+
+
+def limit_locals(stmts, outer=0, budget=180, function_level=None):
     """Keep the locals active at any point (enclosing blocks' + this block's)
     under Luau's limit of 200: cut the block into do ... end segments."""
     total = sum(len(declared_here(s)) for s in stmts)
     if outer + total > budget:
-        stmts = fit_locals(stmts, budget - outer)
+        stmts = fit_locals(stmts, budget - outer, function_level)
 
     active = outer
     for st in stmts:
         if isinstance(st, ST.SIf):
-            st.then[:] = limit_locals(st.then, active, budget)
-            st.els[:] = limit_locals(st.els, active, budget)
+            st.then[:] = limit_locals(st.then, active, budget, function_level)
+            st.els[:] = limit_locals(st.els, active, budget, function_level)
         elif isinstance(st, ST.SLoop):
             extra = 1 if st.kind == "for" else len(st.forinfo[0]) if st.kind == "forin" else 0
-            st.body[:] = limit_locals(st.body, active + extra, budget)
+            st.body[:] = limit_locals(st.body, active + extra, budget, function_level)
         elif isinstance(st, DoBlock):
-            st.body[:] = limit_locals(st.body, active, budget)
+            st.body[:] = limit_locals(st.body, active, budget, function_level)
         active += len(declared_here(st))
     return stmts
 
@@ -627,19 +826,19 @@ def _unlocalize(stmts, hoisted):
         out.append(st)
     return out
 
-def fit_locals(stmts, room):
+def fit_locals(stmts, room, function_level=None):
     """The block with at most `room` locals active at once (as far as
     possible): small do ... end segments (wrap_segments) when they get there,
     else a split into a closed prefix and the rest (split_block)."""
     if sum(len(declared_here(s)) for s in stmts) <= room:
         return stmts
-    if wrap_segments(stmts, room, dry=True) > room:
-        got = split_block(stmts, room)
+    if wrap_segments(stmts, room, dry=True, function_level=function_level) > room:
+        got = split_block(stmts, room, function_level)
         if got is not None:
             return got
-    return wrap_segments(stmts, room)
+    return wrap_segments(stmts, room, function_level=function_level)
 
-def split_block(stmts, room):
+def split_block(stmts, room, function_level=None):
     """Cut a block with too many locals into a closed prefix, wrapped in
     do ... end, and the rest. The cut goes where the fewest locals live
     across it (they are declared, without a value, in front of the prefix)
@@ -684,13 +883,17 @@ def split_block(stmts, room):
         return None
     k = best[1]
     hoisted = {nm for nm, f in first.items() if f < k <= last.get(nm, f)}
+    # Only named locals can be declared in front of the prefix: a register's
+    # declaration is an assignment to a name the renderer owns, so a register
+    # crossing the cut blocks it instead (it counts as bad_d above).
+    hoisted = {nm for nm in hoisted if isinstance(nm, str)}
     room2 = room - len(hoisted)
     pre = sorted(hoisted, key=lambda nm: first[nm])
     out = [CG.LocalS(pre[j:j + 10], None) for j in range(0, len(pre), 10)]
-    out.append(DoBlock(fit_locals(_unlocalize(stmts[:k], hoisted), room2)))
-    return out + fit_locals(stmts[k:], room2)
+    out.append(DoBlock(fit_locals(_unlocalize(stmts[:k], hoisted), room2, function_level)))
+    return out + fit_locals(stmts[k:], room2, function_level)
 
-def _segments(stmts, decl_at, last, hoisted):
+def _segments(stmts, decl_at, last, hoisted, function_level=None):
     """Maximal closed segments: no variable declared inside (and not hoisted)
     is used after the segment. Returns [(start, end_exclusive, n_decls)]."""
     segs = []
@@ -698,6 +901,10 @@ def _segments(stmts, decl_at, last, hoisted):
     for i in range(len(stmts)):
         for n in decl_at[i]:
             if n in hoisted:
+                continue
+            if function_level and n in function_level:
+                # Function-level: no segment that contains it can ever close.
+                reach = len(stmts)
                 continue
             cnt += 1
             reach = max(reach, last.get(n, i))
@@ -708,7 +915,7 @@ def _segments(stmts, decl_at, last, hoisted):
         segs.append((start, len(stmts), cnt))
     return segs
 
-def wrap_segments(stmts, room, chunk=None, dry=False):
+def wrap_segments(stmts, room, chunk=None, dry=False, function_level=None):
     """The original source used scopes (do ... end, nested blocks) that leave
     no trace in the bytecode. Rebuild some: closed segments of the block (every
     local declared inside is dead after it) become do ... end. Locals that
@@ -725,14 +932,16 @@ def wrap_segments(stmts, room, chunk=None, dry=False):
     life = []
     for i, names in enumerate(decl_at):
         for nm in names:
+            # registers cannot be hoisted (see split_block): only named locals
             life.append((last.get(nm, i) - i, nm))
+    life = [entry for entry in life if isinstance(entry[1], str)]
     life.sort(reverse=True)
     if chunk is None:
         chunk = max(20, min(80, room // 3))
     hoisted = set()
     k = 0
     while True:
-        segs = _segments(stmts, decl_at, last, hoisted)
+        segs = _segments(stmts, decl_at, last, hoisted, function_level)
         worst = max((c for _, _, c in segs), default=0)
         if worst <= chunk or k >= len(life) or len(hoisted) + chunk >= room:
             break

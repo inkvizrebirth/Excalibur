@@ -454,9 +454,18 @@ void debugStep(lua_State* state, lua_Debug* info)
     {
         const bool includeLocals = context->stepCount == 1 || context->stepCount % kLocalSnapshotStride == 0;
         const int frameDepth = lua_stackdepth(state);
+        // The VM fills only `currentline` and `userdata` of the debug record it
+        // hands to the single-step hook; `name`, `source`, `protoid` and
+        // `bytecodeid` are uninitialized stack bytes there, so reading them
+        // dereferences whatever was left on the stack -- payloads that run deep
+        // enough crashed the worker this way.  Ask the VM for a fresh record of
+        // the running frame instead: it also gives the trace real function names
+        // and sources, which the lifter can use.
+        lua_Debug frame{};
+        const bool frameInfo = lua_getinfo(state, 0, "nSlp", &frame) != 0;
         const int line = info ? info->currentline : 0;
-        const std::string name = info && info->name ? info->name : "";
-        const std::string source = info && info->source ? info->source : "";
+        const std::string name = frameInfo && frame.name ? frame.name : "";
+        const std::string source = frameInfo && frame.source ? frame.source : "";
 
         int pc = -1;
         int opcodeId = -1;
@@ -496,10 +505,10 @@ void debugStep(lua_State* state, lua_Debug* info)
 
         std::string detail = "{\"step\":" + std::to_string(context->stepCount) +
                              ",\"frame_depth\":" + std::to_string(std::max(0, frameDepth));
-        if (info)
+        if (frameInfo)
         {
-            detail += ",\"proto_id\":" + std::to_string(info->protoid);
-            detail += ",\"bytecode_id\":" + std::to_string(info->bytecodeid);
+            detail += ",\"proto_id\":" + std::to_string(frame.protoid);
+            detail += ",\"bytecode_id\":" + std::to_string(frame.bytecodeid);
         }
         else
         {
