@@ -188,6 +188,53 @@ class EmulatorTests(unittest.TestCase):
         self.assertEqual(result.downloaded_payloads[0].text, NESTED_SOURCE)
         self.assertEqual(result.written_files, ("dump/body.lua",))
 
+    def test_dumper_sandbox_pattern_reaches_the_target(self) -> None:
+        """XDumper-style: hook ``genv.loadstring`` and sandbox the input."""
+        dumper = f"""
+        local genv = getgenv()
+        local captured = {{}}
+        local realLoadstring = genv.loadstring
+        genv.loadstring = newcclosure(function(chunk, chunk_name)
+          if type(chunk) == "string" and #chunk > 8 then
+            captured[#captured + 1] = chunk
+            writefile("XDumper/" .. tostring(#captured) .. "_chunk.lua", chunk)
+          end
+          return realLoadstring(chunk, chunk_name)
+        end)
+        local function runSandboxed(source)
+          local env = {{}}
+          setmetatable(env, {{
+            __index = genv,
+            __newindex = function(_, key, value) genv[key] = value end,
+          }})
+          local chunk = realLoadstring(source, "=XDumperInput")
+          if not chunk then return false, "load failed" end
+          setfenv(chunk, env)
+          return pcall(chunk)
+        end
+        local ok, value = runSandboxed([[
+          local body = game:HttpGet("{PAYLOAD_URL}")
+          loadstring(body)()
+          return "sandbox returned"
+        ]])
+        print("sandbox=" .. tostring(ok) .. ":" .. tostring(value) .. " captured=" .. tostring(#captured))
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            result = LuaEmulator(
+                profile="real",
+                workspace_dir=Path(temporary) / "workspace",
+                http_bridge=bridge,
+            ).run(dumper)
+        self.assertEqual(result.status, "completed", result.error)
+        prints = [capture.text for capture in result.captures if capture.kind == "print"]
+        self.assertIn("sandbox=true:sandbox returned captured=1", prints)
+        self.assertEqual(result.written_files, ("XDumper/1_chunk.lua",))
+        self.assertEqual(
+            [capture.chunk_name for capture in result.downloaded_payloads], [PAYLOAD_URL]
+        )
+        inner = [capture for capture in result.captures if capture.kind == "loadstring"]
+        self.assertTrue(any(capture.text == NESTED_SOURCE for capture in inner), result.captures)
+
     def test_binary_payloads_are_flagged(self) -> None:
         loader = """
         local bytes = {27, 76, 117, 97, 81, 0, 1, 4, 8}
