@@ -246,6 +246,10 @@ end
 
 local function __protez_vm_consider(label, value, depth)
   if type(value) ~= 'table' then return end
+  -- Protez's own executor surface is not the obfuscator's VM.  The prelude tags
+  -- every table that exists before the payload runs (see core.emulator), and a
+  -- loader that copies one of them keeps the tag.
+  if rawget(value, '__protez_own') == true then return end
   if __protez_vm_reports >= 160 then return end
   if __protez_vm_is_runtime(label) then return end
   if __protez_vm_has_seen(value) then return end
@@ -287,7 +291,7 @@ local function __protez_vm_note(line)
 end
 
 local function __protez_vm_scan()
-  if __protez_vm_scans >= 512 then return end
+  if __protez_vm_scans >= 1024 then return end
   __protez_vm_scans = __protez_vm_scans + 1
   -- Dense while the loader is still building its tables, sparse afterwards.
   if __protez_vm_scans == 160 then __protez_vm_gate = 8 end
@@ -338,6 +342,21 @@ end)
 rawset(_G, '__protez_vm_scan_now', function()
   pcall(__protez_vm_scan)
   return rawget(_G, '__protez_vm_log')
+end)
+
+-- The payload starts after Protez's own prelude, which is thousands of lines of
+-- Lua.  Its instructions must not consume the dumper's scan schedule, otherwise
+-- the frames that matter are already sparse by the time the loader runs.
+rawset(_G, '__protez_vm_reset', function()
+  __protez_vm_events = 0
+  __protez_vm_scans = 0
+  __protez_vm_reports = 0
+  __protez_vm_number_reports = 0
+  __protez_vm_string_reports = 0
+  __protez_vm_gate = 1
+  __protez_vm_seen = {}
+  __protez_vm_seen_count = 0
+  __protez_vm_reported = {}
 end)
 
 -- Diagnostics: how much of the run the dumper actually observed.

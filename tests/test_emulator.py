@@ -338,5 +338,38 @@ class BackendProbeTests(unittest.TestCase):
         self.assertIs(verdict, False)
 
 
+class HostBridgeTests(unittest.TestCase):
+    """Host callbacks cross the lupa bridge as *userdata*, not functions.
+
+    A ``type(fn) == 'function'`` guard therefore disables the bridge silently:
+    it did, and the Luau lowering inside the backend never ran once.  These
+    tests pin the bridge and the helpers that use it.
+    """
+
+    def setUp(self) -> None:
+        if not HAVE_LUA:
+            self.skipTest("lupa is required for the portable backend")
+
+    def test_luau_loaded_at_runtime_is_lowered_and_runs(self) -> None:
+        loader = (
+            "local chunk = 'local step = if true then 4_2 else 0\\nreturn step'\n"
+            "local fn = loadstring(chunk)\n"
+            "print('step', fn())\n"
+        )
+        result = LuaEmulator(profile="universal").run(loader)
+        self.assertEqual(result.status, "completed", result.error)
+        printed = [capture.text for capture in result.captures if capture.kind == "print"]
+        self.assertTrue(any("42" in text for text in printed), printed)
+
+    def test_protez_own_tables_are_tagged_before_the_payload_runs(self) -> None:
+        # The VM dumper skips tagged tables: without the tag it reported the
+        # executor-name list as an instruction stream.
+        loader = "print(rawget(rawget(_G, '__protez_globals'), '__protez_own'))\n"
+        result = LuaEmulator(profile="universal").run(loader)
+        self.assertEqual(result.status, "completed", result.error)
+        printed = [capture.text for capture in result.captures if capture.kind == "print"]
+        self.assertTrue(any("true" in text for text in printed), printed)
+
+
 if __name__ == "__main__":
     unittest.main()

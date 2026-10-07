@@ -161,6 +161,11 @@ class RecoveryEngine:
         self.max_layers = max(1, int(max_layers))
         self.max_seconds = float(max_seconds)
         self.emulator_timeout = float(emulator_timeout)
+        #: Why the portable backend is no longer worth probing in this run.  A
+        #: loader that has to be killed inside the backend burns the full
+        #: timeout on every layer, so one proven hang skips the rest: the whole
+        #: recovery run then finishes in seconds instead of minutes.
+        self._backend_skip_reason: str | None = None
         self.fetch_max_bytes = int(fetch_max_bytes)
         self.max_fetches = int(max_fetches)
 
@@ -169,6 +174,7 @@ class RecoveryEngine:
         started = time.monotonic()
         deadline = started + self.max_seconds
         notes: list[str] = []
+        notes_for_run = notes
         layers: list[LayerRecord] = []
         sandbox_results: list[SandboxResult] = []
         emulator_result: EmulatorResult | None = None
@@ -652,13 +658,26 @@ class RecoveryEngine:
         # call*, where neither the budget nor the pipeline deadline can reach it.
         # Run the script in a disposable child first: if that child has to be
         # killed, the backend is skipped instead of freezing the whole app.
+        if self._backend_skip_reason is not None:
+            note = self._backend_skip_reason
+            self.logger.info("Portable backend still skipped: %s", note)
+            return EmulatorResult(
+                status="unavailable",
+                error=note,
+                runtime="Lua 5.1 (lupa)",
+                profile=self.profile.label,
+                notes=(note,),
+            )
         verdict = backend_terminates(source, timeout_seconds=self.emulator_timeout, logger=self.logger)
         if verdict is False:
             note = (
-                "portable backend skipped: the loader caught the step budget and kept running "
-                "inside one call"
+                "portable backend skipped: the loader did not return inside its budget "
+                "(it swallows the step stop or sits in a long call)"
             )
+            self._backend_skip_reason = note
             self.logger.warning(note)
+            if note not in notes_for_run:
+                notes_for_run.append(note)
             return EmulatorResult(
                 status="unavailable",
                 error=note,

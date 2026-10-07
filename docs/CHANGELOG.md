@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- The portable backend now performs the **same work for every family**, instead
+  of depending on what a loader happens to call:
+  - The executor prelude, the table tagger and the VM dumper are set up *before*
+    the step hook starts.  Charging Protez's own thousands of prelude statements
+    to the hook's schedule left the VM dumper scanning its own tables while the
+    payload ran; the backend also re-reporting its own executor-name list as an
+    "instruction stream" — a confident dump that meant nothing.  Payload tables
+    now carry `__protez_own` where they belong to Protez, the dumper skips
+    tagged tables, and its scan schedule starts at the payload's first
+    instruction.
+  - The VM report refuses to confirm a stream it cannot justify: opcode and
+    operand columns must have different shapes (repetitive opcodes, varied
+    operands) before the dump is called an instruction stream, and otherwise the
+    summary says plainly that no stream was confirmed and how many tables and
+    constants were collected.
+- Two host bridges inside the backend never worked: a Python callable crosses
+  the `lupa` bridge as *userdata*, so the `type(fn) == 'function'` guards were
+  always false.  That silently disabled the Luau lowering for chunks a loader
+  builds at run time (`loadstring` of Luau source — v15-style wrappers) and the
+  new position reporting.  Both now call through a tiny helper and are pinned by
+  tests.
+- Diagnostics that pay for themselves on every family:
+  - `PROTEZ_EMU_TRACEBACK=1` runs the payload through `xpcall` with a handler
+    that prints each frame *and its locals*, so a loader that catches its own
+    error and later falls over on a `nil` register can be read directly from the
+    backend's log.
+  - `PROTEZ_EMU_POSITIONS=<file>` records where the script was (once per 200
+    hook events and when the budget runs out), which is how the PSU fixture's
+    extra-long tail was located even though it never trips the budget.
+- `backend_terminates` caches its verdict for the rest of the recovery run: a
+  loader that has to be killed inside the backend used to burn the full timeout
+  on every layer, turning one slow fixture into a minute of wasted work.
+
+
 - **Every fixture now ends as a readable script.**  The pipeline used to hand
   back minified wrappers unchanged: `format_luau` declines any input whose `if`
   is not a statement (every machine-made wrapper), and the single formatting path

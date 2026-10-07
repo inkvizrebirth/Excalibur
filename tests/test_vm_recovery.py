@@ -129,5 +129,34 @@ class PayloadProbeTests(unittest.TestCase):
         self.assertFalse(looks_like_vm_payload(""))
 
 
+class VmViabilityTests(unittest.TestCase):
+    """Uniform data must not be reported as a confirmed instruction stream."""
+
+    def test_a_permutation_table_is_not_a_confirmed_stream(self) -> None:
+        from core.vm_dump import VmSnapshot
+        from core.vm_recover import analyse_vm, summary_line
+
+        # 16 rows of 0..15: highly repetitive, but opcodes and operands have the
+        # same shape, which is data rather than code.
+        values = tuple(value for _ in range(40) for value in range(16))
+        snapshot = VmSnapshot(kind="numbers", label="(local)", values=values, width=16)
+        analysis = analyse_vm((snapshot,))
+        self.assertIsNotNone(analysis)
+        self.assertFalse(analysis.viable)
+        self.assertIn("no instruction stream was confirmed", summary_line(analysis))
+
+    def test_a_repetitive_opcode_column_with_varied_operands_is_viable(self) -> None:
+        from core.vm_dump import VmSnapshot
+        from core.vm_recover import analyse_vm
+
+        values = []
+        for index in range(200):
+            values.extend((index % 4, index * 7 % 977, index * 13 % 1013))
+        snapshot = VmSnapshot(kind="numbers", label="(local)", values=tuple(values), width=3)
+        analysis = analyse_vm((snapshot,))
+        self.assertIsNotNone(analysis)
+        self.assertTrue(analysis.viable, analysis.notes)
+
+
 if __name__ == "__main__":
     unittest.main()

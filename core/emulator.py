@@ -79,6 +79,21 @@ local __protez_real_pcall = pcall
 local __protez_real_xpcall = xpcall
 local __protez_real_resume = coroutine and coroutine.resume
 local __protez_real_wrap = coroutine and coroutine.wrap
+-- Forward declaration: ``__protez_run_payload`` is defined before the real
+-- loader is captured, and Lua locals are only visible after their declaration.
+local __protez_real_loadstring
+
+local function __protez_host_call(name, ...)
+  -- Host callbacks are Python callables, which cross the lupa bridge as
+  -- callable *userdata*: ``type(fn) == 'function'`` is false for them, so a
+  -- guard on the type silently disables the bridge.  Call by name instead.
+  local fn = rawget(_G, name)
+  if fn == nil then return nil end
+  local ok, result = pcall(fn, ...)
+  if not ok then return nil end
+  return result
+end
+
 
 -- A loader that wraps its own loop in ``pcall`` swallows the step budget and
 -- keeps running (AztupBrew does exactly that), which used to hang the whole
@@ -132,11 +147,82 @@ local function __protez_neuter()
   end
 end
 
+local __protez_position_tick = 0
+
+local function __protez_report_position(kind)
+  -- Where the script currently is.  Recorded when the budget runs out, and
+  -- periodically when the host asked for a position log: a loader that
+  -- disappears into one long C call leaves that log as the only clue.
+  if rawget(_G, '__protez_note_position') == nil then return end
+  -- Walk out of Protez's own frames (report -> step -> the combined hook) to
+  -- the payload's frame, which is the one worth reporting.
+  local own_source = debug.getinfo(1, 'S').source
+  local best = nil
+  for level = 2, 8 do
+    local info = debug.getinfo(level, 'Sl')
+    if info == nil then break end
+    best = info
+    if info.what == 'Lua' and info.source ~= own_source then break end
+  end
+  if best == nil then return end
+  __protez_host_call('__protez_note_position', kind, tostring(best.short_src or ''),
+                     tostring(best.currentline or 0), tostring(best.what or ''))
+end
+
+-- Diagnostic: on a payload error, describe the failing frames and their
+-- locals.  Enabled by the host (PROTEZ_EMU_TRACEBACK=1) when a family stops
+-- with an error that the payload itself caught and re-raised somewhere else.
+local function __protez_traceback(err)
+  local parts = { tostring(err) }
+  for level = 2, 14 do
+    local info = debug.getinfo(level, 'Sl')
+    if info == nil then break end
+    parts[#parts + 1] = string.format('  #%d %s:%s %s', level - 1,
+      tostring(info.short_src or '?'), tostring(info.currentline or -1), tostring(info.what or ''))
+    for index = 1, 26 do
+      local name, value = debug.getlocal(level, index)
+      if name == nil then break end
+      local kind = type(value)
+      local shown = ''
+      if kind == 'table' then
+        local ok, count = pcall(function() return #value end)
+        shown = '#' .. tostring(ok and count or '?')
+      elseif kind ~= 'function' and kind ~= 'userdata' then
+        shown = tostring(value):sub(1, 60)
+      end
+      parts[#parts + 1] = string.format('      %s = %s %s', tostring(name), kind, shown)
+    end
+  end
+  return table.concat(parts, '\n')
+end
+rawset(_G, '__protez_traceback', __protez_traceback)
+
+-- Runs the payload through ``xpcall`` so a failure carries a traceback with the
+-- failing frames' locals.  The real ``loadstring`` is used on purpose: the
+-- instrumented one would record the payload as a captured chunk.
+local function __protez_run_payload()
+  local source = rawget(_G, '__protez_payload_source')
+  if type(source) ~= 'string' then return false, 'no payload source' end
+  local fn, load_error = __protez_real_loadstring(source, '@payload')
+  if fn == nil then return false, tostring(load_error) end
+  local ok, message = __protez_real_xpcall(fn, __protez_traceback)
+  return ok, tostring(message)
+end
+rawset(_G, '__protez_run_payload', __protez_run_payload)
+
 local function __protez_step_fn()
   local verdict = __protez_step()
   if verdict == 'escalate' then
+    __protez_report_position('budget')
     __protez_neuter()
     error('Protez step budget exceeded', 0)
+  end
+  if verdict == 'trace' then
+    __protez_position_tick = __protez_position_tick + 1
+    if __protez_position_tick >= 200 then
+      __protez_position_tick = 0
+      __protez_report_position('trace')
+    end
   end
 end
 local __protez_print_fn = function(text) __protez_record_print(text) end
@@ -146,7 +232,7 @@ local __protez_http_fn = function(url, method) return __protez_http(url, method)
 rawset(_G, '__protez_step_fn', __protez_step_fn)
 rawset(_G, '__protez_http_lua', __protez_http_fn)
 
-local __protez_real_loadstring = loadstring
+__protez_real_loadstring = loadstring
 local __protez_real_load = load
 local __protez_real_dump = string.dump
 local __protez_real_sethook = debug and debug.sethook
@@ -193,10 +279,9 @@ local function __protez_normalise(chunk)
   -- The payload may be Luau (numeric separators, type arrows, continue) while
   -- the portable backend is Lua 5.1.  The host lowers it when it can; the
   -- original chunk is what gets recorded, this is an execution-only copy.
-  local fn = rawget(_G, '__protez_normalise_luau')
-  if type(fn) ~= 'function' or type(chunk) ~= 'string' then return nil end
-  local ok, lowered = pcall(fn, chunk)
-  if ok and type(lowered) == 'string' and lowered ~= chunk then return lowered end
+  if type(chunk) ~= 'string' then return nil end
+  local lowered = __protez_host_call('__protez_normalise_luau', chunk)
+  if type(lowered) == 'string' and lowered ~= chunk then return lowered end
   return nil
 end
 
@@ -264,6 +349,46 @@ warn = function(...)
     pcall(__protez_record_print, 'warn: <binary output, ' .. #text .. ' bytes>')
   end
   return nil
+end
+"""
+
+#: Runs between the executor prelude and the payload.  Everything reachable from
+#: ``_G`` at this point belongs to Protez (its surface, the standard library, the
+#: backend's own bookkeeping), never to the obfuscator, so the VM scanner can
+#: skip it by tag.  Without this the scanner reported Protez's executor-name
+#: list as an "instruction stream" -- a confident but completely wrong dump.
+_TAG_PRELUDE_TABLES = r"""
+do
+  local marked, queue, head = {}, {}, 1
+  local function tag(value, depth)
+    if type(value) ~= 'table' or marked[value] then return end
+    marked[value] = true
+    if depth > 0 then rawset(value, '__protez_own', true) end
+    if depth < 4 then queue[#queue + 1] = { value, depth } end
+  end
+  tag(_G, 0)
+  while head <= #queue and #queue <= 4000 do
+    local item = queue[head]
+    head = head + 1
+    local ok, keys = pcall(function()
+      local found = {}
+      local count = 0
+      for key, value in pairs(item[1]) do
+        count = count + 1
+        if count > 512 then break end
+        found[#found + 1] = value
+      end
+      return found
+    end)
+    if ok and type(keys) == 'table' then
+      for index = 1, #keys do
+        tag(keys[index], item[2] + 1)
+      end
+    end
+  end
+  -- Start the VM dumper's schedule at the payload's first instruction.
+  local reset = rawget(_G, '__protez_vm_reset')
+  if reset ~= nil then pcall(reset) end
 end
 """
 
@@ -707,6 +832,23 @@ class LuaEmulator:
                 EmulatorCapture(kind="print", text=str(text), chunk_name="", binary=False)
             )
 
+        positions: list[str] = []
+        position_log = os.environ.get("PROTEZ_EMU_POSITIONS")
+
+        def note_position(kind: Any, source: Any, line: Any, what: Any = "") -> None:
+            """Record where the script was, on request and when the budget runs out."""
+            entry = "%d %s %s:%s %s" % (
+                state["instructions"] * HOOK_STEP, kind, source, line, what
+            )
+            positions.append(entry)
+            del positions[:-16]
+            if position_log:
+                try:
+                    with open(position_log, "a", encoding="utf-8") as handle:
+                        handle.write(entry + "\n")
+                except OSError:  # pragma: no cover - diagnostics only
+                    pass
+
         def step_hook() -> str | None:
             """Count a step and stop a script that keeps catching the stop.
 
@@ -728,7 +870,7 @@ class LuaEmulator:
                     state["escalations"] = state["instructions"]
                     return "escalate"
                 raise RuntimeError(f"Protez stopped by the {state['stopped']}")
-            return None
+            return "trace" if position_log else None
 
         def clock() -> float:
             return time.monotonic() - started
@@ -991,6 +1133,8 @@ class LuaEmulator:
         globals_table["__protez_record"] = record
         globals_table["__protez_record_print"] = record_print
         globals_table["__protez_step"] = step_hook
+        if position_log:
+            globals_table["__protez_note_position"] = note_position
         globals_table["__protez_clock"] = clock
         globals_table["__protez_time"] = wall_time
         globals_table["__protez_hook_count"] = hook_count
@@ -1033,9 +1177,17 @@ class LuaEmulator:
         # instrumented loader would record that copy as a payload capture.
         variant, luau_notes = self._luau_ready(runtime, source)
         try:
+            # Order matters.  Protez's own code runs *before* the step hook is
+            # installed: the hook counts instructions and drives the VM dumper,
+            # and charging the executor prelude (thousands of statements) to
+            # that schedule used to leave the dumper scanning its own tables
+            # while the payload went unobserved.
             runtime.execute((_SAFE_OS + "\n" + _LUA_BOOTSTRAP).encode("utf-8"))
-            runtime.execute(VM_DUMP_LUA.encode("utf-8"))
-            # The step budget is installed last so the bootstrap itself runs free.
+            if os.environ.get("PROTEZ_EMU_NO_VM_DUMP") != "1":
+                runtime.execute(VM_DUMP_LUA.encode("utf-8"))
+            runtime.execute(self._prelude.encode("latin-1", "replace"))
+            runtime.execute(_TAG_PRELUDE_TABLES.encode("utf-8"))
+            # The budget and the VM dumper start with the payload's first step.
             runtime.execute("debug.sethook()")
             if os.environ.get("PROTEZ_EMU_DIAGNOSE"):
                 # A loader that dies on "arithmetic on a nil value" usually read
@@ -1051,10 +1203,16 @@ class LuaEmulator:
                     b"end })\n"
                     b"rawset(_G, '__protez_missing', __protez_missing)"
                 )
-            script = self._prelude + "\n" + variant
-            # The bridge is latin-1, so the script must travel back as the very
+            # The bridge is latin-1, so the payload must travel back as the very
             # bytes the file had; ``utf-8`` would inflate every byte above 0x7f.
-            runtime.execute(script.encode("latin-1", "replace"))
+            if os.environ.get("PROTEZ_EMU_TRACEBACK") == "1":
+                globals_table["__protez_payload_source"] = variant
+                runtime.execute(
+                    b"local ok, message = __protez_run_payload()\n"
+                    b"if not ok then error(message, 0) end\n"
+                )
+            else:
+                runtime.execute(variant.encode("latin-1", "replace"))
         except Exception as exc:  # noqa: BLE001 - LuaError and Python errors alike
             if os.environ.get("PROTEZ_EMU_TB"):
                 import traceback
@@ -1113,6 +1271,9 @@ class LuaEmulator:
                 vm_stats[1],
                 vm_stats[0],
             )
+        if positions:
+            # Where the loader was every time it swallowed the step budget.
+            notes.append("budget spent at: " + "; ".join(positions[-4:]))
         return EmulatorResult(
             status=status,
             captures=tuple(captures),

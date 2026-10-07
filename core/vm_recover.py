@@ -53,6 +53,12 @@ class VmAnalysis:
     listing: str = ""
     notes: tuple[str, ...] = ()
     constants: tuple[str, ...] = field(default_factory=tuple)
+    #: Whether the numbers actually look like an instruction stream.  A table of
+    #: uniform data (a permutation, a checksum list) can score like one, and an
+    #: unconfirmed dump is worse than none: the report says so instead.
+    viable: bool = True
+    #: How many candidate tables the run sampled, viable or not.
+    tables_seen: int = 0
 
     @property
     def opcode_span(self) -> int:
@@ -70,6 +76,8 @@ class VmAnalysis:
             "opcode_max": self.opcode_max,
             "histogram": [{"opcode": opcode, "count": count} for opcode, count in self.histogram],
             "confidence": round(self.confidence, 3),
+            "viable": self.viable,
+            "tables_seen": self.tables_seen,
             "notes": list(self.notes),
             "constants": list(self.constants[:64]),
         }
@@ -197,6 +205,17 @@ def analyse_vm(
     if pool is not None and not pool.numeric:
         constants = tuple(str(value) for value in pool.values[:512])
 
+    # A real opcode column is repetitive and its operands are *more* varied than
+    # the opcodes.  Uniform data -- a permutation table, a list of hashes -- has
+    # the opposite shape, and calling that an instruction stream produced dumps
+    # that looked confident and meant nothing.
+    viable = confidence >= 0.45 and repeat_ratio >= 0.35 and operand_variety > opcode_variety * 1.15
+    if not viable:
+        notes.append(
+            "the numbers do not look like an instruction stream "
+            "(opcode and operand columns have the same shape): the dump below is unconfirmed"
+        )
+
     return VmAnalysis(
         stream_label=stream.label,
         pool_label=pool.label if pool is not None else "",
@@ -211,6 +230,8 @@ def analyse_vm(
         listing=_listing(values, stride=stride, max_lines=max_listing_lines),
         notes=tuple(notes),
         constants=constants,
+        viable=viable,
+        tables_seen=len(tables),
     )
 
 
@@ -249,6 +270,11 @@ def render_analysis(analysis: VmAnalysis, *, max_constants: int = 48) -> str:
 
 
 def summary_line(analysis: VmAnalysis) -> str:
+    if not analysis.viable:
+        return (
+            f"{analysis.tables_seen} loader table(s) sampled, {len(analysis.constants)} "
+            "constant(s) collected; no instruction stream was confirmed in them"
+        )
     return (
         f"custom VM surface recovered: {analysis.instruction_count:,} instructions, "
         f"{analysis.distinct_opcodes} distinct opcodes, {len(analysis.constants)} constants"
