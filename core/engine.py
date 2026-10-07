@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 from core.deobfuscator import deobfuscate_source
+from core.devirt import DevirtResult
+from core.devirt import devirtualize as devirtualize_family
 from core.emulator import EmulatorResult, LuaEmulator, emulator_available
 from core.families import (
     FamilyOutcome,
@@ -46,6 +48,7 @@ from core.lua51 import BytecodeError, decompile, is_lua51_bytecode, looks_like_l
 from core.executor_api import classify_written_file
 from core.protection import inspect_protection
 from core.remote_payloads import PayloadFetcher, RemotePayloadError, extract_script_key, extract_urls, is_luarmor
+from core.vm_dump import VmSnapshot
 from core.vm_recover import VmAnalysis, analyse_vm, summary_line
 from core.sandbox import Sandbox, SandboxError, SandboxResult
 
@@ -89,6 +92,7 @@ class RecoveryResult:
     direct: bool = False
     strong: bool = False
     vm_analysis: VmAnalysis | None = None
+    vm_listing: str = ""
 
     @property
     def layer_count(self) -> int:
@@ -276,6 +280,30 @@ class RecoveryEngine:
                     if "embedded Lua 5.1 bytecode decompiled" not in notes:
                         notes.append("embedded Lua 5.1 bytecode decompiled")
 
+            # 3c. the family's own recovery method (core.devirt)
+            if family_match is not None and time.monotonic() < deadline:
+                devirt = self._devirtualize(family_match.key, current)
+                if devirt is not None and devirt.recovered and devirt.source is not None:
+                    candidate = devirt.source
+                    if (
+                        self._digest(candidate) not in seen
+                        and self._accept_devirtualized(devirt, candidate, current)
+                    ):
+                        current = candidate
+                        seen.add(self._digest(current))
+                        layers.append(
+                            self._record(len(layers) + 1, "static", devirt.method, current)
+                        )
+                        note = f"layer {depth}: {devirt.method}"
+                        if note not in notes:
+                            notes.append(note)
+                        for extra in devirt.notes:
+                            if extra and extra not in notes:
+                                notes.append(extra)
+                        strong = True
+                        improved = True
+                        continue
+
             # 4. portable backend
             if self.use_emulator and emulator_available() and time.monotonic() < deadline:
                 self.progress(min(70.0, 16.0 + depth * 8), "EMULATE")
@@ -337,10 +365,35 @@ class RecoveryEngine:
         # exposes its instruction stream and constant pool while it runs: keep
         # the analysis so a partial result says what the VM actually contained.
         analysis = None
+        vm_listing = ""
         if emulator_result is not None and emulator_result.vm_tables:
             analysis = analyse_vm(emulator_result.vm_tables)
             if analysis is not None:
                 notes.append(summary_line(analysis))
+                devirt = self._devirtualize(
+                    family_match.key if family_match is not None else "generic",
+                    current,
+                    vm_tables=emulator_result.vm_tables,
+                    vm_analysis=analysis,
+                )
+                if devirt is not None:
+                    vm_listing = devirt.listing
+                    for note in devirt.notes:
+                        if note and note not in notes:
+                            notes.append(note)
+                    if (
+                        not strong
+                        and devirt.recovered
+                        and devirt.source is not None
+                        and self._digest(devirt.source) not in seen
+                    ):
+                        # Some VMs spell their payload out through the constant
+                        # pool: when that happens the pool *is* the payload.
+                        bytecode_source = devirt.source
+                        strong = True
+                        note = f"{devirt.method}: payload reassembled from the VM's own tables"
+                        if note not in notes:
+                            notes.append(note)
                 if not strong:
                     # Nothing lifted this VM's semantics, but its surface is
                     # known: let the family handler say so in its own words.
@@ -417,7 +470,47 @@ class RecoveryEngine:
             direct=not layers,
             strong=strong or (from_bytecode and static_bytecode_found),
             vm_analysis=analysis,
+            vm_listing=vm_listing,
         )
+
+    def _devirtualize(
+        self,
+        family_key: str,
+        source: str,
+        *,
+        vm_tables: Sequence[VmSnapshot] | None = None,
+        vm_analysis: VmAnalysis | None = None,
+    ) -> DevirtResult | None:
+        """Run the family's own recovery method; never raises."""
+        try:
+            return devirtualize_family(
+                family_key,
+                source,
+                vm_tables=vm_tables,
+                vm_analysis=vm_analysis,
+                logger=self.logger,
+            )
+        except Exception as exc:  # noqa: BLE001 - a devirtualizer must not abort a run
+            self.logger.debug("Devirtualizer for %s failed: %s", family_key, exc)
+            return None
+
+    def _accept_devirtualized(self, result: DevirtResult, candidate: str, current: str) -> bool:
+        """Accept a devirtualized candidate that is a structural rewrite.
+
+        A flattening removal is *shorter* than the dispatcher it replaces, so
+        the size-based improvement test does not apply to it; it is accepted
+        when the rewritten file still has balanced blocks.
+        """
+        if self._candidate_is_better(candidate, current):
+            return True
+        if "flattening" not in result.method:
+            return False
+        try:
+            from core.devirt.prometheus import lua_blocks_balanced
+
+            return lua_blocks_balanced(candidate)
+        except Exception:  # noqa: BLE001
+            return False
 
     def _family_vm_outcome(
         self,

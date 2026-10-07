@@ -15,12 +15,39 @@ applies them in the order that recovers the most source:
    over HTTP, written to disk, or assembled inside a Lua-side VM is captured.
 4. **VM introspection** (`core.vm_dump` + `core.vm_recover`) — for a loader
    that keeps its payload inside its own VM, the instruction stream, constant
-   pool, opcode histogram and a bounded disassembly are recovered and reported,
-   with an honest note that opcode semantics need a per-family opcode map.
+   pool, opcode histogram and a bounded disassembly are recovered and reported.
+5. **Own devirtualizers** (`core.devirt`) — one recovery method per family,
+   applied before the VM surface is accepted as the final answer.
 
 Open-source lifters are used where they exist and are legally bundleable
 (the MoonSec V3 handler mapper and Lua-5.1 decompiler shipped in `tools/`); the
 methods above are Protez's own and cover the rest.
+
+## The own devirtualizers (`core.devirt`)
+
+No lifter could be vendored for most of the named families, so each one has an
+implemented method instead of a guess.  `core.devirt.devirtualize(family, …)`
+runs the family's strategy and normalises the outcome (`source`, `bytecode`,
+`method`, `notes`, `confidence`, `partial`).
+
+| Family | Method | What it recovers |
+| --- | --- | --- |
+| Luraph v14/v15 | `core.devirt.luraph` | Static container unpack (`core.luraph_static`), a Lua 5.1 chunk if the custom stream turns out to be one, hidden source in the decoded streams, and a disassembly whose opcode names come from Luraph's **own** interpreter source |
+| MoonSec V2/V3 | `core.devirt.bytecode_vm` | The Lua 5.1 chunk behind the VM — from the loader text, from a captured `loadstring`, or rebuilt from the table the loader filled at runtime |
+| WeAreDevs v2.4 | `core.devirt.bytecode_vm` | Same bytecode reconstruction, including the runtime-table door |
+| IronBrew 2/3 | `core.devirt.bytecode_vm` | Same, plus byte-table packings (1-based codes, 16/32-bit words, both endiannesses) |
+| PSU v1.0 | `core.devirt.bytecode_vm` | Same |
+| Nexus v2.0 | `core.devirt.nexus` | Reassembles payloads split across `"…" .. "…"` literal runs before decoding, then falls back to the bytecode method |
+| Prometheus | `core.devirt.prometheus` | **Control-flow flattening removal:** the state-machine dispatcher is traced and re-ordered into straight-line code.  Conservative: a rewrite happens only when every branch is reachable through literal `state = n` transitions, no branch computes its state at runtime, and the loop cannot repeat |
+| Wynfuscate v5 | `core.devirt.table_vm` | Annotated disassembly: opcode names read from the loader's dispatcher (`handlers[n] = function …`, `if opcode == n then …`), pool constants inlined (`K[12]="print"`), and the payload itself when the constant pool spells it out |
+| Xen / Synapse / Hyperion / Luau VM | `core.devirt.table_vm` | Same annotated disassembly and pool reassembly |
+| Generic / unknown VM | `core.devirt.bytecode_vm` → `table_vm` → `prometheus` | Whichever method applies first |
+
+Two doors lead to a bytecode chunk, and the runtime one matters most: static
+containers can be encrypted, but the loader still has to *build* the chunk
+before running it, so `core.vm_dump` snapshots the table and
+`core.devirt.common` rebuilds the bytes from it.  The same helper accepts
+0–255 byte tables, 1-based codes and 16/32-bit word packings.
 
 ## Named families
 
@@ -57,3 +84,7 @@ methods above are Protez's own and cover the rest.
 `tests/test_family_samples.py` builds a synthetic protected sample for every
 family in the table above and asserts detection **and** one working recovery
 method per family, so a family that silently loses coverage fails the suite.
+`tests/test_devirt.py` covers the own devirtualizers: container packing,
+runtime-table reconstruction, concatenated-literal reassembly, opcode naming
+from a dispatcher, pool reassembly, and the flattening removal with its
+refusal cases (incomplete graph, computed state, loop that can repeat).

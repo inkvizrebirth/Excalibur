@@ -535,8 +535,11 @@ class DeobfuscationPipeline:
             # The VM dump is an artifact, not clutter: it lives next to the
             # report so output/ still holds exactly one destroyed_N.lua.
             disassembly_path = report_file.with_name(f"vm_surface_{report_file.stem}.txt")
+            surface_text = render_analysis(result.vm_analysis)
+            if getattr(result, "vm_listing", ""):
+                surface_text += "\n\n" + str(result.vm_listing)
             try:
-                write_text_atomic(disassembly_path, render_analysis(result.vm_analysis) + "\n")
+                write_text_atomic(disassembly_path, surface_text + "\n")
                 self.logger.info("Custom VM surface written to %s", disassembly_path)
                 if not result.strong:
                     vm_notice = (
