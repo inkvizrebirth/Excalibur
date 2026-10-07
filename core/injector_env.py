@@ -1286,11 +1286,28 @@ local function __protez_default_namecall(self, ...)
 end
 rawset(_G, '__protez_default_namecall', __protez_default_namecall)
 
+-- Roblox locks the metatables of its instances: `getmetatable(instance)` hands
+-- back a string, and only the executor's own `getrawmetatable` sees the real
+-- table.  Payloads probe for exactly that difference (it is how they tell a live
+-- Roblox from a re-implementation), so the proxies behave the same way.
+local __protez_locked_metatable = 'The metatable is locked'
+local function __protez_raw_metatable(value)
+  local debug_api = rawget(_G, 'debug')
+  if type(debug_api) == 'table' and type(debug_api.getmetatable) == 'function' then
+    local ok, meta = pcall(debug_api.getmetatable, value)
+    if ok then return meta end
+  end
+  return getmetatable(value)
+end
+rawset(_G, '__protez_raw_metatable', __protez_raw_metatable)
+rawset(_G, '__protez_locked_metatable', __protez_locked_metatable)
+
 local function __protez_new_proxy(label, fields)
   local store = fields or {}
   local cache = {}
   local proxy
   proxy = setmetatable(store, {
+    __metatable = __protez_locked_metatable,
     __namecall = __protez_default_namecall,
     __index = function(self, key)
       local value = rawget(cache, key)
@@ -1310,7 +1327,7 @@ local function __protez_new_proxy(label, fields)
           if type(invoke) == 'function' then
             return invoke(self, method, default_call, extra[1], extra[2], extra[3], extra[4])
           end
-          local meta = getmetatable(self)
+          local meta = __protez_raw_metatable(self)
           local hook = type(meta) == 'table' and rawget(meta, '__namecall') or nil
           if type(hook) == 'function' then
             local previous = rawget(_G, '__protez_namecall_default')
@@ -1868,7 +1885,13 @@ __protez_declare('hookfunction', function(original, replacement) return original
 __protez_declare('replaceclosure', function(original, replacement) return original end)
 __protez_declare('hookmetamethod', function(object, method, hook) return function() return nil end end)
 __protez_declare('getconnections', __protez_table)
-__protez_declare('getrawmetatable', function(value) return getmetatable(value) end)
+__protez_declare('getrawmetatable', function(value)
+  -- The real metatable, even when the object is locked: this is exactly what
+  -- an executor's `getrawmetatable` is for.
+  local raw = rawget(_G, '__protez_raw_metatable')
+  if type(raw) == 'function' then return raw(value) end
+  return getmetatable(value)
+end)
 __protez_declare('setreadonly', __protez_true)
 __protez_declare('isreadonly', __protez_false)
 __protez_declare('getupvalue', function(fn, index) return nil end)

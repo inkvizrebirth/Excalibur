@@ -130,6 +130,35 @@ class EmulatorTests(unittest.TestCase):
         self.assertEqual(prints[3].split(), ["function"] * 4)
         self.assertEqual(prints[4].split(), ["true", "true"])
 
+    def test_instance_metatables_are_locked_like_roblox(self) -> None:
+        """`getmetatable(instance)` is a string; `getrawmetatable` is the table.
+
+        Payloads use exactly that difference to tell a live Roblox from a
+        re-implementation, and they hook `__namecall` through the raw one.
+        """
+
+        loader = """
+        print("meta=" .. type(getmetatable(game)) .. ":" .. tostring(getmetatable(game)))
+        local raw = getrawmetatable(game)
+        print("raw=" .. type(raw) .. ":" .. type(raw and raw.__namecall))
+        local captured = {}
+        raw.__namecall = function(self, ...)
+          captured[#captured + 1] = select("#", ...)
+          return "hooked"
+        end
+        print("call=" .. tostring(game:HttpGet("https://example.test/x")))
+        print("seen=" .. tostring(#captured))
+        """
+        result = LuaEmulator(profile="real").run(loader)
+        self.assertEqual(result.status, "completed", result.error)
+        printed = [capture.text for capture in result.captures if capture.kind == "print"]
+        self.assertTrue(any(text.startswith("meta=string") for text in printed), printed)
+        self.assertIn("The metatable is locked", " ".join(printed))
+        self.assertTrue(any(text.startswith("raw=table:function") for text in printed), printed)
+        # The payload's own hook is what runs, exactly like on Roblox.
+        self.assertTrue(any(text == "call=hooked" for text in printed), printed)
+        self.assertTrue(any(text == "seen=1" for text in printed), printed)
+
     def test_dumpers_capture_httpget_results(self) -> None:
         """Both namecall hooking idioms a dumper uses must see the call."""
         hookmetamethod_style = f"""

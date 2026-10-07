@@ -539,7 +539,10 @@ local function __protez_dispatch(self, name, default_callable, ...)
   -- through the classic `getrawmetatable(game).__namecall = hook` swap.
   local hook = __protez_namecall.hook
   if hook == nil then
-    local meta = getmetatable(self)
+    -- The real metatable, not the lock string `getmetatable` answers with:
+    -- Roblox-style `getrawmetatable(game).__namecall = hook` lands there.
+    local raw = rawget(_G, '__protez_raw_metatable')
+    local meta = type(raw) == 'function' and raw(self) or getmetatable(self)
     if type(meta) == 'table' then hook = rawget(meta, '__namecall') end
     if hook == __protez_default_namecall then hook = nil end
   end

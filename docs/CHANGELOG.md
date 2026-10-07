@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **The executor surface is faithful where it matters most.**  Roblox locks the
+  metatables of its instances: `getmetatable(instance)` answers with the string
+  "The metatable is locked", and only the executor's own `getrawmetatable` sees
+  the real table -- which is how payloads tell a live Roblox from a
+  re-implementation, and how they hook `__namecall`.  Protez's instance proxies
+  now behave the same way, its internal namecall dispatch reads the raw
+  metatable, and `getrawmetatable(game).__namecall = hook` still reaches the
+  payload's hook first (pinned by a test).
+- **A remote body that cannot be fetched no longer takes the loader down.**  A
+  failed fetch handed back an empty string, so `loadstring(game:HttpGet(url))()`
+  produced nil and the loader died at its first call into the missing library --
+  and everything the script would have decoded after that point was lost.  Both
+  the HTTP bridge and `request` now return a placeholder chunk whose result
+  tolerates indexing, calling, concatenation and length, so the script keeps
+  running and keeps decoding its own protected payload.  (With the IronBrew1
+  fixture the failure moves from the missing library into the payload's own
+  decode loop.)
+- The backend's traceback handler now reports up to 64 locals per frame (26 was
+  not enough to see the variable that was actually nil) and the new
+  `PROTEZ_EMU_CALL_LOG=<file>` records every environment-probing call a script
+  makes -- `newproxy`, `getmetatable`, `hookfunction`, `getgenv` and friends --
+  with its arguments and results, which is how a payload's expectations can be
+  read straight off its last few calls.
+
+
 - The Lua 5.1 lifter (the common path for WeAreDevs, IronBrew2/3, PSU, Nexus,
   MoonSec and every other bytecode family) now produces listings that actually
   parse, and no longer explode on obfuscated control flow:

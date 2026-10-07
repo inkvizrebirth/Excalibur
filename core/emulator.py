@@ -184,7 +184,7 @@ local function __protez_traceback(err)
     if info == nil then break end
     parts[#parts + 1] = string.format('  #%d %s:%s %s', level - 1,
       tostring(info.short_src or '?'), tostring(info.currentline or -1), tostring(info.what or ''))
-    for index = 1, 26 do
+    for index = 1, 64 do
       local name, value = debug.getlocal(level, index)
       if name == nil then break end
       local kind = type(value)
@@ -1617,6 +1617,79 @@ class LuaEmulator:
                 )
             # The bridge is latin-1, so the payload must travel back as the very
             # bytes the file had; ``utf-8`` would inflate every byte above 0x7f.
+            call_log_path = os.environ.get("PROTEZ_EMU_CALL_LOG")
+            if call_log_path:
+                # Which environment call did the script make just before it fell
+                # over?  A payload that probes the executor (metatables, hooks,
+                # `gethui`) tells us what it expected by the calls it makes, and
+                # the last few entries name the expectation exactly.
+                logged: list[str] = []
+
+                def record_call(name: Any, detail: Any) -> bool:
+                    logged.append(f"{name}({detail})")
+                    del logged[:-400]
+                    return True
+
+                globals_table["__protez_record_call"] = record_call
+                runtime.execute(
+                    b"-- Save the primitives first: wrapping `select` and then calling\n"
+                    b"-- it from the logger recursed forever (and looked like a hang).\n"
+                    b"local __protez_select, __protez_type = select, type\n"
+                    b"local __protez_tostring, __protez_format = tostring, string.format\n"
+                    b"local __protez_concat, __protez_ipairs = table.concat, ipairs\n"
+                    b"local __protez_pcall, __protez_rawget = pcall, rawget\n"
+                    b"local __protez_host_log = __protez_rawget(_G, '__protez_record_call')\n"
+                    b"local __protez_watch = {\n"
+                    b"  'getmetatable', 'setmetatable', 'newproxy', 'rawget', 'rawset',\n"
+                    b"  'getfenv', 'setfenv', 'setreadonly', 'isreadonly',\n"
+                    b"  'getrawmetatable', 'setrawmetatable', 'hookfunction', 'hookmetamethod',\n"
+                    b"  'getgenv', 'gethui', 'getrenv', 'getreg', 'getgc', 'getupvalue',\n"
+                    b"  'setupvalue', 'getupvalues', 'getconnections', 'firesignal',\n"
+                    b"  'checkcaller', 'islclosure', 'iscclosure', 'isexecutorclosure',\n"
+                    b"  'require', 'loadstring', 'load', 'string.dump',\n"
+                    b"}\n"
+                    b"-- `debug.getinfo` and `rawget` stay unwrapped on purpose: the VM\n"
+                    b"-- dumper walks the stack with them on every hook event, and an\n"
+                    b"-- extra frame per call drives that walk into recursion.\n"
+                    b"local function __protez_detail(...)\n"
+                    b"  local parts = {}\n"
+                    b"  for index = 1, __protez_select('#', ...) do\n"
+                    b"    local value = __protez_select(index, ...)\n"
+                    b"    local kind = __protez_type(value)\n"
+                    b"    if kind == 'string' then\n"
+                    b"      parts[#parts + 1] = __protez_format('%q', value:sub(1, 60))\n"
+                    b"    elseif kind == 'table' then\n"
+                    b"      local keys = {}\n"
+                    b"      for key in pairs(value) do\n"
+                    b"        keys[#keys + 1] = tostring(key)\n"
+                    b"        if #keys >= 6 then break end\n"
+                    b"      end\n"
+                    b"      parts[#parts + 1] = 'table:#' .. tostring(#value) .. '{' .. __protez_concat(keys, ',') .. '}'\n"
+                    b"    elseif kind == 'function' then parts[#parts + 1] = 'function'\n"
+                    b"    else parts[#parts + 1] = __protez_tostring(value) end\n"
+                    b"  end\n"
+                    b"  return __protez_concat(parts, ', ')\n"
+                    b"end\n"
+                    b"for _, name in __protez_ipairs(__protez_watch) do\n"
+                    b"  local owner, key = _G, name\n"
+                    b"  local dot = name:find('%.')\n"
+                    b"  if dot then\n"
+                    b"    owner = rawget(_G, name:sub(1, dot - 1))\n"
+                    b"    key = name:sub(dot + 1)\n"
+                    b"  end\n"
+                    b"  if __protez_type(owner) == 'table' and __protez_type(owner[key]) == 'function' then\n"
+                    b"    local original = owner[key]\n"
+                    b"    owner[key] = function(...)\n"
+                    b"      local results = { original(...) }\n"
+                    b"      if __protez_host_log ~= nil then\n"
+                    b"        __protez_pcall(__protez_host_log, name,\n"
+                    b"          __protez_detail(...) .. ' -> ' .. __protez_detail(unpack(results)))\n"
+                    b"      end\n"
+                    b"      return unpack(results)\n"
+                    b"    end\n"
+                    b"  end\n"
+                    b"end\n"
+                )
             if os.environ.get("PROTEZ_EMU_TRACEBACK") == "1":
                 # An error raised inside a coroutine loses its stack by the time
                 # the resume site sees it, which hides exactly the frames a
@@ -1677,6 +1750,13 @@ class LuaEmulator:
                 vm_stats = tuple(int(value) for value in stats)  # type: ignore[assignment]
         except Exception:  # noqa: BLE001 - diagnostics only
             pass
+
+        if call_log_path and logged:
+            try:
+                with open(call_log_path, "a", encoding="utf-8") as handle:
+                    handle.write("\n".join(logged) + "\n")
+            except OSError:  # pragma: no cover - diagnostics only
+                pass
 
         duration = time.monotonic() - started
         notes = [f"portable backend: {runtime_label}", f"executor profile: {self.profile.label}"]
