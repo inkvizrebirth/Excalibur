@@ -305,6 +305,7 @@ class DeobfuscationPipeline:
         self.use_emulator = bool(use_emulator)
         self.use_native_worker = bool(use_native_worker)
         self.logs_dir = Path(logs_dir) if logs_dir else LOGS_DIR
+        self._verification_unavailable = False
 
     def run(self, source: str | bytes, *, source_name: str = "input") -> PipelineResult:
         if isinstance(source, bytes):
@@ -483,6 +484,19 @@ class DeobfuscationPipeline:
                         {"kind": capture.kind, "size_bytes": capture.size_bytes, "binary": capture.binary}
                         for capture in result.emulator.captures
                     ],
+                    "requests": len(result.emulator.request_calls),
+                    "request_urls": [
+                        capture.chunk_name for capture in result.emulator.request_calls
+                    ],
+                    "downloads": [
+                        {"url": capture.chunk_name, "size_bytes": capture.size_bytes}
+                        for capture in result.emulator.downloaded_payloads
+                    ],
+                    "workspace_files": [
+                        {"path": capture.chunk_name, "size_bytes": capture.size_bytes}
+                        for capture in result.emulator.written_captures
+                    ],
+                    "written_files": list(result.emulator.written_files),
                 }
                 if result.emulator is not None
                 else None
@@ -1319,6 +1333,21 @@ class DeobfuscationPipeline:
         except InvalidLuauPayload as exc:
             self.logger.info("%s is not yet valid Luau: %s", label, str(exc)[:1200])
             return False
+        except PipelineError as exc:
+            # The bundled compiler is missing or unusable. Refusing the payload
+            # would throw away a good recovery, so the run continues without
+            # syntax verification and the report says so.
+            self._mark_verification_unavailable(exc)
+            return True
+
+    def _mark_verification_unavailable(self, error: Exception) -> None:
+        if self._verification_unavailable:
+            return
+        self._verification_unavailable = True
+        self.logger.warning(
+            "Luau syntax verification is unavailable (%s); recovered source is kept unverified",
+            str(error)[:200],
+        )
 
     @staticmethod
     def _captured_texts(result: SandboxResult) -> tuple[str, ...]:

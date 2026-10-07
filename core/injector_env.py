@@ -24,6 +24,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
+from core.executor_api import EXECUTOR_API_SURFACE
+
 __all__ = [
     "ExecutorProfile",
     "EXECUTOR_PROFILES",
@@ -138,11 +140,86 @@ _HOOK_FEATURES = (
 )
 
 
+_REAL_FEATURES = (
+    # Files, clipboard, assets
+    "writefile", "appendfile", "readfile", "isfile", "isfolder", "makefolder",
+    "delfile", "delfolder", "listfiles", "loadfile", "dofile", "getcustomasset",
+    "getcustomassetasync", "setclipboard", "getclipboard", "setrbxclipboard",
+    # HTTP
+    "request", "http_request", "http_get", "http_post", "httpget", "httpgetasync",
+    "fetch", "requestasync", "websocket",
+    # Identity, HWID, timing
+    "identifyexecutor", "getexecutorname", "getexecutor", "getexploit", "getversion",
+    "getexecutorversion", "gethwid", "getusername", "getuserid", "getgenv", "getrenv",
+    "getidentity", "getthreadidentity", "setthreadidentity", "getthreadcontext",
+    "setthreadcontext", "printidentity", "getfpscap", "setfpscap", "getping",
+    "getserverping", "tick", "time", "elapsedTime", "getmemoryusage", "getspecialinfo",
+    # Hooks, closures, metatables, introspection
+    "hookfunction", "hookmetamethod", "restorefunction", "replaceclosure",
+    "newcclosure", "newlclosure", "clonefunction", "checkcaller", "iscclosure",
+    "islclosure", "isexecutorclosure", "isourclosure", "getrawmetatable",
+    "setrawmetatable", "setreadonly", "isreadonly", "make_writeable",
+    "getupvalue", "getupvalues", "setupvalue", "getconstants", "getconstant",
+    "setconstant", "getproto", "getprotos", "getstack", "getnamecallmethod",
+    "setnamecallmethod", "getfunctionhash", "getscripts", "getrunningscripts",
+    "getloadedmodules", "getinstances", "getnilinstances", "getgc", "getreg",
+    "getobjects", "getsenv", "getmenv", "getcallingscript", "getscriptclosure",
+    "getscriptfunction", "getscriptbytecode", "getscripthash", "decompile",
+    "dumpstring", "getconnections", "firesignal", "getheap",
+    # Instances, GUI, rendering, input, signals
+    "fireclickdetector", "firetouchinterest", "fireproximityprompt", "replicatesignal",
+    "sethiddenproperty", "gethiddenproperty", "isscriptable", "setscriptable",
+    "setsimulationradius", "isnetworkowner", "getcallbackvalue", "setrenderproperty",
+    "getrenderproperty", "isrenderobj", "protect_gui", "unprotect_gui",
+    "is_protected_gui", "gethui", "getgui", "cloneref", "compareinstances", "isvalid",
+    "queue_on_teleport", "queueonteleport", "clearteleportqueue", "saveinstance",
+    "keypress", "keyrelease", "iskeydown", "mouse1click", "mouse1press",
+    "mouse1release", "mouse2click", "mousemoverel", "mousemoveabs", "getmouse",
+    # Libraries
+    "crypt", "base64", "hash", "sha256", "lz4", "bit32", "utf8", "task",
+)
+
+
 def _features(*extra: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys((*_BASE_FEATURES, *extra)))
 
 
 EXECUTOR_PROFILES: tuple[ExecutorProfile, ...] = (
+    ExecutorProfile(
+        key="real",
+        label="Real — full executor API (recommended)",
+        executor_name="Real",
+        version="1.0.0",
+        markers=(
+            "real",
+            "Real",
+            "syn",
+            "krnl",
+            "KRNL_LOADED",
+            "fluxus",
+            "FLUXUS_LOADED",
+            "xeno",
+            "delta",
+            "Delta",
+            "wave",
+            "hydrogen",
+            "solara",
+            "is_solara",
+            "swift",
+            "codex",
+            "WeAreDevs",
+        ),
+        aliases=("Protez",),
+        features=tuple(dict.fromkeys(_REAL_FEATURES)),
+        universal=True,
+        notes=(
+            "The Real injector: identifyexecutor() reports 'Real' and the whole "
+            "executor API answers (workspace files, request tables, hooks, crypt, "
+            "HWID, input, GUI signals).  Compatibility namespaces (syn.*, krnl.*, "
+            "fluxus.*, ...) are installed too, so executor-specific branches in a "
+            "protected wrapper still run."
+        ),
+    ),
     ExecutorProfile(
         key="universal",
         label="Auto — all executors (recommended)",
@@ -395,7 +472,7 @@ EXECUTOR_PROFILES: tuple[ExecutorProfile, ...] = (
     ),
 )
 
-DEFAULT_PROFILE_KEY = "universal"
+DEFAULT_PROFILE_KEY = "real"
 
 _PROFILE_BY_KEY = {profile.key: profile for profile in EXECUTOR_PROFILES}
 
@@ -514,6 +591,11 @@ def static_call(
         if isinstance(value, bytes):
             return True, b"string"
         return True, b"table"
+    if name in {"getfpscap", "get_fps_cap"}:
+        return True, 60
+    if name in {"gethwid", "get_hwid", "gethwid"}:
+        # Stable so two calls in the same script agree with each other.
+        return True, b"PROTEZ-00000000-00000000-00000000"
     if name == "tick":
         return True, 0.0
     if name in {"time", "os.time", "os.clock"}:
@@ -535,11 +617,28 @@ def build_static_environment(
         "getexecutorname": lambda *_: active.executor_name.encode("utf-8"),
         "getexecutor": lambda *_: active.executor_name.encode("utf-8"),
         "getversion": lambda *_: active.version.encode("utf-8"),
+        "getexecutorversion": lambda *_: active.version.encode("utf-8"),
+        "get_exploit": lambda *_: active.executor_name.encode("utf-8"),
+        "getexploit": lambda *_: active.executor_name.encode("utf-8"),
         "getgenv": lambda *_: None,
         "getrenv": lambda *_: None,
+        "gettenv": lambda *_: None,
         "checkcaller": lambda *_: True,
+        "iscclosure": lambda *_: False,
+        "islclosure": lambda *_: True,
         "is_sirhurt_closure": lambda *_: active.key == "sirhurt",
+        "is_pro_sirhurt": lambda *_: active.key == "sirhurt",
+        "iskrnl": lambda *_: active.key in {"krnl", "universal"},
         "getthreadidentity": lambda *_: 8,
+        "getthreadcontext": lambda *_: 8,
+        "getidentity": lambda *_: 8,
+        "getfpscap": lambda *_: 60,
+        "isfile": lambda *_: False,
+        "isfolder": lambda *_: False,
+        "getscriptbytecode": lambda *_: b"",
+        "getscripthash": lambda *_: b"",
+        "tick": lambda *_: 0.0,
+        "time": lambda *_: 0.0,
     }
     if script_key:
         environment["script_key"] = script_key
@@ -608,8 +707,10 @@ def build_lua_prelude(
     body = body.replace("@@FETCH_HOOK@@", _lua_string(fetch_hook))
     if active.key == "plain":
         body = body.replace("@@EXECUTOR_SURFACE@@", _PLAIN_SURFACE)
+        body = body.replace("@@EXECUTOR_API_SURFACE@@", "-- Plain environment: no executor API.")
     else:
         body = body.replace("@@EXECUTOR_SURFACE@@", _EXECUTOR_SURFACE)
+        body = body.replace("@@EXECUTOR_API_SURFACE@@", EXECUTOR_API_SURFACE)
     if roblox:
         body = body.replace("@@ROBLOX_SURFACE@@", _ROBLOX_SURFACE)
     else:
@@ -913,6 +1014,8 @@ if rawget(_G, 'printidentity') == nil then rawset(_G, 'printidentity', __protez_
 
 @@EXECUTOR_SURFACE@@
 
+@@EXECUTOR_API_SURFACE@@
+
 -- Scripts that re-sandbox themselves with setfenv() must keep seeing the
 -- executor surface; otherwise the payload dies on its first environment probe.
 local __protez_real_setfenv = rawget(_G, 'setfenv')
@@ -959,17 +1062,130 @@ _ROBLOX_SURFACE = r"""-- -------------------------------------------------------
 rawset(_G, '__protez_globals', rawget(_G, '__protez_globals') or {})
 
 local __protez_fetch
+
+-- Real signal objects: `:Connect` remembers the callback, `getconnections`
+-- lists it and `firesignal` can run it.  Nothing runs on its own.
+local function __protez_new_signal(label)
+  local connections = {}
+  local signal = { __protez_type = 'RBXScriptSignal', __protez_connections = connections }
+  local function connect(callback)
+    local connection = {
+      Enabled = true,
+      Function = callback,
+      Connected = true,
+      __protez_type = 'RBXScriptConnection',
+    }
+    connection.Disconnect = function()
+      connection.Connected = false
+      connection.Enabled = false
+      for index, item in ipairs(connections) do
+        if item == connection then table.remove(connections, index) break end
+      end
+      return true
+    end
+    connections[#connections + 1] = connection
+    return connection
+  end
+  signal.Connect = function(self, callback) return connect(callback) end
+  signal.connect = signal.Connect
+  signal.Once = function(self, callback)
+    local connection
+    connection = connect(function(...)
+      if connection ~= nil then connection:Disconnect() end
+      return callback(...)
+    end)
+    return connection
+  end
+  signal.Wait = function() return nil end
+  signal.wait = signal.Wait
+  signal.Fire = function(self, ...)
+    for _, connection in ipairs(connections) do
+      if connection.Enabled ~= false and type(connection.Function) == 'function' then
+        pcall(connection.Function, ...)
+      end
+    end
+    return #connections
+  end
+  signal.Destroy = function() connections = {} return true end
+  signal.__protez_signal_name = label
+  return signal
+end
+
+local __protez_signal_names = {
+  RenderStepped = true, Heartbeat = true, Stepped = true, PreRender = true,
+  PreSimulation = true, PreAnimation = true, PostSimulation = true,
+  InputBegan = true, InputChanged = true, InputEnded = true,
+  MouseButton1Click = true, MouseButton1Down = true, MouseButton1Up = true,
+  MouseButton2Click = true, MouseEnter = true, MouseLeave = true,
+  MouseMoved = true, MouseWheel = true, Changed = true, ChildAdded = true,
+  ChildRemoved = true, DescendantAdded = true, DescendantRemoving = true,
+  AncestryChanged = true, CharacterAdded = true, CharacterRemoving = true,
+  Died = true, Touched = true, TouchEnded = true, Activated = true,
+  Triggered = true, Died = true, Loaded = true, Focused = true, FocusLost = true,
+  PromptButtonHoldBegan = true, PromptButtonHoldEnded = true, OnClientEvent = true,
+  OnServerEvent = true, Event = true, StateChanged = true, Equipped = true,
+  Unequipped = true, Running = true, Jumping = true, GamepadConnected = true,
+  GamepadDisconnected = true, PlayerAdded = true, PlayerRemoving = true,
+}
+
+local function __protez_is_signal_name(key)
+  if __protez_signal_names[key] then return true end
+  local text = tostring(key)
+  if text:sub(-7) == 'Changed' or text:sub(-5) == 'Added' or text:sub(-7) == 'Removed' then
+    return true
+  end
+  return false
+end
+
+rawset(_G, '__protez_namecall_default', nil)
+
+local function __protez_default_namecall(self, ...)
+  -- Roblox instances answer `__namecall` with the method that
+  -- `getnamecallmethod()` names; the default implementation simply runs the
+  -- pending call recorded by the dispatcher.
+  local pending = rawget(_G, '__protez_namecall_default')
+  if type(pending) == 'function' then
+    return pending()
+  end
+  return nil
+end
+rawset(_G, '__protez_default_namecall', __protez_default_namecall)
+
 local function __protez_new_proxy(label, fields)
   local store = fields or {}
   local cache = {}
   local proxy
   proxy = setmetatable(store, {
+    __namecall = __protez_default_namecall,
     __index = function(self, key)
       local value = rawget(cache, key)
       if value ~= nil then return value end
       if key == 'ClassName' or key == 'Name' then return label end
       if key == 'HttpGet' or key == 'HttpGetAsync' or key == 'GetAsync' then
-        local fetcher = function(_, url, ...) return __protez_fetch(url, ...) end
+        local fetcher = function(self, url, ...)
+          local extra = { url, ... }
+          local method = key
+          local function default_call()
+            return __protez_fetch(extra[1], extra[2], extra[3], extra[4])
+          end
+          -- Namecall hooks (hookmetamethod, or the classic
+          -- `getrawmetatable(game).__namecall = ...` dance) must see the real
+          -- arguments, exactly like they would inside a Roblox instance call.
+          local invoke = rawget(_G, '__protez_namecall_invoke')
+          if type(invoke) == 'function' then
+            return invoke(self, method, default_call, extra[1], extra[2], extra[3], extra[4])
+          end
+          local meta = getmetatable(self)
+          local hook = type(meta) == 'table' and rawget(meta, '__namecall') or nil
+          if type(hook) == 'function' then
+            local previous = rawget(_G, '__protez_namecall_default')
+            rawset(_G, '__protez_namecall_default', default_call)
+            local ok, value = pcall(hook, self, extra[1], extra[2], extra[3], extra[4])
+            rawset(_G, '__protez_namecall_default', previous)
+            if ok then return value end
+          end
+          return default_call()
+        end
         rawset(cache, key, fetcher)
         return fetcher
       end
@@ -977,6 +1193,11 @@ local function __protez_new_proxy(label, fields)
         local fetcher = function(_, url, ...) return __protez_fetch(url, ...) end
         rawset(cache, key, fetcher)
         return fetcher
+      end
+      if __protez_is_signal_name(key) then
+        local signal = __protez_new_signal(label .. '.' .. tostring(key))
+        rawset(cache, key, signal)
+        return signal
       end
       if key == 'WaitForChild' or key == 'FindFirstChild' or key == 'FindFirstChildOfClass' or key == 'FindFirstAncestor' then
         local finder = function(_, ...) return __protez_new_proxy(label .. '.' .. tostring(key)) end
@@ -1033,15 +1254,29 @@ local __protez_players = __protez_new_proxy('Players', {
   NumPlayers = 1,
 })
 
+local __protez_services = { Players = __protez_players }
 local function __protez_service(name)
-  if name == 'Players' then return __protez_players end
-  return __protez_new_proxy(tostring(name), { Name = tostring(name), ClassName = tostring(name) })
+  local key = tostring(name)
+  local cached = __protez_services[key]
+  if cached ~= nil then return cached end
+  local service = __protez_new_proxy(key, { Name = key, ClassName = key })
+  __protez_services[key] = service
+  return service
 end
+rawset(_G, '__protez_services', __protez_services)
+rawset(_G, 'gethui', function() return __protez_service('CoreGui') end)
+rawset(_G, 'getgui', rawget(_G, 'gethui'))
 
+local __protez_place_id = tonumber(rawget(_G, '__protez_place_id')) or 0
+if __protez_place_id <= 0 then
+  -- Emulated session identifiers: non-zero so loaders that refuse to run
+  -- outside a place do not bail out.
+  __protez_place_id = 1500000000
+end
 local __protez_game = __protez_new_proxy('game', {
-  PlaceId = 0,
-  GameId = 0,
-  JobId = '',
+  PlaceId = __protez_place_id,
+  GameId = __protez_place_id,
+  JobId = tostring(rawget(_G, '__protez_job_id') or 'protez0000-0000-0000-0000-protez000000'),
   PlaceVersion = 1,
   Workspace = __protez_new_proxy('Workspace', { Name = 'Workspace', ClassName = 'Workspace' }),
   GetService = function(self, name) return __protez_service(name) end,

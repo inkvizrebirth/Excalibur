@@ -332,6 +332,79 @@ class PayloadFetcher:
     # ------------------------------------------------------------------
     # Lua bridge
     # ------------------------------------------------------------------
+    def request_bridge(self, options: object) -> dict[str, object]:
+        """Callable exposed to the Lua emulator as the ``request`` bridge.
+
+        Loaders post their ``script_key`` (and other secrets) to an API and read
+        the payload out of the JSON answer, so the response is handed back as a
+        Roblox-shaped ``{StatusCode, StatusMessage, Headers, Body, Success}``
+        table instead of a bare body.
+        """
+        fields = self._as_mapping(options)
+        url = str(fields.get("Url") or fields.get("url") or "")
+        method = str(fields.get("Method") or fields.get("method") or "GET").upper()
+        body = fields.get("Body")
+        if not url.lower().startswith(("http://", "https://")):
+            return self._empty_response("no url", method)
+        try:
+            text = self.fetch(url)
+        except RemotePayloadError as exc:
+            self._records.append(
+                FetchRecord(url=url, size_bytes=0, status="failed", cached=False, detail=str(exc))
+            )
+            self.logger.info("Loader request skipped (%s): %s", url[:100], exc)
+            return self._empty_response(str(exc), method)
+        except Exception as exc:  # noqa: BLE001 - never let Lua see a Python traceback
+            self.logger.info("Loader request failed (%s): %s", url[:100], exc)
+            return self._empty_response(str(exc), method)
+        payload = text if isinstance(text, str) else str(text)
+        self.logger.info(
+            "Loader request %s %s -> %s byte(s)%s",
+            method,
+            url[:100],
+            len(payload),
+            f" (body {len(body)} byte(s))" if isinstance(body, str) and body else "",
+        )
+        return self._response(payload, method)
+
+    def _response(self, body: str, method: str) -> dict[str, object]:
+        return {
+            "StatusCode": 200 if body else 404,
+            "StatusMessage": "OK" if body else "no payload",
+            "Headers": {"Content-Type": "application/octet-stream"},
+            "Body": body,
+            "Success": bool(body),
+            "Method": method,
+        }
+
+    def _empty_response(self, reason: str, method: str) -> dict[str, object]:
+        return {
+            "StatusCode": 0,
+            "StatusMessage": reason[:120],
+            "Headers": {},
+            "Body": "",
+            "Success": False,
+            "Method": method,
+        }
+
+    @staticmethod
+    def _as_mapping(value: object) -> dict[str, object]:
+        if isinstance(value, dict):
+            return {str(key): item for key, item in value.items()}
+        fields: dict[str, object] = {}
+        for key in ("Url", "url", "Method", "method", "Headers", "headers", "Body", "body"):
+            item = getattr(value, key, None)
+            if item is not None:
+                fields[key] = item
+        items = getattr(value, "items", None)
+        if callable(items):
+            try:
+                for key, item in items():
+                    fields[str(key)] = item
+            except Exception:  # noqa: BLE001 - Lua tables are not always iterable
+                pass
+        return fields
+
     def bridge(self, url: object, method: object = "GET") -> str:
         """Callable exposed to the Lua emulator as ``__protez_http``.
 

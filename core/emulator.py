@@ -23,12 +23,20 @@ capabilities are removed rather than confined:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 import zlib
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Sequence
+from pathlib import Path
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from core.executor_api import (
+    WORKSPACE_MAX_FILE_BYTES,
+    WORKSPACE_MAX_FILES,
+    classify_written_file,
+    normalise_workspace_path,
+)
 from core.injector_env import ExecutorProfile, build_lua_prelude, get_profile
 
 __all__ = [
@@ -87,8 +95,19 @@ local function __protez_record_safe(kind, chunk)
   end
 end
 
+local function __protez_guard_record(kind, chunk, name)
+  -- Empty chunks carry nothing worth recovering.
+  if type(chunk) ~= 'string' or #chunk == 0 then return end
+  -- Chunks that are not valid UTF-8 cannot cross into the host as text, so
+  -- the host is told the size instead of losing the whole run.
+  local ok = pcall(__protez_record, kind, chunk, name)
+  if not ok then
+    local size = type(chunk) == 'string' and #chunk or 0
+    pcall(__protez_record, kind .. ':unreadable', '', tostring(name or '') .. ' (' .. size .. ' bytes)')
+  end
+end
 local function __protez_safe_loadstring(chunk, chunkname)
-  __protez_record_safe('loadstring', chunk)
+  __protez_guard_record('loadstring', chunk, chunkname)
   return __protez_real_loadstring(chunk, chunkname)
 end
 loadstring = __protez_safe_loadstring
@@ -96,7 +115,7 @@ load = function(chunk, chunkname, mode, environment)
   -- Roblox/Luau `load` accepts a string as well as a function; Lua 5.1 does
   -- not, so route strings through loadstring and keep the capture.
   if type(chunk) == 'string' then
-    __protez_record_safe('load', chunk)
+    __protez_guard_record('load', chunk, chunkname)
     return __protez_real_loadstring(chunk, chunkname)
   end
   return __protez_real_load(chunk, chunkname, mode, environment)
@@ -115,11 +134,17 @@ end
 local __protez_real_print = print
 local __protez_real_warn = warn
 print = function(...)
-  __protez_record_print(__protez_flatten({ ... }, 0))
+  local text = __protez_flatten({ ... }, 0)
+  if not pcall(__protez_record_print, text) then
+    pcall(__protez_record_print, '<binary output, ' .. #text .. ' bytes>')
+  end
   return nil
 end
 warn = function(...)
-  __protez_record_print('warn: ' .. __protez_flatten({ ... }, 0))
+  local text = 'warn: ' .. __protez_flatten({ ... }, 0)
+  if not pcall(__protez_record_print, text) then
+    pcall(__protez_record_print, 'warn: <binary output, ' .. #text .. ' bytes>')
+  end
   return nil
 end
 """
@@ -167,6 +192,8 @@ class EmulatorResult:
     profile: str = ""
     notes: tuple[str, ...] = ()
     fetches: tuple[str, ...] = ()
+    requests: tuple[dict[str, Any], ...] = ()
+    written_files: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -180,14 +207,52 @@ class EmulatorResult:
     def bytecode(self) -> tuple[EmulatorCapture, ...]:
         return tuple(item for item in self.captures if item.kind == "bytecode")
 
+    @property
+    def downloaded_payloads(self) -> tuple[EmulatorCapture, ...]:
+        """Bodies the loader pulled over HTTP/``request``."""
+        return tuple(item for item in self.captures if item.kind == "http-body")
+
     def source_chunks(self, *, minimum: int = 24) -> tuple[EmulatorCapture, ...]:
         return tuple(
             item
             for item in self.captures
-            if item.kind in {"loadstring", "load"}
+            if item.kind in {"loadstring", "load", "file", "http-body"}
             and not item.binary
             and len(item.text.strip()) >= minimum
         )
+
+    @property
+    def written_captures(self) -> tuple[EmulatorCapture, ...]:
+        """Files a script wrote through the executor workspace API."""
+        return tuple(item for item in self.captures if item.kind == "file")
+
+    @property
+    def request_calls(self) -> tuple[EmulatorCapture, ...]:
+        """HTTP calls the loader issued through ``request``/``HttpGet``."""
+        return tuple(item for item in self.captures if item.kind == "request")
+
+
+def _as_mapping(value: Any) -> dict[str, Any]:
+    """Best-effort dict view over a Lua table or Python mapping."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    converted: dict[str, Any] = {}
+    items = getattr(value, "items", None)
+    if callable(items):
+        try:
+            for key, item in items():
+                converted[str(key)] = item
+            return converted
+        except Exception:  # noqa: BLE001 - lupa tables can be odd
+            return converted
+    try:
+        for key in value:  # type: ignore[union-attr]
+            converted[str(key)] = value[key]
+    except Exception:  # noqa: BLE001
+        return converted
+    return converted
 
 
 def emulator_available() -> bool:
@@ -249,6 +314,9 @@ class LuaEmulator:
         max_captures: int = MAX_CAPTURES,
         max_capture_bytes: int = MAX_CAPTURE_BYTES,
         http_bridge: Callable[[object, object], str] | None = None,
+        request_bridge: Callable[[object], object] | None = None,
+        workspace_dir: Path | str | None = None,
+        hwid: str | None = None,
         logger: logging.Logger | None = None,
         roblox: bool = True,
     ):
@@ -261,6 +329,9 @@ class LuaEmulator:
         self.max_captures = int(max_captures)
         self.max_capture_bytes = int(max_capture_bytes)
         self.http_bridge = http_bridge
+        self.request_bridge = request_bridge
+        self.workspace_dir = Path(workspace_dir) if workspace_dir else None
+        self.hwid = hwid
         self.logger = logger or logging.getLogger("protez")
         self.roblox = roblox
         self._prelude = prelude if prelude is not None else build_lua_prelude(
@@ -284,7 +355,15 @@ class LuaEmulator:
         started = time.monotonic()
         deadline = started + self.timeout_seconds
         captures: list[EmulatorCapture] = []
-        state = {"instructions": 0, "stopped": None, "fetches": []}
+        state = {
+            "instructions": 0,
+            "stopped": None,
+            "fetches": [],
+            "requests": [],
+            "writes": [],
+            "inputs": [],
+            "clipboard": "",
+        }
         output_bytes = {"value": 0}
 
         def record(kind: Any, text: Any, chunk_name: Any = "") -> None:
@@ -370,6 +449,18 @@ class LuaEmulator:
         def hook_count() -> int:
             return 20000
 
+        def record_download(url: Any, body: Any) -> str:
+            """Keep a downloaded body when it can be a payload."""
+            if not isinstance(body, str) or not body:
+                return body
+            label = str(url or "download")
+            kind = classify_written_file(label, body)
+            if kind == "source":
+                record("http-body", body, label)
+            elif kind == "bytecode":
+                record("http-body:hex", body.encode("latin-1", "replace").hex(), label)
+            return body
+
         def http(url: Any, method: Any = "GET") -> str:
             if isinstance(url, str) and url.lower().startswith(("http://", "https://")):
                 state["fetches"].append(url)
@@ -380,7 +471,208 @@ class LuaEmulator:
             except Exception as exc:  # noqa: BLE001 - bridge failures must not crash Lua
                 self.logger.warning("HTTP bridge failed: %s", exc)
                 return ""
-            return result if isinstance(result, str) else ""
+            return record_download(url, result) if isinstance(result, str) else ""
+
+        def request(options: Any) -> dict[str, Any]:
+            """Serve `request{Url=..., Method=..., Headers=..., Body=...}`."""
+            fields = _as_mapping(options)
+            url = fields.get("Url") or fields.get("url") or fields.get("URL")
+            method = str(fields.get("Method") or fields.get("method") or "GET").upper()
+            headers = _as_mapping(fields.get("Headers") or fields.get("headers"))
+            body = fields.get("Body", fields.get("body"))
+            if isinstance(url, str) and url.lower().startswith(("http://", "https://")):
+                state["fetches"].append(url)
+            body_bytes = len(body) if isinstance(body, (str, bytes)) else 0
+            state["requests"].append(
+                {
+                    "url": url if isinstance(url, str) else "",
+                    "method": method,
+                    "headers": {str(key): str(value) for key, value in headers.items()},
+                    "body_bytes": body_bytes,
+                }
+            )
+            if isinstance(url, str) and url.lower().startswith(("http://", "https://")):
+                header_names = ", ".join(sorted(str(key) for key in headers)) or "none"
+                record(
+                    "request",
+                    f"{method} {url} ({body_bytes} byte(s) of body, headers: {header_names})",
+                    url,
+                )
+            if self.request_bridge is not None:
+                try:
+                    response = self.request_bridge(
+                        {
+                            "Url": url,
+                            "Method": method,
+                            "Headers": {str(key): str(value) for key, value in headers.items()},
+                            "Body": body if isinstance(body, str) else None,
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001 - never let a bridge kill the run
+                    self.logger.warning("Request bridge failed: %s", exc)
+                    response = None
+                if isinstance(response, dict):
+                    body_text = response.get("Body")
+                    if isinstance(body_text, str):
+                        record_download(url, body_text)
+                    return {
+                        "StatusCode": int(response.get("StatusCode") or 0),
+                        "StatusMessage": str(response.get("StatusMessage") or ""),
+                        "Headers": response.get("Headers") or {},
+                        "Body": body_text if isinstance(body_text, str) else "",
+                        "Success": bool(response.get("Success")),
+                    }
+            text = http(url, method)
+            return {
+                "StatusCode": 200 if text else 0,
+                "StatusMessage": "OK" if text else "no response",
+                "Headers": {},
+                "Body": text,
+                "Success": bool(text),
+            }
+
+        def workspace_write(path: Any, data: Any, mode: Any = "write") -> bool:
+            """Mirror a script's `writefile` into the run workspace and capture it."""
+            raw = "" if data is None else (data if isinstance(data, str) else str(data))
+            name = normalise_workspace_path(str(path))
+            if len(state["writes"]) >= WORKSPACE_MAX_FILES:
+                return False
+            if len(raw) > WORKSPACE_MAX_FILE_BYTES:
+                raw = raw[:WORKSPACE_MAX_FILE_BYTES]
+            state["writes"].append(name)
+            if self.workspace_dir is not None:
+                target = self.workspace_dir / name
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    mode_text = "ab" if str(mode) == "append" else "wb"
+                    with target.open(mode_text) as handle:
+                        handle.write(raw.encode("latin-1", "replace"))
+                except OSError as exc:
+                    self.logger.debug("Workspace write failed for %s: %s", name, exc)
+            kind = classify_written_file(name, raw)
+            if kind == "source" and len(raw.strip()) >= 8:
+                record("file", raw, name)
+            elif kind == "bytecode":
+                record("file:hex", raw.encode("latin-1", "replace").hex(), name)
+            return True
+
+        def workspace_read(path: Any) -> str:
+            name = normalise_workspace_path(str(path))
+            if self.workspace_dir is None:
+                return ""
+            try:
+                return (self.workspace_dir / name).read_text(encoding="latin-1", errors="replace")
+            except OSError:
+                return ""
+
+        def workspace_exists(path: Any, kind: Any = "isfile") -> bool:
+            name = normalise_workspace_path(str(path))
+            if self.workspace_dir is None:
+                return False
+            target = self.workspace_dir / name
+            return target.is_dir() if str(kind) == "isfolder" else target.is_file()
+
+        def workspace_list(path: Any = "") -> list[str]:
+            name = normalise_workspace_path(str(path)) if path else ""
+            if self.workspace_dir is None:
+                return []
+            root = self.workspace_dir / name if name and name != "unnamed" else self.workspace_dir
+            listed: list[str] = []
+            try:
+                for item in sorted(root.rglob("*")):
+                    listed.append(str(item.relative_to(self.workspace_dir)))
+                    if len(listed) >= WORKSPACE_MAX_FILES:
+                        break
+            except OSError:
+                return []
+            return listed
+
+        def workspace_delete(path: Any, kind: Any = "file") -> bool:
+            name = normalise_workspace_path(str(path))
+            if self.workspace_dir is None:
+                return True
+            target = self.workspace_dir / name
+            try:
+                if str(kind) == "folder":
+                    if target.is_dir():
+                        for child in sorted(target.rglob("*"), reverse=True):
+                            child.unlink(missing_ok=True)
+                        target.rmdir()
+                else:
+                    target.unlink(missing_ok=True)
+            except OSError as exc:
+                self.logger.debug("Workspace delete failed for %s: %s", name, exc)
+            return True
+
+        def workspace_makefolder(path: Any) -> bool:
+            name = normalise_workspace_path(str(path))
+            if self.workspace_dir is not None:
+                try:
+                    (self.workspace_dir / name).mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    self.logger.debug("Workspace mkdir failed for %s: %s", name, exc)
+            return True
+
+        def fs_bridge(operation: Any, *arguments: Any) -> Any:
+            name = str(operation)
+            if name == "write":
+                first, second, mode = (list(arguments) + [None, None, "write"])[:3]
+                return workspace_write(first, second, mode)
+            if name == "read":
+                return workspace_read(arguments[0] if arguments else "")
+            if name == "isfile":
+                return workspace_exists(arguments[0] if arguments else "", "isfile")
+            if name == "isfolder":
+                return workspace_exists(arguments[0] if arguments else "", "isfolder")
+            if name == "list":
+                return workspace_list(arguments[0] if arguments else "")
+            if name == "makefolder":
+                return workspace_makefolder(arguments[0] if arguments else "")
+            if name in {"delfile", "delfolder"}:
+                first = arguments[0] if arguments else ""
+                return workspace_delete(first, "folder" if name == "delfolder" else "file")
+            if name == "customasset":
+                return ""
+            return None
+
+        def clipboard(operation: Any, value: Any = None) -> str:
+            if str(operation) == "set":
+                state["clipboard"] = "" if value is None else str(value)
+                return state["clipboard"]
+            return state.get("clipboard", "")
+
+        def hwid() -> str:
+            if self.hwid:
+                return self.hwid
+            digest = hashlib.sha256(b"protez-real-executor").hexdigest().upper()
+            return f"PROTEZ-{digest[:8]}-{digest[8:16]}-{digest[16:24]}"
+
+        def hash_text(algorithm: Any, value: Any) -> str:
+            name = str(algorithm or "sha256").lower()
+            data = value.encode("latin-1", "replace") if isinstance(value, str) else bytes(value or b"")
+            if name in {"sha256", "sha2", "sha"}:
+                return hashlib.sha256(data).hexdigest()
+            if name == "sha1":
+                return hashlib.sha1(data).hexdigest()
+            if name == "md5":
+                return hashlib.md5(data).hexdigest()
+            if name == "sha512":
+                return hashlib.sha512(data).hexdigest()
+            return hashlib.sha256(data).hexdigest()
+
+        def decompile(bytecode: Any) -> str:
+            raw = bytecode.encode("latin-1", "replace") if isinstance(bytecode, str) else bytes(bytecode or b"")
+            try:
+                from core.lua51 import decompile as lua51_decompile
+
+                return lua51_decompile(raw)
+            except Exception as exc:  # noqa: BLE001 - the helper is best effort
+                self.logger.debug("decompile() bridge failed: %s", exc)
+                return ""
+
+        def input_event(action: Any, detail: Any = "") -> bool:
+            state["inputs"].append(f"{action}:{detail}")
+            return True
 
         try:
             runtime = lua_module.LuaRuntime(unpack_returned_tuples=True)
@@ -397,6 +689,13 @@ class LuaEmulator:
         globals_table["__protez_time"] = wall_time
         globals_table["__protez_hook_count"] = hook_count
         globals_table["__protez_http"] = http
+        globals_table["__protez_request"] = request
+        globals_table["__protez_fs"] = fs_bridge
+        globals_table["__protez_clipboard"] = clipboard
+        globals_table["__protez_hwid"] = hwid
+        globals_table["__protez_hash"] = hash_text
+        globals_table["__protez_decompile"] = decompile
+        globals_table["__protez_input"] = input_event
 
         status = "completed"
         error: str | None = None
@@ -418,6 +717,10 @@ class LuaEmulator:
         notes = [f"portable backend: {runtime_label}", f"executor profile: {self.profile.label}"]
         if state["fetches"]:
             notes.append(f"{len(state['fetches'])} HTTP request(s) issued by the loader")
+        if state["writes"]:
+            notes.append(f"{len(state['writes'])} file(s) written to the executor workspace")
+        if state["inputs"]:
+            notes.append(f"{len(state['inputs'])} input event(s) recorded, none delivered")
         return EmulatorResult(
             status=status,
             captures=tuple(captures),
@@ -428,4 +731,6 @@ class LuaEmulator:
             profile=self.profile.key,
             notes=tuple(notes),
             fetches=tuple(dict.fromkeys(state["fetches"])),
+            requests=tuple(state["requests"]),
+            written_files=tuple(state["writes"]),
         )

@@ -73,6 +73,29 @@ class DetectionTests(unittest.TestCase):
 
 
 class StaticEnvironmentTests(unittest.TestCase):
+    def test_default_profile_is_the_real_executor(self) -> None:
+        profile = get_profile(None)
+        self.assertEqual(profile.key, "real")
+        self.assertEqual(profile.executor_name, "Real")
+        handled, value = static_call("identifyexecutor", [])
+        self.assertTrue(handled)
+        self.assertEqual(value, b"Real")
+        handled, value = static_call("getfpscap", [])
+        self.assertTrue(handled)
+        self.assertEqual(value, 60)
+        handled, first = static_call("gethwid", [])
+        handled_again, second = static_call("gethwid", [])
+        self.assertTrue(handled and handled_again)
+        self.assertEqual(first, second)
+
+    def test_static_environment_matches_the_profile(self) -> None:
+        environment = build_static_environment()
+        self.assertEqual(environment["identifyexecutor"](), b"Real")
+        self.assertEqual(environment["getexecutorname"](), b"Real")
+        self.assertIs(environment["isfile"]("dump.lua"), False)
+        self.assertEqual(environment["getthreadidentity"](), 8)
+        self.assertEqual(environment["getfpscap"](), 60)
+
     def test_identifyexecutor_folds_to_the_profile_name(self) -> None:
         profile = get_profile("krnl")
         handled, value = static_call("identifyexecutor", [], profile=profile)

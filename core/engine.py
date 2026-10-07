@@ -36,6 +36,7 @@ from core.injector_env import (
     get_profile,
 )
 from core.lua51 import BytecodeError, decompile, is_lua51_bytecode, looks_like_luau_bytecode
+from core.executor_api import classify_written_file
 from core.protection import inspect_protection
 from core.remote_payloads import PayloadFetcher, RemotePayloadError, extract_script_key, extract_urls, is_luarmor
 from core.sandbox import Sandbox, SandboxError, SandboxResult
@@ -167,11 +168,13 @@ class RecoveryEngine:
         if detected_keys:
             notes.append("executor probes detected: " + ", ".join(detected_keys[:6]))
 
+        cache_dir = Path(self.logs_dir) / "remote_cache" if self.logs_dir is not None else None
         fetcher = PayloadFetcher(
             enabled=self.allow_network,
             logger=self.logger,
             max_bytes=self.fetch_max_bytes,
             max_fetches=self.max_fetches,
+            cache_dir=cache_dir,
         )
         extracted_key = self.script_key or extract_script_key(source)
         if is_luarmor(source):
@@ -244,7 +247,14 @@ class RecoveryEngine:
             # 4. portable backend
             if self.use_emulator and emulator_available() and time.monotonic() < deadline:
                 self.progress(min(70.0, 16.0 + depth * 8), "EMULATE")
-                emulator_result = self._run_emulator(current, fetcher)
+                run = self._run_emulator(current, fetcher)
+                # Later layers are usually tiny deobfuscated bodies: keep the
+                # richest run (the loader itself) for the report, so its
+                # requests and workspace files stay visible.
+                if run is not None and (
+                    emulator_result is None or len(run.captures) > len(emulator_result.captures)
+                ):
+                    emulator_result = run
                 if emulator_result is not None and emulator_result.status != "completed":
                     self.logger.info(
                         "Portable backend status: %s%s",
@@ -476,12 +486,31 @@ class RecoveryEngine:
                 script_key=self.script_key,
                 timeout_seconds=self.emulator_timeout,
                 http_bridge=fetcher.bridge if fetcher.enabled else None,
+                request_bridge=fetcher.request_bridge if fetcher.enabled else None,
+                workspace_dir=self._executor_workspace(),
                 logger=self.logger,
             )
-            return emulator.run(source)
+            result = emulator.run(source)
+            if result.written_files:
+                self.logger.info(
+                    "Executor workspace received %s file(s): %s",
+                    len(result.written_files),
+                    ", ".join(result.written_files[:6]),
+                )
+            return result
         except Exception as exc:  # noqa: BLE001 - the portable backend is optional
             self.logger.info("Portable backend skipped: %s", exc)
             return None
+
+    def _executor_workspace(self) -> Path | None:
+        """Directory mirrored onto the virtual executor's filesystem.
+
+        Files a loader writes (``writefile``) land here, so a payload that only
+        exists as a dumped file is still recoverable after the run.
+        """
+        if self.logs_dir is None:
+            return None
+        return Path(self.logs_dir) / "executor-workspace"
 
     def _run_native(self, source: str, fetcher: PayloadFetcher) -> SandboxResult | None:
         assert self.sandbox is not None
@@ -551,6 +580,41 @@ class RecoveryEngine:
             if best_source is None or len(text) > len(best_source):
                 best_source = text
                 best_note = f"payload captured by the portable Lua backend ({len(text):,} bytes)"
+        for capture in result.downloaded_payloads:
+            label = capture.chunk_name or "download"
+            body = capture.text
+            if not body.strip():
+                continue
+            if not self._candidate_is_better(body, current):
+                continue
+            if best_source is None or len(body) > len(best_source):
+                best_source = body
+                best_note = (
+                    f"payload downloaded by the loader from {label[:120]!r} "
+                    f"({len(body):,} bytes)"
+                )
+        for capture in result.written_captures:
+            label = capture.chunk_name or "dump.lua"
+            raw = self._written_bytes(capture)
+            if raw is not None:
+                recovered = self._decompile(raw)
+                if recovered and (bytecode_source is None or len(recovered) > len(bytecode_source)):
+                    bytecode_source = recovered
+                    self.logger.info("Decompiled the file %s written by the loader", label)
+                continue
+            body = capture.text
+            if not body.strip():
+                continue
+            if classify_written_file(label, body) != "source":
+                continue
+            if not self._candidate_is_better(body, current):
+                continue
+            if best_source is None or len(body) > len(best_source):
+                best_source = body
+                best_note = (
+                    f"payload recovered from {label!r}, a file the loader wrote to the "
+                    f"executor workspace ({len(body):,} bytes)"
+                )
         for capture in result.bytecode:
             raw = self._capture_bytes(capture.text)
             if raw is None:
@@ -579,6 +643,21 @@ class RecoveryEngine:
                 best = text
                 note = f"payload captured by the native Luau worker ({len(text):,} bytes)"
         return best, note
+
+    @staticmethod
+    def _written_bytes(capture: Any) -> bytes | None:
+        """Bytecode payload for a file the loader wrote, when it is bytecode."""
+        text = capture.text
+        if capture.kind == "file:hex":
+            try:
+                raw = bytes.fromhex(text)
+            except ValueError:
+                return None
+            return raw if is_lua51_bytecode(raw) else None
+        raw = text.encode("latin-1", "replace")
+        if is_lua51_bytecode(raw):
+            return raw
+        return None
 
     @staticmethod
     def _capture_bytes(text: str) -> bytes | None:

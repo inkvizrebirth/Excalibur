@@ -21,7 +21,7 @@ from core.remote_payloads import (
 LOADER_ID = "d41d8cd98f00b204e9800998ecf8427e"
 LOADER_URL = luarmor_payload_url(LOADER_ID)
 PAYLOAD_URL = "https://cdn.example/library/payload.lua"
-PAYLOAD_BODY = 'print("recovered from a private library")'
+PAYLOAD_BODY = 'print("recovered from a private library")\nprint("recovered from an api-protected loader")'
 
 LUARMOR_LOADER = f"""-- Luarmor protected
 script_key = "KEY-123"
@@ -35,6 +35,45 @@ local script_key = script_key or "KEY-123"
 local body = game:HttpGet("{PAYLOAD_URL}")
 return loadstring(body)()
 """
+
+# A script whose body lives behind a web API: the raw link answers with HTML
+# (or nothing) in a browser, and only the loader -- running inside the executor
+# with the right request body -- receives the payload. The loader also parks a
+# copy of what it decoded in the executor workspace with ``writefile``.
+PAYLOAD_MARKER = "recovered from an api-protected loader"
+
+# ``api защита``: the script body lives behind a web API. The raw link cannot be
+# opened in a browser, and the URL is assembled at runtime, so the only way to
+# reach the payload is to actually run the loader inside an executor -- with its
+# ``request`` call, its file API and its identity functions.
+API_PAYLOAD = f"""-- protected library payload
+local parts = {{ "recovered", "from", "an", "api-protected", "loader" }}
+local message = table.concat(parts, " ")
+print(message)
+"""
+
+API_LOADER = f"""-- api защита: the payload is only served to a running loader
+script_key = "KEY-123"
+local executor = identifyexecutor and identifyexecutor() or "unknown"
+assert(type(writefile) == "function", "no file api")
+local scheme = "https"
+local host = table.concat({{ "cdn", "example" }}, ".")
+local url = scheme .. "://" .. host .. "/library/" .. ("pay" .. "load.lua")
+local response = request({{
+  Url = url,
+  Method = "POST",
+  Headers = {{ ["Authorization"] = "KEY-123", ["Content-Type"] = "application/json" }},
+  Body = '{{"script_key":"KEY-123"}}',
+}})
+local payload = response.Body
+makefolder("dump")
+writefile("dump/payload.lua", payload)
+appendfile("dump/_log.txt", executor .. "\\n")
+local chunk = loadstring(payload)
+if chunk then chunk() end
+"""
+
+
 
 
 class SignatureTests(unittest.TestCase):
@@ -108,6 +147,21 @@ class FetcherTests(unittest.TestCase):
         with self.assertRaises(RemotePayloadError):
             fetcher.fetch("https://cdn.example/other.lua")
 
+    def test_request_bridge_serves_api_payloads(self) -> None:
+        fetcher = self._fetcher({PAYLOAD_URL: PAYLOAD_BODY})
+        response = fetcher.request_bridge(
+            {"Url": PAYLOAD_URL, "Method": "POST", "Body": '{"script_key":"KEY-123"}'}
+        )
+        self.assertEqual(response["StatusCode"], 200)
+        self.assertEqual(response["Body"], PAYLOAD_BODY)
+        self.assertTrue(response["Success"])
+        self.assertEqual(self.calls, [PAYLOAD_URL])
+
+        missing = fetcher.request_bridge({"Url": "https://cdn.example/gone.lua"})
+        self.assertFalse(missing["Success"])
+        self.assertEqual(missing["Body"], "")
+        self.assertFalse(fetcher.request_bridge({"Url": "not-a-url"})["Success"])
+
     def test_bridge_serves_roblox_style_calls(self) -> None:
         fetcher = self._fetcher({PAYLOAD_URL: PAYLOAD_BODY})
         # game:HttpGet(url) passes the instance table first.
@@ -160,6 +214,58 @@ class PipelineRemoteTests(unittest.TestCase):
         report = json.loads(result.report_path.read_text(encoding="utf-8"))
         fetched = {entry["url"] for entry in report["remote_fetches"]}
         self.assertIn(PAYLOAD_URL, fetched)
+
+    def test_api_protected_loader_is_recovered(self) -> None:
+        """A payload the loader only receives (and writes) at runtime."""
+
+        calls: list[str] = []
+
+        def download(self, url, *, use_roblox_headers=None):
+            calls.append(url)
+            if url == PAYLOAD_URL:
+                return API_PAYLOAD
+            raise RemotePayloadError(f"no canned body for {url}")
+
+        pipeline = DeobfuscationPipeline(
+            logger=logging.getLogger("protez.test.remote.api"),
+            output_dir=self.output,
+            logs_dir=self.logs,
+            allow_network=True,
+        )
+        with (
+            patch.object(PayloadFetcher, "_download", download),
+            patch.object(PayloadFetcher, "cache_dir", self.cache, create=True),
+        ):
+            result = pipeline.run(API_LOADER, source_name="api-protected.luau")
+
+        body = result.output_path.read_text(encoding="utf-8")
+        # The payload itself, not the loader that fetched it.
+        self.assertIn('table.concat(parts, " ")', body)
+        self.assertIn("api-protected", body)
+        self.assertNotIn("script_key", body)
+        self.assertEqual([item.name for item in self.output.iterdir()], ["destroyed_1.lua"])
+        self.assertEqual(calls, [PAYLOAD_URL], "the payload may only be fetched at runtime")
+
+        report = json.loads(result.report_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["route"], "recovery engine")
+        self.assertEqual(
+            {entry["url"] for entry in report["remote_fetches"]},
+            {PAYLOAD_URL},
+        )
+        emulator = report["emulator"]
+        self.assertIsNotNone(emulator)
+        assert emulator is not None
+        self.assertEqual(emulator["status"], "completed", emulator["error"])
+        self.assertTrue(emulator["requests"] >= 1)
+        self.assertTrue(
+            any(item["path"] == "dump/payload.lua" for item in emulator["workspace_files"]),
+            emulator["workspace_files"],
+        )
+        # The mirrored workspace keeps what the loader wrote, next to the report.
+        mirrored = self.logs / "executor-workspace" / "dump" / "payload.lua"
+        self.assertTrue(mirrored.is_file(), sorted(str(item) for item in self.logs.rglob("*")))
+        self.assertIn("recovered", mirrored.read_text(encoding="utf-8"))
+        self.assertTrue((self.logs / "executor-workspace" / "dump" / "_log.txt").is_file())
 
     def test_offline_run_still_produces_output(self) -> None:
         pipeline = DeobfuscationPipeline(
