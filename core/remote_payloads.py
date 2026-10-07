@@ -382,7 +382,9 @@ class PayloadFetcher:
             "StatusCode": 0,
             "StatusMessage": reason[:120],
             "Headers": {},
-            "Body": "",
+            # A loader that does `loadstring(response.Body)()` must still reach
+            # its own decoded payload: an empty body would kill it right there.
+            "Body": PERMISSIVE_PLACEHOLDER_CHUNK,
             "Success": False,
             "Method": method,
         }
@@ -427,10 +429,33 @@ class PayloadFetcher:
                 FetchRecord(url=target, size_bytes=0, status="failed", cached=False, detail=str(exc))
             )
             self.logger.warning("Payload request failed: %s", exc)
-            return ""
+            return PERMISSIVE_PLACEHOLDER_CHUNK
         except Exception as exc:  # noqa: BLE001 - never let Lua see a Python traceback
             self.logger.warning("Payload request failed: %s", exc)
-            return ""
+            return PERMISSIVE_PLACEHOLDER_CHUNK
+
+
+#: Returned in place of a body that could not be fetched.  Handing back an empty
+#: string makes the loader die at its first call into the missing library
+#: (`Rayfield:CreateWindow` on a nil value), and everything the loader would have
+#: decoded after that point is lost.  This chunk returns a table that tolerates
+#: any use -- indexing, calling, comparing -- so the script keeps running and
+#: keeps decoding, which is the whole point of running it in executor space.
+PERMISSIVE_PLACEHOLDER_CHUNK = """-- Protez: the remote body could not be fetched; this placeholder keeps the
+-- script running so its own protected payload can still be recovered.
+local proxy
+proxy = setmetatable({}, {
+  __index = function(_, key)
+    return function(...) return proxy end
+  end,
+  __call = function(...) return proxy end,
+  __tostring = function() return 'Protez placeholder' end,
+  __concat = function() return '' end,
+  __len = function() return 0 end,
+  __eq = function() return false end,
+})
+return proxy
+"""
 
 
 def luarmor_payload_url(loader_id: str) -> str:

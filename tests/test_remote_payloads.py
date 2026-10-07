@@ -159,7 +159,10 @@ class FetcherTests(unittest.TestCase):
 
         missing = fetcher.request_bridge({"Url": "https://cdn.example/gone.lua"})
         self.assertFalse(missing["Success"])
-        self.assertEqual(missing["Body"], "")
+        # The body is a loadable placeholder, not an empty string: a loader that
+        # does `loadstring(response.Body)()` must reach its own decoded payload
+        # instead of dying on a nil library.
+        self.assertIn("return proxy", str(missing["Body"]))
         self.assertFalse(fetcher.request_bridge({"Url": "not-a-url"})["Success"])
 
     def test_bridge_serves_roblox_style_calls(self) -> None:
@@ -170,8 +173,33 @@ class FetcherTests(unittest.TestCase):
 
     def test_failed_downloads_are_recorded_not_raised(self) -> None:
         fetcher = self._fetcher({})
-        self.assertEqual(fetcher.bridge(PAYLOAD_URL), "")
+        body = fetcher.bridge(PAYLOAD_URL)
         self.assertEqual(fetcher.records[-1].status, "failed")
+        # A missing body must not take the loader down with it: the loader keeps
+        # running (and keeps decoding its own payload) against a placeholder.
+        self.assertIn("return proxy", body)
+        self.assertTrue(body.strip().startswith("--"))
+
+    def test_the_placeholder_survives_indexing_calling_and_concatenation(self) -> None:
+        from core.remote_payloads import PERMISSIVE_PLACEHOLDER_CHUNK
+
+        try:
+            from lupa import lua51
+        except Exception:  # noqa: BLE001
+            self.skipTest("lupa is required to execute the placeholder")
+        runtime = lua51.LuaRuntime(unpack_returned_tuples=True, encoding="latin-1")
+        chunk = PERMISSIVE_PLACEHOLDER_CHUNK.encode("utf-8").decode("latin-1")
+        runtime.globals()["__protez_placeholder_chunk"] = chunk
+        outcome = runtime.execute(
+            "local library = loadstring(__protez_placeholder_chunk)()\n"
+            "local window = library:CreateWindow({})\n"
+            "local button = window:AddButton():Something()\n"
+            "assert(window ~= nil and button ~= nil)\n"
+            "assert(tostring(library):find('placeholder') ~= nil)\n"
+            "assert(#library == 0)\n"
+            "return true"
+        )
+        self.assertTrue(outcome)
 
 
 class PipelineRemoteTests(unittest.TestCase):

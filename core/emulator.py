@@ -1618,6 +1618,32 @@ class LuaEmulator:
             # The bridge is latin-1, so the payload must travel back as the very
             # bytes the file had; ``utf-8`` would inflate every byte above 0x7f.
             if os.environ.get("PROTEZ_EMU_TRACEBACK") == "1":
+                # An error raised inside a coroutine loses its stack by the time
+                # the resume site sees it, which hides exactly the frames a
+                # coroutine-based VM would want to show.  ``debug.traceback``
+                # accepts a thread, so the resume path is wrapped to attach the
+                # coroutine's own traceback to the message.
+                runtime.execute(
+                    b"local __protez_real_resume = coroutine.resume\n"
+                    b"coroutine.resume = function(co, ...)\n"
+                    b"  local results = { __protez_real_resume(co, ...) }\n"
+                    b"  if results[1] == false and type(results[2]) == 'string' then\n"
+                    b"    local ok, trace = pcall(debug.traceback, co, tostring(results[2]), 1)\n"
+                    b"    if ok and type(trace) == 'string' then results[2] = trace end\n"
+                    b"  end\n"
+                    b"  return unpack(results)\n"
+                    b"end\n"
+                    b"local __protez_real_wrap = coroutine.wrap\n"
+                    b"coroutine.wrap = function(fn)\n"
+                    b"  local co = coroutine.create(fn)\n"
+                    b"  return function(...)\n"
+                    b"    local results = { coroutine.resume(co, ...) }\n"
+                    b"    if results[1] == false then error(results[2], 0) end\n"
+                    b"    return unpack(results, 2)\n"
+                    b"  end\n"
+                    b"end\n"
+                    b"_ = __protez_real_wrap\n"
+                )
                 globals_table["__protez_payload_source"] = variant
                 runtime.execute(
                     b"local ok, message = __protez_run_payload()\n"

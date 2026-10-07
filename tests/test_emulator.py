@@ -371,5 +371,75 @@ class HostBridgeTests(unittest.TestCase):
         self.assertTrue(any("true" in text for text in printed), printed)
 
 
+class BoundedRunTests(unittest.TestCase):
+    """A loader that cannot be stopped must not stop the application.
+
+    The backend is run in a forked child under a hard wall-clock deadline, and
+    the child spools what it observed: a run that has to be killed still yields
+    its evidence, and the parent still performs the host-side work (fetches,
+    requests) itself.
+    """
+
+    def setUp(self) -> None:
+        if not HAVE_LUA:
+            self.skipTest("lupa is required for the portable backend")
+        if os.name == "nt" or not hasattr(os, "fork"):
+            self.skipTest("process isolation is unavailable on this platform")
+
+    def test_a_finished_run_returns_its_full_result(self) -> None:
+        from core.emulator import LuaEmulator, run_bounded
+
+        loader = "print('bounded ok')\n"
+        result = run_bounded(LuaEmulator(timeout_seconds=10), loader, wall_seconds=20)
+        self.assertEqual(result.status, "completed", result.error)
+        printed = [capture.text for capture in result.captures if capture.kind == "print"]
+        self.assertTrue(any("bounded ok" in text for text in printed), printed)
+
+    def test_a_run_that_cannot_be_stopped_is_killed_and_keeps_its_evidence(self) -> None:
+        from core.emulator import LuaEmulator, run_bounded
+
+        # A loader that catches the step stop and keeps looping inside one call:
+        # only the process-level stop ends it.
+        loader = (
+            "print('first')\n"
+            "local fn = string.dump(function() return 1 end)\n"
+            "while true do\n"
+            "  local ok = pcall(function() while true do end end)\n"
+            "  _ = ok\n"
+            "end\n"
+        )
+        started = time.monotonic()
+        result = run_bounded(
+            LuaEmulator(timeout_seconds=30, max_instructions=10**9), loader, wall_seconds=4
+        )
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 12.0, "the wall-clock deadline must bound the run")
+        self.assertEqual(result.status, "limit")
+        self.assertIn("wall-clock", str(result.error))
+        printed = [capture.text for capture in result.captures if capture.kind == "print"]
+        self.assertTrue(any("first" in text for text in printed), printed)
+
+    def test_the_parent_performs_bridge_calls_of_a_forked_run(self) -> None:
+        from core.emulator import LuaEmulator, run_bounded
+
+        calls: list[str] = []
+
+        def bridge(url, method="GET"):
+            calls.append(str(url))
+            return "print('remote body')\n"
+
+        loader = (
+            "local body = game:HttpGet('https://example.test/library')\n"
+            "print('body', body)\n"
+        )
+        result = run_bounded(
+            LuaEmulator(timeout_seconds=10, http_bridge=bridge), loader, wall_seconds=20
+        )
+        self.assertEqual(result.status, "completed", result.error)
+        # The call happened in *this* process: the caller can see it.
+        self.assertEqual(calls, ["https://example.test/library"])
+        self.assertTrue(any("remote body" in capture.text for capture in result.captures), result.captures)
+
+
 if __name__ == "__main__":
     unittest.main()
