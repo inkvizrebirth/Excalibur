@@ -50,6 +50,7 @@ from core.vm_dump import (
 
 __all__ = [
     "backend_terminates",
+    "run_bounded",
     "EmulatorCapture",
     "EmulatorResult",
     "EmulatorUnavailable",
@@ -68,6 +69,10 @@ MAX_INSTRUCTIONS = 80_000_000 // HOOK_STEP
 #: Once the budget is spent, re-escalate this often: a loader that keeps catching
 #: the error gets its newly created handlers neutered as well.
 ESCALATE_EVERY = 2_000
+
+#: How often a run reports its progress to an event sink (hook events).  A run
+#: that later has to be killed still knows how far it got.
+PROGRESS_EVERY = 20_000
 MAX_CAPTURES = 200
 MAX_VM_TABLES = 160
 MAX_CAPTURE_BYTES = 8 * 1024 * 1024
@@ -424,6 +429,16 @@ class EmulatorCapture:
         return len(self.text)
 
 
+def _capture_payload(capture: EmulatorCapture) -> dict[str, Any]:
+    """JSON-safe form of a capture, for the ``run_bounded`` spool."""
+    return {
+        "kind": capture.kind,
+        "text": capture.text,
+        "chunk_name": capture.chunk_name,
+        "binary": bool(capture.binary),
+    }
+
+
 @dataclass
 class EmulatorResult:
     status: str  # completed | error | limit | unavailable
@@ -595,6 +610,366 @@ def backend_terminates(
     return finished and verdict == b"1"
 
 
+def _spool_event(handle: Any, kind: str, payload: dict[str, Any]) -> None:
+    """Append one observation to the run spool (a newline-delimited JSON file).
+
+    The event type lives under ``event`` and the payload under ``data`` so a
+    payload key can never shadow the type the reader switches on.
+    """
+    import json
+
+    handle.write(json.dumps({"event": kind, "data": payload}, ensure_ascii=True) + "\n")
+    handle.flush()
+
+
+# ----------------------------------------------------------------------
+# Parent/child bridge channel for run_bounded
+# ----------------------------------------------------------------------
+#
+# Forking the backend isolates a loader that cannot be stopped, but it also
+# isolates Python-level side effects: a fetch served inside the child leaves the
+# parent's fetcher (its records, its cache state, the caller's own bookkeeping)
+# untouched.  The child therefore *asks* the parent to do it: bridge calls travel
+# over a pipe as length-prefixed JSON frames and the parent answers with the
+# real bridge, in the parent process.
+
+_FRAME_HEADER = 4
+
+
+def _json_safe(value: Any, depth: int = 0) -> Any:
+    """Convert a value that came from Lua into something JSON can carry."""
+    if depth > 6:
+        return str(value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, bytes):
+        return value.decode("latin-1")
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item, depth + 1) for item in value]
+    items = getattr(value, "items", None)
+    if callable(items):
+        # A lupa table: iterate like a mapping.
+        try:
+            return {str(key): _json_safe(item, depth + 1) for key, item in items()}
+        except Exception:  # noqa: BLE001 - not a table after all
+            return str(value)
+    if isinstance(value, (set, frozenset)):
+        return [_json_safe(item, depth + 1) for item in value]
+    return str(value)
+
+
+def _write_frame(fd: int, payload: dict[str, Any]) -> None:
+    import json
+
+    body = json.dumps(payload, ensure_ascii=True, default=str).encode("utf-8")
+    header = len(body).to_bytes(_FRAME_HEADER, "big")
+    for chunk in (header, body):
+        offset = 0
+        while offset < len(chunk):
+            offset += os.write(fd, chunk[offset:])
+
+
+def _read_exact(fd: int, size: int) -> bytes:
+    buffer = bytearray()
+    while len(buffer) < size:
+        chunk = os.read(fd, size - len(buffer))
+        if not chunk:
+            return bytes(buffer)
+        buffer.extend(chunk)
+    return bytes(buffer)
+
+
+def _read_frame(fd: int) -> dict[str, Any] | None:
+    """Read one frame, or ``None`` when the other side closed the pipe."""
+    import json
+
+    header = _read_exact(fd, _FRAME_HEADER)
+    if len(header) < _FRAME_HEADER:
+        return None
+    size = int.from_bytes(header, "big")
+    body = _read_exact(fd, size)
+    if len(body) < size:
+        return None
+    try:
+        return json.loads(body.decode("utf-8"))
+    except ValueError:  # pragma: no cover - a torn frame
+        return None
+
+
+def _bridge_proxy(request_fd: int, response_fd: int, call: str) -> Callable[..., Any]:
+    """The child's stand-in for a host bridge: ask the parent and wait."""
+
+    def proxy(*args: Any, **_kwargs: Any) -> Any:
+        try:
+            _write_frame(request_fd, {"call": call, "args": [_json_safe(item) for item in args]})
+            frame = _read_frame(response_fd)
+        except OSError as exc:  # pragma: no cover - the parent went away
+            raise RuntimeError(f"host bridge unavailable: {exc}") from exc
+        if frame is None:
+            raise RuntimeError("host bridge closed the channel")
+        if "error" in frame:
+            raise RuntimeError(str(frame["error"]))
+        return frame.get("result")
+
+    return proxy
+
+
+def _serve_bridge_call(
+    call: str,
+    args: list[Any],
+    http_bridge: Callable[..., Any] | None,
+    request_bridge: Callable[..., Any] | None,
+) -> tuple[Any, str | None]:
+    """Run one bridge call in the parent and describe the answer."""
+    try:
+        if call == "http":
+            if http_bridge is None:
+                raise RuntimeError("no HTTP bridge is configured")
+            return http_bridge(*args), None
+        if call == "request":
+            if request_bridge is None:
+                raise RuntimeError("no request bridge is configured")
+            return _json_safe(request_bridge(*args)), None
+        raise RuntimeError(f"unknown bridge call: {call}")
+    except Exception as exc:  # noqa: BLE001 - the child must see the message, not a traceback
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def run_bounded(
+    emulator: LuaEmulator,
+    source: str,
+    *,
+    wall_seconds: float,
+    logger: logging.Logger | None = None,
+) -> EmulatorResult:
+    """Run the backend under a hard wall-clock deadline, keeping what it saw.
+
+    A loader can defeat every in-process stop: it may swallow the step budget
+    inside a ``pcall`` (the hook then only fires on the next Lua instruction, and
+    a long C call never gets there), or it may clear the hook.  The only reliable
+    stop is process-level, so the run happens in a forked child that is killed
+    when the deadline passes.
+
+    Killing the child used to throw away everything it had already found -- the
+    captured chunks, the VM tables, the prints, which are exactly the evidence a
+    partially-running loader yields.  The child therefore *spools* every
+    observation as it happens, and this function rebuilds a partial result from
+    the spool when the child was killed.
+    """
+    if os.name == "nt" or not hasattr(os, "fork"):
+        # No process isolation: the emulator's own hook budgets are all we have.
+        return emulator.run(source)
+
+    import json
+    import select
+    import tempfile
+
+    handle = tempfile.NamedTemporaryFile("w+", suffix=".protez-spool", delete=False)
+    spool_path = handle.name
+    host_http = emulator.http_bridge
+    host_request = emulator.request_bridge
+    # The child asks the parent to make the calls, so the parent's fetcher keeps
+    # its records (and whatever the caller is watching) intact.
+    request_read, request_write = os.pipe()
+    response_read, response_write = os.pipe()
+    started = time.monotonic()
+    try:
+        pid = os.fork()
+    except OSError as exc:  # pragma: no cover - fork limits are environmental
+        handle.close()
+        for fd in (request_read, request_write, response_read, response_write):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(spool_path)
+        except OSError:
+            pass
+        if logger is not None:
+            logger.debug("Portable backend could not fork: %s", exc)
+        return emulator.run(source)
+
+    if pid == 0:  # pragma: no cover - the child never returns to the test suite
+        try:
+            os.close(request_read)
+            os.close(response_write)
+            if host_http is not None:
+                emulator.http_bridge = _bridge_proxy(request_write, response_read, "http")
+            if host_request is not None:
+                emulator.request_bridge = _bridge_proxy(request_write, response_read, "request")
+            emulator.event_sink = lambda kind, payload: _spool_event(handle, kind, payload)
+            try:
+                result = emulator.run(source)
+            except BaseException:  # noqa: BLE001 - a failed run is reported by its spool
+                pass
+            else:
+                _spool_event(
+                    handle,
+                    "result",
+                    {
+                        "status": result.status,
+                        "error": result.error,
+                        "instructions": result.instructions,
+                        "runtime": result.runtime,
+                        "profile": result.profile,
+                        "notes": list(result.notes),
+                        "fetches": list(result.fetches),
+                        "requests": list(result.requests),
+                        "written_files": list(result.written_files),
+                    },
+                )
+        finally:
+            try:
+                handle.close()
+            except Exception:  # noqa: BLE001 - nothing left to do about it
+                pass
+            for fd in (request_write, response_read):
+                try:
+                    os.close(fd)
+                except OSError:  # pragma: no cover
+                    pass
+            os._exit(0)
+
+    os.close(request_write)
+    os.close(response_read)
+    deadline = started + max(0.0, wall_seconds)
+    killed = False
+    while time.monotonic() < deadline:
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:  # pragma: no cover - the child vanished
+            done = pid
+        if done == pid:
+            break
+        # While the child runs, answer its bridge calls in this process.
+        try:
+            ready, _, _ = select.select([request_read], [], [], 0.02)
+        except (OSError, ValueError):  # pragma: no cover - the pipe is gone
+            ready = []
+        if not ready:
+            continue
+        frame = _read_frame(request_read)
+        if frame is None:
+            continue
+        result, error = _serve_bridge_call(
+            str(frame.get("call") or ""),
+            list(frame.get("args") or []),
+            host_http,
+            host_request,
+        )
+        try:
+            _write_frame(
+                response_write,
+                {"result": result} if error is None else {"error": error},
+            )
+        except OSError:  # pragma: no cover - the child died mid-call
+            pass
+    else:
+        killed = True
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:  # pragma: no cover - already gone
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:  # pragma: no cover
+            pass
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):  # pragma: no cover
+            pass
+    for fd in (request_read, response_write):
+        try:
+            os.close(fd)
+        except OSError:  # pragma: no cover
+            pass
+    handle.close()
+
+    captures: list[EmulatorCapture] = []
+    tables: list[VmSnapshot] = []
+    result_payload: dict[str, Any] | None = None
+    instructions = 0
+    try:
+        with open(spool_path, "r", encoding="utf-8") as reader:
+            for line in reader:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:  # pragma: no cover - a torn final line
+                    continue
+                event = record.get("event")
+                data = record.get("data") or {}
+                if event == "capture":
+                    captures.append(
+                        EmulatorCapture(
+                            kind=str(data.get("kind") or "print"),
+                            text=str(data.get("text", "")),
+                            chunk_name=str(data.get("chunk_name", "")),
+                            binary=bool(data.get("binary")),
+                        )
+                    )
+                elif event == "vm_table":
+                    tables.append(
+                        VmSnapshot(
+                            kind=str(data.get("kind") or "numbers"),
+                            label=str(data.get("label") or "table"),
+                            values=tuple(data.get("values") or ()),
+                            width=int(data.get("width") or 1),
+                        )
+                    )
+                elif event == "progress":
+                    instructions = max(instructions, int(data.get("instructions") or 0))
+                elif event == "result":
+                    result_payload = data
+    except OSError:  # pragma: no cover - the spool should exist
+        result_payload = None
+    finally:
+        try:
+            os.unlink(spool_path)
+        except OSError:  # pragma: no cover
+            pass
+
+    duration = time.monotonic() - started
+    if result_payload is not None and not killed:
+        return EmulatorResult(
+            status=str(result_payload.get("status") or "completed"),
+            captures=tuple(captures),
+            error=result_payload.get("error"),
+            instructions=int(result_payload.get("instructions") or instructions),
+            duration_seconds=duration,
+            runtime=str(result_payload.get("runtime") or ""),
+            profile=str(result_payload.get("profile") or emulator.profile.key),
+            notes=tuple(str(note) for note in result_payload.get("notes", ())),
+            fetches=tuple(str(item) for item in result_payload.get("fetches", ())),
+            requests=tuple(result_payload.get("requests", ())),
+            written_files=tuple(str(item) for item in result_payload.get("written_files", ())),
+            vm_tables=tuple(tables),
+        )
+
+    note = (
+        f"the loader did not return inside its {wall_seconds:.0f}s wall-clock budget and was "
+        "stopped; what it produced before that is kept below"
+    )
+    if logger is not None:
+        logger.warning("Portable backend: %s", note)
+    return EmulatorResult(
+        status="limit",
+        captures=tuple(captures),
+        error=note,
+        instructions=instructions,
+        duration_seconds=duration,
+        runtime="Lua 5.1 (lupa)",
+        profile=emulator.profile.key,
+        notes=(note,),
+        vm_tables=tuple(tables),
+    )
+
+
 def emulator_available() -> bool:
     """True when the optional ``lupa`` runtime can be imported."""
     try:
@@ -659,6 +1034,7 @@ class LuaEmulator:
         hwid: str | None = None,
         logger: logging.Logger | None = None,
         roblox: bool = True,
+        event_sink: Callable[[str, dict[str, Any]], None] | None = None,
     ):
         self.profile = profile if isinstance(profile, ExecutorProfile) else get_profile(
             profile if isinstance(profile, str) else None
@@ -674,6 +1050,10 @@ class LuaEmulator:
         self.hwid = hwid
         self.logger = logger or logging.getLogger("protez")
         self.roblox = roblox
+        #: Optional ``(kind, payload)`` callback that receives every observation
+        #: as it happens.  ``run_bounded`` uses it to spool a run that will later
+        #: be killed, so the evidence survives the kill.
+        self.event_sink = event_sink
         self._prelude = prelude if prelude is not None else build_lua_prelude(
             self.profile, roblox=roblox, script_key=script_key
         )
@@ -810,17 +1190,30 @@ class LuaEmulator:
                 return
             if len(captures) >= self.max_captures:
                 return
+            pending_capture = EmulatorCapture(
+                kind=str(kind), text="", chunk_name=str(chunk_name or ""), binary=binary
+            )
             output_bytes["value"] += len(decoded)
             if output_bytes["value"] > self.max_capture_bytes:
                 raise RuntimeError("captured chunks exceed the configured byte budget")
-            captures.append(
-                EmulatorCapture(
-                    kind=str(kind),
-                    text=decoded,
-                    chunk_name=str(chunk_name or ""),
-                    binary=binary,
-                )
+            captured = EmulatorCapture(
+                kind=str(kind),
+                text=decoded,
+                chunk_name=str(chunk_name or ""),
+                binary=binary,
             )
+            captures.append(captured)
+            _ = pending_capture
+            emit("capture", _capture_payload(captured))
+
+        def emit(kind: str, payload: dict[str, Any]) -> None:
+            """Hand one observation to the event sink, if there is one."""
+            if self.event_sink is None:
+                return
+            try:
+                self.event_sink(kind, payload)
+            except Exception:  # noqa: BLE001 - streaming must never break a run
+                pass
 
         printed = {"count": 0}
 
@@ -828,9 +1221,9 @@ class LuaEmulator:
             if printed["count"] >= MAX_PRINT_LINES:
                 return
             printed["count"] += 1
-            captures.append(
-                EmulatorCapture(kind="print", text=str(text), chunk_name="", binary=False)
-            )
+            capture = EmulatorCapture(kind="print", text=str(text), chunk_name="", binary=False)
+            captures.append(capture)
+            emit("capture", _capture_payload(capture))
 
         positions: list[str] = []
         position_log = os.environ.get("PROTEZ_EMU_POSITIONS")
@@ -859,6 +1252,9 @@ class LuaEmulator:
             handlers created since the last pass are caught too.
             """
             state["instructions"] += 1
+            if state["instructions"] % PROGRESS_EVERY == 0:
+                # Enough for a killed run to report how far it got.
+                emit("progress", {"instructions": state["instructions"] * HOOK_STEP})
             if state["stopped"] is None:
                 if state["instructions"] > self.max_instructions:
                     state["stopped"] = "instruction budget"
@@ -1114,6 +1510,15 @@ class LuaEmulator:
             if snapshot is None:
                 return False
             state["vm_tables"].append(snapshot)
+            emit(
+                "vm_table",
+                {
+                    "kind": snapshot.kind,
+                    "label": snapshot.label,
+                    "width": snapshot.width,
+                    "values": list(snapshot.values),
+                },
+            )
             self.logger.debug("VM snapshot: %s", snapshot.describe())
             return True
 

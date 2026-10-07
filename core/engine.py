@@ -28,7 +28,13 @@ from typing import Callable, Iterable, Sequence
 from core.deobfuscator import deobfuscate_source
 from core.devirt import DevirtResult
 from core.devirt import devirtualize as devirtualize_family
-from core.emulator import EmulatorResult, LuaEmulator, backend_terminates, emulator_available
+from core.emulator import (
+    EmulatorResult,
+    LuaEmulator,
+    backend_terminates,
+    emulator_available,
+    run_bounded,
+)
 from core.families import (
     FamilyOutcome,
     best_family,
@@ -655,9 +661,11 @@ class RecoveryEngine:
 
     def _run_emulator(self, source: str, fetcher: PayloadFetcher) -> EmulatorResult | None:
         # A loader that swallows the step budget loops forever *inside one Lua
-        # call*, where neither the budget nor the pipeline deadline can reach it.
-        # Run the script in a disposable child first: if that child has to be
-        # killed, the backend is skipped instead of freezing the whole app.
+        # call*, where neither the budget nor the pipeline deadline can reach it,
+        # so the run happens in a child that is killed when the wall clock runs
+        # out.  The child spools what it saw as it goes: a killed run still
+        # yields its captured chunks and VM tables instead of nothing, which is
+        # exactly the evidence a loader that half-runs produces.
         if self._backend_skip_reason is not None:
             note = self._backend_skip_reason
             self.logger.info("Portable backend still skipped: %s", note)
@@ -668,40 +676,31 @@ class RecoveryEngine:
                 profile=self.profile.label,
                 notes=(note,),
             )
-        verdict = backend_terminates(source, timeout_seconds=self.emulator_timeout, logger=self.logger)
-        if verdict is False:
-            note = (
-                "portable backend skipped: the loader did not return inside its budget "
-                "(it swallows the step stop or sits in a long call)"
-            )
-            self._backend_skip_reason = note
-            self.logger.warning(note)
-            if note not in notes_for_run:
-                notes_for_run.append(note)
-            return EmulatorResult(
-                status="unavailable",
-                error=note,
-                runtime="Lua 5.1 (lupa)",
-                profile=self.profile.label,
-                notes=(note,),
-            )
+        # Never start a run that cannot finish inside the pipeline budget: the
+        # total limit used to stop the *caller* while the backend kept running.
+        remaining = self._deadline_guard() - time.monotonic()
+        budget = min(self.emulator_timeout, max(2.0, remaining - 5.0))
         try:
             emulator = LuaEmulator(
                 profile=self.profile,
                 script_key=self.script_key,
-                timeout_seconds=self.emulator_timeout,
+                timeout_seconds=budget,
                 http_bridge=fetcher.bridge if fetcher.enabled else None,
                 request_bridge=fetcher.request_bridge if fetcher.enabled else None,
                 workspace_dir=self._executor_workspace(),
                 logger=self.logger,
             )
-            result = emulator.run(source)
+            result = run_bounded(emulator, source, wall_seconds=budget, logger=self.logger)
             if result.written_files:
                 self.logger.info(
                     "Executor workspace received %s file(s): %s",
                     len(result.written_files),
                     ", ".join(result.written_files[:6]),
                 )
+            if result.status == "limit" and result.error and "wall-clock" in str(result.error):
+                # Remember it, so later layers do not each pay the same budget
+                # for a loader that is known not to return.
+                self._backend_skip_reason = str(result.error)
             return result
         except Exception as exc:  # noqa: BLE001 - the portable backend is optional
             self.logger.info("Portable backend skipped: %s", exc)
