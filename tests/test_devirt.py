@@ -209,7 +209,7 @@ class LifterTerminationTests(unittest.TestCase):
             self.skipTest("lupa is required for the portable backend")
         if not self.sample.is_file():
             self.skipTest("no MoonSec v3 sample in this checkout")
-        from core import lua51
+        from core import lua51 as lua51_lifter
         from core.emulator import LuaEmulator
 
         result = LuaEmulator(timeout_seconds=8.0).run(
@@ -220,10 +220,91 @@ class LifterTerminationTests(unittest.TestCase):
         self.assertTrue(raw.startswith(b"\x1bLua"))
 
         started = time.monotonic()
-        pseudocode = lua51.decompile(raw)
+        pseudocode = lua51_lifter.decompile(raw)
         elapsed = time.monotonic() - started
         self.assertLess(elapsed, 20.0, "the structured walk must stay bounded")
         self.assertIn("Recovered from Lua 5.1 bytecode", pseudocode)
+
+        # Bounded is not enough: the listing is what a user reads, so it has to
+        # be valid Lua.  Before instruction-level deduplication this listing was
+        # 250k lines with hundreds of half-open blocks and could not be parsed
+        # by any Lua compiler at all.
+        self.assertTrue(lua51_lifter.listing_is_structurally_valid(pseudocode))
+        self.assertLess(len(pseudocode.splitlines()), 40_000)
+        runtime = lua51.LuaRuntime(unpack_returned_tuples=True, encoding="latin-1")
+        payload = pseudocode.encode("latin-1", "replace").decode("latin-1")
+        self.assertTrue(runtime.eval("loadstring")(payload), "the listing must parse")
+
+
+class ListingStructureTests(unittest.TestCase):
+    """The listing verifier and repair pass back the readability guarantee."""
+
+    def test_unmatched_else_and_end_are_rejected(self) -> None:
+        from core.lua51 import listing_is_structurally_valid
+
+        self.assertFalse(listing_is_structurally_valid("else\nreturn 1\n"))
+        self.assertFalse(listing_is_structurally_valid("end\n"))
+        self.assertTrue(listing_is_structurally_valid("if a then\nreturn 1\nend\n"))
+
+    def test_return_in_the_middle_of_a_block_is_rejected(self) -> None:
+        from core.lua51 import listing_is_structurally_valid
+
+        self.assertFalse(listing_is_structurally_valid("if a then\nreturn 1\nprint(2)\nend\n"))
+        self.assertFalse(listing_is_structurally_valid("if a then\nreturn 1\nif b then\nend\nend\n"))
+        # A return that *is* the last statement of its block is fine.
+        self.assertTrue(listing_is_structurally_valid("if a then\nprint(2)\nreturn 1\nend\n"))
+        self.assertTrue(listing_is_structurally_valid("return 1\n"))
+
+    def test_repair_detaches_only_unmatched_markers(self) -> None:
+        from core.lua51 import repair_block_structure
+
+        lines = ["if a then", "\tprint(1)", "\tend", "\telse", "\tprint(2)"]
+        repaired, detached, closed = repair_block_structure(lines)
+        self.assertEqual((detached, closed), (1, 0))
+        self.assertIn("detached block marker: else", repaired[3])
+        self.assertEqual(repaired[:3], lines[:3])
+
+    def test_a_balanced_listing_is_returned_untouched(self) -> None:
+        from core.lua51 import repair_block_structure
+
+        lines = ["if a then", "\tprint(1)", "end"]
+        repaired, detached, closed = repair_block_structure(lines)
+        self.assertEqual((detached, closed), (0, 0))
+        self.assertEqual(repaired, lines)
+
+    def test_global_names_are_printed_as_assignable_text(self) -> None:
+        from core.lua51 import _FunctionLifter
+
+        class _StubProto:
+            """Just enough proto for the name renderer."""
+
+            instructions: list = []
+            num_params = 0
+            max_stack_size = 1
+            upvalue_count = 0
+            upvalue_names: list = []
+            protos: list = []
+            is_vararg = 0
+
+            def constant_text(self, index: int) -> str:
+                return names[index]
+
+        for constant, expected in (
+            ("print", "print"),
+            ("WVatKLioHEcz", "WVatKLioHEcz"),
+            ('"print"', "print"),
+            ('"WVatKLioHEcz"', "WVatKLioHEcz"),
+            ('"end"', '_G["end"]'),
+        ):
+            names = [constant]
+            lifter = _FunctionLifter(_StubProto())
+            self.assertEqual(lifter._global_text(0), expected, constant)
+
+    def test_a_flat_listing_has_no_block_tokens(self) -> None:
+        from core.lua51 import listing_is_structurally_valid
+
+        flat = "-- function@1: flat listing\n\tv1 = 1\n-- TEST v2\n\tv3 = 4\n"
+        self.assertTrue(listing_is_structurally_valid(flat))
 
 
 class TableVmTests(unittest.TestCase):

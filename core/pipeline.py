@@ -51,6 +51,7 @@ from core.moonsec_devirtualizer import (
     MoonSecDevirtualizationError,
     MoonSecV3Result,
     devirtualize_moonsec_v3,
+    lift_moonsec_from_runtime,
 )
 from core.output import (
     clean_result_header,
@@ -758,6 +759,21 @@ class DeobfuscationPipeline:
                         self.logger.exception("Unexpected error in the MoonSec V3 lifter")
                 else:
                     family_lifter_error = "the total pipeline time limit was reached before VM lifting started"
+                if moonsec_result is None:
+                    # No external tool: capture the interpreter the wrapper
+                    # dumps at runtime and lift that with Protez's own lifter.
+                    remaining = deadline - time.monotonic()
+                    if remaining > 0:
+                        try:
+                            moonsec_result = lift_moonsec_from_runtime(
+                                source, timeout_seconds=remaining, logger=self.logger
+                            )
+                        except MoonSecDevirtualizationError as exc:
+                            family_lifter_error = f"{family_lifter_error}; {exc}"
+                        except Exception as exc:  # noqa: BLE001
+                            family_lifter_error = f"{family_lifter_error}; unexpected {type(exc).__name__}: {exc}"
+                    else:
+                        family_lifter_error = f"{family_lifter_error}; no time left for the runtime capture"
                 return self._write_moonsec_result(
                     source=source,
                     source_name=source_name,
@@ -1238,8 +1254,6 @@ class DeobfuscationPipeline:
             artifacts.append((output_path, source_candidate.encode("utf-8")))
             primary_path = output_path
         else:
-            if source_candidate is not None:
-                artifacts.append((candidate_path, source_candidate.encode("utf-8")))
             preview = (
                 "-- Protez static preview only; this is not recovered source.\n"
                 f"-- Detected: {profile.display_name}.\n"
@@ -1248,8 +1262,17 @@ class DeobfuscationPipeline:
                     source_analysis.source, label="MoonSec V3 wrapper preview"
                 )[0]
             )
-            artifacts.append((preview_path, preview.encode("utf-8")))
-            primary_path = preview_path
+            if source_candidate is not None:
+                # A partial lift (the interpreter recovered from the wrapper's own
+                # runtime capture) is the most readable artifact this route can
+                # produce, so it is what the single result file holds.
+                lift = self._make_readable(source_candidate, label="MoonSec V3 lifted source")[0]
+                artifacts.append((candidate_path, lift.encode("utf-8")))
+                artifacts.append((preview_path, preview.encode("utf-8")))
+                primary_path = candidate_path
+            else:
+                artifacts.append((preview_path, preview.encode("utf-8")))
+                primary_path = preview_path
         if devirtualized is not None and devirtualized.bytecode is not None:
             artifacts.append((bytecode_path, devirtualized.bytecode))
         if devirtualized is not None and devirtualized.disassembly:
@@ -1302,6 +1325,10 @@ class DeobfuscationPipeline:
             ],
         }
         artifacts.append((report_path, (json.dumps(report, indent=2, ensure_ascii=False) + "\n").encode("utf-8")))
+        if primary_path != preview_path:
+            # output/ keeps exactly one readable result; the raw preview belongs
+            # with the reports.
+            artifacts = [(path, payload) for path, payload in artifacts if path != preview_path]
         temporaries: list[Path] = []
         try:
             for path, payload in artifacts:
@@ -1317,7 +1344,14 @@ class DeobfuscationPipeline:
             "MoonSec V3 bytecode was lifted to readable Lua and passed Luau syntax validation; "
             "semantic equivalence is not verified."
             if source_recovered
-            else "MoonSec V3 analysis is partial: "
+            else (
+                "MoonSec V3: the wrapper's interpreter was recovered from its own runtime capture "
+                "and lifted to readable pseudocode; the protected program itself lives in the "
+                "payload that interpreter decodes and is not decoded by this route. "
+                if primary_path == candidate_path and source_candidate is not None
+                else "MoonSec V3 analysis is partial: "
+            )
+            + ("" if primary_path == candidate_path and source_candidate is not None else "")
             + ", ".join(partial_reasons)
             + (f". {diagnostic_error}" if diagnostic_error else ".")
         )

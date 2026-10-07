@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- The Lua 5.1 lifter (the common path for WeAreDevs, IronBrew2/3, PSU, Nexus,
+  MoonSec and every other bytecode family) now produces listings that actually
+  parse, and no longer explode on obfuscated control flow:
+  - **Instruction-level deduplication.**  Obfuscators overlap their branch
+    regions on purpose; the lifter followed every path and re-emitted shared
+    tails, turning a 9k-instruction dispatcher into a 250k-line listing full of
+    half-open blocks.  Each instruction is now emitted once, and a path that
+    reaches one already emitted ends with a short note.  MoonSec V3's recovered
+    interpreter went from 250k unparseable lines to **11.8k lines that parse**
+    (287 KB down from 3.4 MB, 0.2 s).
+  - **Flat fallback.**  When a branch layout cannot be structured, the listing is
+    re-emitted flat -- one instruction per line, control flow in comments --
+    instead of leaving an unparseable structure behind.  Flat mode emits no
+    blocks at all, including `return`/`break`.
+  - **Structural verification.**  A listing is checked before it is handed on
+    (unmatched `else`/`end`, `return` that does not end its block) and repaired
+    or re-emitted flat, with a header line saying which happened.
+  - Fixed three emissions that were syntactically invalid on their own:
+    `SETGLOBAL` printed `"SomeName" = value` (the name is a string constant, and
+    a name that is not an identifier belongs in `_G[...]`), a chunk with
+    parameters or upvalues was printed as a bare `function(...) ... end`, and
+    `...` was emitted inside functions that do not declare varargs (a stripped
+    prototype can read varargs without carrying the flag).
+  - A `_varargs` helper keeps `...` legal at every use site, the nested-prototype
+    copy keeps the child's own nesting instead of flattening it, and the block
+    scanner no longer copies the remaining listing per line (that made a 3 MB
+    listing quadratic to scan).
+- **MoonSec V3 without the offline tool.**  The shipped route needs an external
+  devirtualizer and `unluac`; when they are absent the route now falls back to
+  the portable backend, captures the interpreter chunk the wrapper dumps at run
+  time, lifts it with Protez's own lifter, and uses that partial lift as the
+  single result artifact (route `moonsec-v3-vm-lifter`, with a notice saying
+  exactly what was and was not decoded).
+
+
 - The portable backend now performs the **same work for every family**, instead
   of depending on what a loader happens to call:
   - The executor prelude, the table tagger and the VM dumper are set up *before*

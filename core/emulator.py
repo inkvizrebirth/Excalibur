@@ -1195,13 +1195,20 @@ class LuaEmulator:
                 # misses turns that hunt into a list.
                 runtime.execute(
                     b"local __protez_missing = {}\n"
+                    b"local __protez_missing_where = {}\n"
                     b"setmetatable(_G, { __index = function(_, key)\n"
                     b"  if type(key) == 'string' then\n"
                     b"    __protez_missing[key] = (__protez_missing[key] or 0) + 1\n"
+                    b"    if __protez_missing_where[key] == nil then\n"
+                    b"      local info = debug.getinfo(2, 'Sl')\n"
+                    b"      __protez_missing_where[key] = tostring(info and info.short_src or '?')\n"
+                    b"        .. ':' .. tostring(info and info.currentline or -1)\n"
+                    b"    end\n"
                     b"  end\n"
                     b"  return nil\n"
                     b"end })\n"
-                    b"rawset(_G, '__protez_missing', __protez_missing)"
+                    b"rawset(_G, '__protez_missing', __protez_missing)\n"
+                    b"rawset(_G, '__protez_missing_where', __protez_missing_where)"
                 )
             # The bridge is latin-1, so the payload must travel back as the very
             # bytes the file had; ``utf-8`` would inflate every byte above 0x7f.
@@ -1250,9 +1257,18 @@ class LuaEmulator:
                 entries = []
             entries.sort(key=lambda item: (-item[1], item[0]))
             if entries:
+                try:
+                    where = {
+                        str(key): str(value)
+                        for key, value in (runtime.eval("__protez_missing_where") or {}).items()
+                    }
+                except Exception:  # noqa: BLE001 - diagnostics only
+                    where = {}
                 notes.append(
                     "globals the loader read but the environment does not define: "
-                    + ", ".join(f"{name} ({count})" for name, count in entries[:12])
+                    + ", ".join(
+                        f"{name} ({count} at {where.get(name, '?')})" for name, count in entries[:12]
+                    )
                 )
         notes.extend(note for note in luau_notes if note not in notes)
         if state["fetches"]:

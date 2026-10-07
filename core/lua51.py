@@ -319,6 +319,222 @@ OPCODE_NAMES = (
 )
 OPCODE_INDEX = {name: index for index, name in enumerate(OPCODE_NAMES)}
 
+#: Words that cannot be used as bare identifiers in emitted statements.
+_LUA_KEYWORDS = frozenset(
+    """
+    and break do else elseif end false for function if in local nil not or repeat
+    return then true until while
+    """.split()
+)
+
+# ----------------------------------------------------------------------
+# Structural verification of an emitted listing
+# ----------------------------------------------------------------------
+
+#: Past this nesting depth, or this many lines, the branch layout is not worth
+#: structuring any further: the listing continues flat, one instruction per line.
+MAX_STRUCTURED_INDENT = 12
+MAX_LISTING_LINE_FACTOR = 6
+
+#: Instructions that only make sense as structure.  In flat mode they become
+#: comments instead of `if`/`while` headers, which keeps the listing parseable.
+_FLAT_CONTROL_OPS = frozenset(
+    "TEST TESTSET EQ LT LE JMP FORLOOP FORPREP TFORLOOP".split()
+)
+
+_BLOCK_WORDS = frozenset(
+    "function if then elseif else end do while for repeat until".split()
+)
+
+# Match *at* a position instead of slicing: ``text[index:]`` copies the rest of
+# the listing, and a 250k-line listing turned that into a quadratic scan that
+# never finished.
+_BLOCK_COMMENT_START = re.compile(r"--\[(=*)\[")
+_LONG_BRACKET_START = re.compile(r"\[(=*)\[")
+
+
+def iter_block_words(text: str):
+    """Yield ``(word, line)`` for block keywords outside comments and strings."""
+    index = 0
+    length = len(text)
+    line = 0
+    word_start = -1
+    while index < length:
+        char = text[index]
+        if char == "\n":
+            line += 1
+            index += 1
+            continue
+        if char == "-" and text.startswith("--", index):
+            if index + 2 < length and text[index + 2] == "[":
+                match = _BLOCK_COMMENT_START.match(text, index)
+                if match:
+                    closing = "]" + match.group(1) + "]"
+                    end = text.find(closing, index + len(match.group(0)))
+                    end = length if end < 0 else end + len(closing)
+                    line += text.count("\n", index, end)
+                    index = end
+                    continue
+            end = text.find("\n", index)
+            index = length if end < 0 else end
+            continue
+        if char in "\"'":
+            quote = char
+            index += 1
+            while index < length:
+                if text[index] == "\\":
+                    index += 2
+                    continue
+                if text[index] == quote:
+                    index += 1
+                    break
+                if text[index] == "\n":
+                    line += 1
+                index += 1
+            continue
+        if char == "[":
+            match = _LONG_BRACKET_START.match(text, index)
+            if match:
+                closing = "]" + match.group(1) + "]"
+                end = text.find(closing, index + len(match.group(0)))
+                end = length if end < 0 else end + len(closing)
+                line += text.count("\n", index, end)
+                index = end
+                continue
+        if char.isalpha() or char == "_":
+            word_start = index
+            while index < length and (text[index].isalnum() or text[index] == "_"):
+                index += 1
+            word = text[word_start:index]
+            if word in _BLOCK_WORDS:
+                yield word, line
+            continue
+        index += 1
+
+
+def listing_is_structurally_valid(text: str) -> bool:
+    """Whether a listing is a syntactically plausible Lua chunk.
+
+    Two things make a listing unparseable in practice: an ``else``/``end`` with
+    no block to belong to, and a ``return`` that is not the last statement of its
+    block (Lua 5.1 requires that).  Comments and strings are ignored.
+    """
+    stack: list[str] = []
+    for word, _line in iter_block_words(text):
+        if word == "function":
+            stack.append("function")
+        elif word == "if":
+            stack.append("if")
+        elif word in {"while", "for"}:
+            stack.append(word)
+        elif word == "do":
+            if not (stack and stack[-1] in {"while", "for"}):
+                stack.append("do")
+        elif word == "repeat":
+            stack.append("repeat")
+        elif word == "elseif":
+            if not stack or stack[-1] != "if":
+                return False
+        elif word == "else":
+            if not stack or stack[-1] != "if":
+                return False
+        elif word == "until":
+            if not stack or stack[-1] != "repeat":
+                return False
+            stack.pop()
+        elif word == "end":
+            if not stack:
+                return False
+            stack.pop()
+    if stack:
+        return False
+
+    # `return` must end its block: nothing may follow it in the same block.
+    block_closers = ("end", "else", "elseif", "until")
+    lines = [line.strip() for line in text.split("\n")]
+    for position, line in enumerate(lines):
+        if not line.startswith("return"):
+            continue
+        for following in lines[position + 1:]:
+            if not following or following.startswith("--"):
+                continue
+            if following.startswith(block_closers):
+                break
+            return False
+    return True
+
+
+def repair_block_structure(lines: Sequence[str]) -> tuple[list[str], int, int]:
+    """Make an emitted listing parse by detaching block markers that cannot be.
+
+    The lifter reconstructs branches from jump layouts, and a layout it cannot
+    resolve (an obfuscator's jump table, overlapping regions) can leave an
+    ``else`` with no open ``if`` or an ``end`` with no opener.  Such a marker is
+    turned into a comment -- which keeps the listing readable *and* parseable --
+    and blocks still open at the end are closed.  Returns the repaired lines and
+    ``(detached, closed)`` counts so the caller can say what it did.
+
+    A listing that is already balanced is returned untouched.
+    """
+    stack: list[list] = []  # [kind, header_closed, saw_else, line]
+    detach: set[int] = set()
+    text = "\n".join(lines)
+    for word, line in iter_block_words(text):
+        if word == "function":
+            stack.append(["function", True, False, line])
+        elif word == "if":
+            stack.append(["if", False, False, line])
+        elif word in {"while", "for"}:
+            stack.append([word, False, False, line])
+        elif word == "do":
+            if stack and stack[-1][0] in {"while", "for"} and not stack[-1][1]:
+                stack[-1][1] = True
+            else:
+                stack.append(["do", True, False, line])
+        elif word == "then":
+            if stack and stack[-1][0] in {"if", "ifelse"} and not stack[-1][1]:
+                stack[-1][1] = True
+        elif word == "repeat":
+            stack.append(["repeat", True, False, line])
+        elif word == "elseif":
+            if stack and stack[-1][0] in {"if", "ifelse"}:
+                stack[-1][1] = False
+                stack[-1][0] = "ifelse"
+            else:
+                detach.add(line)
+        elif word == "else":
+            if stack and stack[-1][0] in {"if", "ifelse"} and not stack[-1][2]:
+                stack[-1][2] = True
+            else:
+                detach.add(line)
+        elif word == "until":
+            if stack and stack[-1][0] == "repeat":
+                stack.pop()
+            else:
+                detach.add(line)
+        elif word == "end":
+            if stack:
+                stack.pop()
+            else:
+                detach.add(line)
+
+    closed = 0
+    repaired = list(lines)
+    for line in sorted(detach):
+        if 0 <= line < len(repaired):
+            stripped = repaired[line].lstrip("\t ")
+            indent = repaired[line][: len(repaired[line]) - len(stripped)]
+            repaired[line] = f"{indent}-- Protez: detached block marker: {stripped}"
+    if stack:
+        # Close whatever is still open so the listing can be parsed and read.
+        for frame in reversed(stack):
+            kind = frame[0]
+            repaired.append("until true" if kind == "repeat" else "end")
+            closed += 1
+    if not detach and not closed:
+        return list(lines), 0, 0
+    return repaired, len(detach), closed
+
 # Opcodes whose C argument is a constant-or-register (RK) operand.
 _RK_OPCODES = {
     "GETTABLE", "SETTABLE", "SELF", "ADD", "SUB", "MUL", "DIV", "MOD", "POW",
@@ -444,7 +660,7 @@ class _FunctionLifter:
     of collapsing into nonsense like ``0 + 1``.
     """
 
-    def __init__(self, proto: Proto):
+    def __init__(self, proto: Proto, *, force_flat: bool = False):
         self.proto = proto
         self.instructions: list[Instruction] = list(proto.instructions)
         self.index_by_offset: dict[int, int] = {
@@ -453,6 +669,10 @@ class _FunctionLifter:
         self.lines: list[str] = []
         self._return_indent: int | None = None
         self.indent = 0
+        self.emitted: set[int] = set()
+        #: Set when the branch layout is too irregular to keep structuring, or
+        #: forced by ``force_flat`` when a prototype must be listed flat.
+        self.flat = bool(force_flat)
         self.registers: dict[int, str] = {}
         self.write_counts: dict[int, int] = {}
         self.stable: dict[int, bool] = {}
@@ -719,9 +939,48 @@ class _FunctionLifter:
     # ------------------------------------------------------------------
     # Main walk
     # ------------------------------------------------------------------
+    def _varargs(self) -> str:
+        """The text to emit where the function's varargs are used.
+
+        ``...`` is only legal inside a function that declares it, and a stripped
+        prototype can use varargs without carrying the flag; the emitted header
+        adds ``...`` in that case.  When even that is impossible the value is
+        spelled ``nil`` so the listing still parses.
+        """
+        return "..." if getattr(self, "declares_varargs", False) else "nil"
+
+    def signature_line(self) -> str:
+        """The ``function(...)`` header this prototype's body is emitted under.
+
+        Callers embed nested prototypes as assignments, and they must use the
+        *same* header: deriving it from the printed text broke as soon as the
+        header stopped starting with ``function(`` (a wrapped chunk), and the
+        fallback dropped the parameter list and the varargs with it.
+        """
+        parameters = list(self.parameters.values())
+        if self.proto.accepts_varargs or self._uses_vararg():
+            parameters.append("...")
+        return f"function({', '.join(parameters)})"
+
+    def _uses_vararg(self) -> bool:
+        """Whether any instruction reads the function's varargs.
+
+        Used when the chunk's ``is_vararg`` flag was cleared (MoonSec V3 does
+        this) so the emitted function still declares ``...``.
+        """
+        if getattr(self, "_vararg_flag", None) is not None:
+            return bool(self._vararg_flag)
+        self._vararg_flag = any(instruction.name == "VARARG" for instruction in self.instructions)
+        return bool(self._vararg_flag)
+
+    declares_varargs = True
+
     def lift(self, *, as_chunk: bool = False) -> str:
         parameters = list(self.parameters.values())
-        if self.proto.accepts_varargs:
+        if self.proto.accepts_varargs or self._uses_vararg():
+            # Some obfuscators strip the ``is_vararg`` flag from their chunks;
+            # without this the listing emits ``...`` inside a non-vararg
+            # function, which is a syntax error in every Lua parser.
             parameters.append("...")
         # The main prototype of a chunk has no parameters; emitting its body
         # directly keeps the result valid Luau instead of a stray
@@ -730,8 +989,14 @@ class _FunctionLifter:
         # with named parameters needs the wrapper to stay valid Luau. Varargs
         # are legal at the top level, so they do not force a wrapper.
         named_parameters = [item for item in parameters if item != "..."]
-        bare_chunk = bool(as_chunk and not named_parameters and not self.proto.upvalue_count)
-        named_chunk = bool(as_chunk and named_parameters and not self.proto.upvalue_count)
+        # A chunk is only emitted as bare statements when that *is* valid Lua:
+        # a prototype with parameters or with upvalues cannot stand alone as
+        # `function(...) ... end`, which is a syntax error.  Binding it to a name
+        # keeps the listing parseable (so editors can highlight and re-format it)
+        # even though the upvalues themselves are not recoverable.
+        bare_chunk = bool(as_chunk and not parameters and not self.proto.upvalue_count)
+        named_chunk = bool(as_chunk and not bare_chunk)
+        self.declares_varargs = "..." in parameters
         self._emit(f"-- {self.proto.name}: {len(self.instructions)} instructions, "
                    f"stack {self.proto.max_stack_size}, {self.proto.upvalue_count} upvalue(s)")
         if named_chunk:
@@ -785,7 +1050,38 @@ class _FunctionLifter:
             offset = instruction.offset
             name = instruction.name
 
-            loop_here = self.loops.get(offset)
+            if index in self.emitted:
+                # A branch layout whose regions overlap (obfuscator jump tables do
+                # this deliberately) used to re-emit the same tail once per path:
+                # a 9k-instruction dispatcher produced a 250k-line listing that
+                # was neither readable nor parseable.  Every instruction is
+                # emitted once; a path that reaches one ends there with a note.
+                self._emit(
+                    f"-- L{offset // 4} and what follows it are emitted above "
+                    "(overlapping branch layout)"
+                )
+                return
+            self.emitted.add(index)
+
+            if not self.flat and (
+                self.indent >= MAX_STRUCTURED_INDENT
+                or len(self.lines) > MAX_LISTING_LINE_FACTOR * len(self.instructions) + 256
+            ):
+                self.flat = True
+                self._emit(
+                    "-- the branch layout below is too irregular to keep nested "
+                    "(obfuscators overlap their regions on purpose): the rest of this "
+                    "prototype is listed one instruction per line"
+                )
+
+            if self.flat and (name in _FLAT_CONTROL_OPS or name in {"RETURN", "TAILCALL"}):
+                # Flat mode emits no blocks, so a bare `return` would sit in the
+                # middle of one -- a syntax error.  Keep it readable as a comment.
+                self._emit(f"-- {instruction.text(self.proto)}")
+                index += 1
+                continue
+
+            loop_here = None if self.flat else self.loops.get(offset)
             if loop_here is loop or (loop_here is not None and offset in self._active_loops):
                 loop_here = None
             if loop_here is not None and loop_here.kind in {"numeric-for", "generic-for"}:
@@ -895,7 +1191,7 @@ class _FunctionLifter:
             if name == "RETURN":
                 values: list[str] = []
                 if instruction.b == 0:
-                    values = [self._expression(instruction.a), "..."]
+                    values = [self._expression(instruction.a), self._varargs()]
                 elif instruction.b > 1:
                     values = [
                         self._expression(register)
@@ -913,15 +1209,26 @@ class _FunctionLifter:
                 nested_index = instruction.bx
                 if 0 <= nested_index < len(self.proto.protos):
                     nested = self.proto.protos[nested_index]
-                    nested_lines = _FunctionLifter(nested).lift().splitlines()
-                    header_line = next(
-                        (line for line in nested_lines if line.strip().startswith("function(")),
-                        "function(...)",
+                    nested_lifter = _FunctionLifter(nested, force_flat=self.flat)
+                    signature = nested_lifter.signature_line()
+                    nested_lines = nested_lifter.lift().splitlines()
+                    header_index = next(
+                        (
+                            position
+                            for position, line in enumerate(nested_lines)
+                            if signature in line
+                        ),
+                        None,
                     )
-                    self._emit(f"{self._register_name(instruction.a)} = {header_line.strip()}")
-                    body_start = nested_lines.index(header_line) + 1
+                    self._emit(f"{self._register_name(instruction.a)} = {signature}")
+                    body_start = (header_index + 1) if header_index is not None else 0
                     for line in nested_lines[body_start:-1]:
-                        self._emit(line.lstrip("\t"))
+                        # Keep the child's nesting visible: its body sits one
+                        # level below its own header, and the copy used to
+                        # flatten every level into a single indent.
+                        stripped = line.lstrip("\t")
+                        depth = len(line) - len(stripped)
+                        self._emit(("\t" * max(0, depth - 1)) + stripped)
                     self._emit("end")
                     self.registers[instruction.a] = self._register_name(instruction.a)
                     self.stable[instruction.a] = False
@@ -931,7 +1238,11 @@ class _FunctionLifter:
                 continue
 
             if name == "SETGLOBAL":
-                self._emit(f"{self.proto.constant_text(instruction.bx)} = {self._expression(instruction.a)}")
+                # The name is a string constant: printed as-is it would read
+                # `"SomeName" = value`, which is not a statement anywhere.
+                self._emit(
+                    f"{self._global_text(instruction.bx)} = {self._expression(instruction.a)}"
+                )
                 index += 1
                 continue
 
@@ -974,6 +1285,22 @@ class _FunctionLifter:
                 if operator in inner:
                     return inner.replace(operator, inverted, 1)
         return condition
+
+    def _global_text(self, index: int) -> str:
+        """Print a global's name so it can be read *and* parsed.
+
+        The name is a string constant; used verbatim as an assignment target it
+        would render as ``"SomeName" = value``, which is a syntax error, and
+        stripped of its quotes a name that is not an identifier would be too.
+        """
+        rendered = self.proto.constant_text(index)
+        if rendered.startswith('"') and rendered.endswith('"'):
+            name = rendered[1:-1]
+            if name.isidentifier() and name not in _LUA_KEYWORDS:
+                return name
+        elif rendered.isidentifier() and rendered not in _LUA_KEYWORDS:
+            return rendered
+        return f"_G[{rendered}]"
 
     def _table_set_text(self, table: str, key: str, value: str) -> str:
         if key.startswith('"') and key.endswith('"'):
@@ -1058,7 +1385,7 @@ class _FunctionLifter:
         arguments: list[str] = []
         if instruction.b == 0:
             arguments = [self._expression(register + 1 + offset) for offset in range(0, 2)]
-            arguments.append("...")
+            arguments.append(self._varargs())
         else:
             arguments = [self._expression(slot) for slot in range(register + 1, register + instruction.b)]
         callee = self.registers.get(register)
@@ -1097,7 +1424,7 @@ class _FunctionLifter:
             source = instruction.b
             self._assign(destination, self._expression(source), stable=self._is_stable(source))
         elif name == "GETGLOBAL":
-            self._assign(destination, self.proto.constant_text(instruction.bx).strip('"'), stable=True)
+            self._assign(destination, self._global_text(instruction.bx), stable=True)
         elif name == "GETUPVAL":
             self._assign(destination, self._upvalue(instruction.b), stable=False)
         elif name == "NEWTABLE":
@@ -1138,7 +1465,11 @@ class _FunctionLifter:
             stable = all(self._is_stable(register) for register in range(instruction.b, instruction.c + 1))
             self._assign(destination, " .. ".join(parts), stable=stable)
         elif name == "VARARG":
-            self._assign(destination, "..." if instruction.b == 0 else "select(...)", stable=False)
+            self._assign(
+                destination,
+                self._varargs() if instruction.b == 0 else f"select(1, {self._varargs()})",
+                stable=False,
+            )
         else:
             self._emit(f"-- {instruction.text(self.proto)}")
 
@@ -1164,6 +1495,35 @@ def decompile(data: bytes | str, *, include_disassembly: bool = False) -> str:
         "",
     ]
     body = _FunctionLifter(chunk.root).lift(as_chunk=True)
+    body_lines = body.split("\n")
+    if not listing_is_structurally_valid(body):
+        # A listing that cannot be parsed cannot be read either.  Rather than
+        # guess which marker to detach, re-emit the chunk in the flat form that
+        # has no blocks to get wrong.
+        flat = _FunctionLifter(chunk.root, force_flat=True).lift(as_chunk=True)
+        if listing_is_structurally_valid(flat):
+            header.append(
+                "-- Protez: the obfuscator's branch layout could not be structured (its regions "
+                "overlap); this listing is flat: one instruction per line, control flow in comments."
+            )
+            header.append("")
+            return "\n".join(header) + flat + "\n"
+    repaired, detached, closed = repair_block_structure(body_lines)
+    if detached or closed:
+        body = "\n".join(repaired)
+        changes: list[str] = []
+        if detached:
+            changes.append(
+                f"{detached} block marker(s) could not be attached to a reconstructed branch "
+                "and were turned into comments"
+            )
+        if closed:
+            changes.append(f"{closed} block(s) left open at the end were closed")
+        header.append(
+            "-- Protez: " + " and ".join(changes) + ", so this listing parses; "
+            "control flow near those lines is approximate."
+        )
+        header.append("")
     if include_disassembly:
         header.append("--[[ Disassembly of the entry prototype:")
         header.append(disassemble(chunk.root, limit=400))

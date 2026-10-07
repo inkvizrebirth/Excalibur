@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
@@ -7,6 +8,8 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from core.lua51 import decompile, is_lua51_bytecode
 
 MAX_MOONSEC_SOURCE_BYTES = 16 * 1024 * 1024
 MAX_MOONSEC_BYTECODE_BYTES = 64 * 1024 * 1024
@@ -139,6 +142,70 @@ def _check_lua51_chunk(path: Path) -> bytes:
     if not chunk.startswith(LUA51_HEADER):
         raise MoonSecDevirtualizationError("MoonSec helper output is not a standard Lua 5.1 chunk")
     return chunk
+
+
+def lift_moonsec_from_runtime(
+    source: str,
+    *,
+    timeout_seconds: float,
+    logger: logging.Logger | None = None,
+) -> MoonSecV3Result:
+    """Recover MoonSec V3 with Protez's own tools, without the offline binaries.
+
+    The shipped route drives an external devirtualizer plus ``unluac``; neither
+    can be bundled here.  What *is* available is the wrapper's own runtime: a
+    MoonSec V3 wrapper dumps its interpreter to bytecode and loads it, so the
+    portable backend captures that chunk (131 KB on the local fixture).  Lifting
+    it with Protez's Lua 5.1 lifter yields the interpreter itself -- its
+    dispatcher, helpers and encoded constants -- which is the honest limit of
+    what can be read without the external tool: the protected program lives in
+    the payload the interpreter decodes, not in this chunk.
+
+    Returns a result whose ``source`` is the lifted interpreter, and whose
+    ``error`` explains what is still missing.
+    """
+    if timeout_seconds <= 0:
+        raise MoonSecDevirtualizationError("MoonSec V3 analysis time budget is exhausted")
+    started = time.monotonic()
+    from core.emulator import LuaEmulator, emulator_available
+
+    if not emulator_available():
+        raise MoonSecDevirtualizationError(
+            "no offline MoonSec V3 tool and no portable backend to capture the interpreter's bytecode"
+        )
+    try:
+        run = LuaEmulator(timeout_seconds=min(20.0, timeout_seconds)).run(source)
+    except Exception as exc:  # noqa: BLE001 - the capture is best effort
+        raise MoonSecDevirtualizationError(f"runtime capture failed: {exc}") from exc
+    chunks = [capture for capture in run.captures if capture.kind == "bytecode"]
+    if not chunks:
+        raise MoonSecDevirtualizationError(
+            "the wrapper did not dump an interpreter chunk during the runtime capture"
+        )
+    capture = max(chunks, key=lambda item: len(item.text))
+    bytecode = capture.text.encode("latin-1", "replace")
+    if not is_lua51_bytecode(bytecode):
+        raise MoonSecDevirtualizationError(
+            "the captured chunk is not a Lua 5.1 container (it may be Luau bytecode)"
+        )
+    if logger is not None:
+        logger.info("MoonSec V3 interpreter captured: %d bytes", len(bytecode))
+    try:
+        lifted = decompile(bytecode, include_disassembly=False)
+    except Exception as exc:  # noqa: BLE001
+        raise MoonSecDevirtualizationError(f"the captured chunk could not be lifted: {exc}") from exc
+    return MoonSecV3Result(
+        source=lifted,
+        bytecode=bytecode,
+        disassembly=None,
+        error=(
+            "the offline MoonSec V3 tool is unavailable: this is the interpreter lifted from the "
+            "wrapper's own runtime capture, not the decoded program"
+        ),
+        elapsed_seconds=time.monotonic() - started,
+        devirtualizer_version="Protez runtime capture (portable backend)",
+        decompiler_version="Protez Lua 5.1 lifter",
+    )
 
 
 def devirtualize_moonsec_v3(
