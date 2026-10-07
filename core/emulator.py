@@ -737,6 +737,24 @@ def _serve_bridge_call(
         return None, f"{type(exc).__name__}: {exc}"
 
 
+def outcome_rank(status: str) -> int:
+    """How well a run went, for comparing two runs of related code.
+
+    ``limit`` is not a failure: a loader can be stopped by the wall clock or by
+    the instruction budget on its own, before any recovery happens.  What
+    matters when a result is judged next to its input is that it did not get
+    worse: completed < limit < error.
+    """
+    text = str(status or "").strip().lower()
+    if text in {"completed", "ok", "success"}:
+        return 0
+    if text in {"limit", "timeout"}:
+        return 1
+    if text in {"unavailable", "checker-error"}:
+        return 3
+    return 2
+
+
 def run_bounded(
     emulator: LuaEmulator,
     source: str,
@@ -1134,6 +1152,11 @@ class LuaEmulator:
         started = time.monotonic()
         deadline = started + self.timeout_seconds
         captures: list[EmulatorCapture] = []
+        # Diagnostics that are only set up once the runtime exists; they are
+        # read again after the run (and after a failure), so they need to exist
+        # even when the failure happens before their setup.
+        call_log_path: str | None = None
+        logged: list[str] = []
         state = {
             "instructions": 0,
             "escalations": 0,
@@ -1625,9 +1648,18 @@ class LuaEmulator:
                 # the last few entries name the expectation exactly.
                 logged: list[str] = []
 
+                # 400 is enough to see what a payload was probing when it
+                # died, but not enough to diff two runs of the same script:
+                # the VM dumper's own reads flood the window.  The cap is
+                # therefore settable for diagnostics.
+                try:
+                    log_cap = int(os.environ.get("PROTEZ_EMU_CALL_LOG_MAX", "400"))
+                except ValueError:
+                    log_cap = 400
+
                 def record_call(name: Any, detail: Any) -> bool:
                     logged.append(f"{name}({detail})")
-                    del logged[:-400]
+                    del logged[:-max(log_cap, 1)]
                     return True
 
                 globals_table["__protez_record_call"] = record_call

@@ -7,11 +7,13 @@ from pathlib import Path
 from core.output import (
     OUTPUT_STEM,
     clean_result_header,
+    collapse_to_one_line,
     existing_outputs,
     next_output_index,
     next_output_path,
     prune_legacy_artifacts,
     report_path,
+    single_line_chunk_document,
     write_text_atomic,
 )
 
@@ -110,3 +112,42 @@ class HeaderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OneLineChunkTests(unittest.TestCase):
+    """The delivery form used when a loader refuses to be reformatted."""
+
+    BODY = "\n".join((
+        "-- a comment that must not swallow the next line",
+        "local a = 1",
+        "local s = [[line one\nline two]]",
+        "if a then",
+        "    print(s)",
+        "end",
+    ))
+
+    def test_collapse_drops_comments_and_keeps_string_contents(self) -> None:
+        collapsed = collapse_to_one_line("local a = 1 -- trailing\nlocal b = 2")
+        self.assertEqual(collapsed, "local a = 1 local b = 2")
+
+    def test_collapse_reports_a_program_that_cannot_be_one_line(self) -> None:
+        self.assertIn("\n", collapse_to_one_line(self.BODY))
+        self.assertNotIn("\n", collapse_to_one_line("local a = 1\nlocal b = 2"))
+
+    def test_document_keeps_the_readable_copy_and_one_runnable_line(self) -> None:
+        body = "local a = 1\nlocal b = 2"
+        document = single_line_chunk_document(body, one_line="local a = 1 local b = 2")
+        self.assertIn("local a = 1", document)
+        self.assertIn("local b = 2", document)
+        self.assertIn("loadstring or load", document)
+        runnable = [line for line in document.splitlines() if line.startswith("return (loadstring")]
+        self.assertEqual(len(runnable), 1)
+        self.assertNotIn("\n", runnable[0])
+        self.assertIn("local a = 1 local b = 2", runnable[0])
+
+    def test_document_picks_a_level_the_body_cannot_close(self) -> None:
+        body = "local a = 1\nlocal close = ']]'"
+        document = single_line_chunk_document(body, one_line="local a = 1")
+        opener = [line for line in document.splitlines() if line.startswith("--[")][0]
+        self.assertEqual(opener, "--[=[")
+        self.assertIn("]=]", document)

@@ -27,6 +27,7 @@ from core.deobfuscator import (
     deobfuscate_source,
     tokenize,
 )
+from core.emulator import LuaEmulator, outcome_rank, run_bounded
 from core.engine import RecoveryEngine, RecoveryResult, static_decode_is_useful
 from core.families import family_report
 from core.formatter import break_statements, format_luau
@@ -61,6 +62,8 @@ from core.output import (
     report_path as logs_report_path,
     write_report,
     write_text_atomic,
+    collapse_to_one_line,
+    single_line_chunk_document,
 )
 from core.protection import ProtectionProfile, inspect_protection
 from core.runtime_paths import SOURCE_ROOT, LOGS_DIR, OUTPUT_DIR, TOOLS_DIR
@@ -299,6 +302,7 @@ class DeobfuscationPipeline:
         use_emulator: bool = True,
         use_native_worker: bool = True,
         logs_dir: Path | str | None = None,
+        verify_delivery: bool = True,
     ):
         if (
             compiler_timeout_seconds <= 0
@@ -323,6 +327,9 @@ class DeobfuscationPipeline:
         self.use_emulator = bool(use_emulator)
         self.use_native_worker = bool(use_native_worker)
         self.logs_dir = Path(logs_dir) if logs_dir else LOGS_DIR
+        # A delivered result is checked in the runtime it will meet; see
+        # _deliverable_source for why a failing result is not necessarily kept.
+        self.verify_delivery = bool(verify_delivery) and bool(use_emulator)
         self._verification_unavailable = False
 
     def run(self, source: str | bytes, *, source_name: str = "input") -> PipelineResult:
@@ -454,6 +461,76 @@ class DeobfuscationPipeline:
             self.logger.debug("Recovery engine failure detail", exc_info=True)
             return None
 
+    def _verify_runtime(self, source: str, *, budget: float) -> tuple[str, str]:
+        """Run a candidate the way an executor would, inside the same budgets.
+
+        Verification never raises: a checker that fails must not fail the run it
+        was checking, so anything unexpected is reported as an outcome.
+        """
+        try:
+            emulator = LuaEmulator(
+                profile=self.profile,
+                script_key=self.script_key,
+                timeout_seconds=budget,
+            )
+            outcome = run_bounded(emulator, source, wall_seconds=budget, logger=self.logger)
+            return outcome.status, str(outcome.error or "")
+        except Exception as exc:  # noqa: BLE001 - verification is best effort
+            self.logger.debug("Delivery check could not run: %s", exc)
+            return "checker-error", f"{type(exc).__name__}: {exc}"
+
+    def _deliverable_source(
+        self, body: str, input_result: object | None
+    ) -> tuple[str, dict[str, object]]:
+        """Decide the form a recovered program is delivered in.
+
+        Readability is the default, but a result that runs *worse* than the file
+        it came from is not a result: WeAreDevs-style loaders compare
+        ``linedefined`` with ``lastlinedefined`` on their own chunk and raise a
+        tamper guard the moment their file spans more than one line, so a
+        pretty-printed copy of them dies where the original ran.  When that
+        happens the same program is delivered with its runnable copy collapsed
+        to one line, which satisfies the loader without hiding the readable
+        source.  Nothing is guessed: both forms are run before either is
+        written, and the readable one wins unless the wrapper measurably does
+        better.
+        """
+        baseline = str(getattr(input_result, "status", "") or "")
+        if not self.verify_delivery:
+            return body, {"checked": False, "reason": "verification disabled"}
+        if outcome_rank(baseline) > 0:
+            return body, {
+                "checked": False,
+                "input_status": baseline,
+                "reason": "the input does not complete on its own either",
+            }
+        budget = min(20.0, max(5.0, self.max_pipeline_seconds * 0.25))
+        status, error = self._verify_runtime(body, budget=budget)
+        record: dict[str, object] = {
+            "checked": True,
+            "input_status": baseline,
+            "status": status,
+            "form": "readable",
+            "error": error[:400],
+        }
+        if outcome_rank(status) <= outcome_rank(baseline):
+            return body, record
+        one_line = collapse_to_one_line(body)
+        if "\n" in one_line:
+            record["reason"] = "the program contains a multi-line string"
+            return body, record
+        wrapped = single_line_chunk_document(body, one_line=one_line)
+        wrapped_status, wrapped_error = self._verify_runtime(wrapped, budget=budget)
+        record["wrapped_status"] = wrapped_status
+        record["wrapped_error"] = wrapped_error[:400]
+        if outcome_rank(wrapped_status) < outcome_rank(status):
+            record["form"] = "single-line chunk"
+            self.logger.info(
+                "Result runs better with a one-line chunk (%s -> %s)", status, wrapped_status
+            )
+            return wrapped, record
+        return body, record
+
     def _write_engine_result(
         self,
         *,
@@ -474,7 +551,27 @@ class DeobfuscationPipeline:
         formatted_source, formatting_applied = self._format_recovered_source(
             result.source, label=f"recovered {source_name}"
         )
-        write_text_atomic(script_path, header + formatted_source.rstrip() + "\n")
+        body = formatted_source.rstrip()
+        delivered, delivery = self._deliverable_source(body, result.emulator)
+        if delivery.get("form") == "single-line chunk":
+            extra_notes = (
+                "the loader checks that its own chunk is one line long, so the runnable "
+                "copy at the end of this file is a one-line chunk and the readable copy "
+                "above it is a comment",
+            )
+        else:
+            extra_notes = ()
+        if extra_notes:
+            header = clean_result_header(
+                source_name=source_name,
+                family_label=result.family if not result.version else f"{result.family} v{result.version}",
+                method=result.method,
+                partial=result.partial,
+                notes=(*result.notes, *extra_notes),
+                profile_label=self.profile.label,
+                layers=result.layer_count,
+            )
+        write_text_atomic(script_path, header + delivered.rstrip() + "\n")
         removed = prune_legacy_artifacts(self.output_dir)
         if removed:
             self.logger.info("Removed %s stale artifact(s) from output/", len(removed))
@@ -499,6 +596,7 @@ class DeobfuscationPipeline:
                 for layer in result.layers
             ],
             "notes": list(result.notes),
+            "delivery": delivery,
             "remote_fetches": list(result.fetches),
             "vm": result.vm_analysis.as_dict() if result.vm_analysis is not None else None,
             "emulator": (

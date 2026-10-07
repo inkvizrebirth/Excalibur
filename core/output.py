@@ -37,6 +37,8 @@ __all__ = [
     "write_text_atomic",
     "write_report",
     "clean_result_header",
+    "collapse_to_one_line",
+    "single_line_chunk_document",
 ]
 
 
@@ -115,6 +117,65 @@ def write_text_atomic(path: Path | str, text: str) -> Path:
 
 def write_report(path: Path | str, report: dict) -> Path:
     return write_text_atomic(path, json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+
+
+def collapse_to_one_line(source: str) -> str:
+    """The same program with its comments removed and every line joined.
+
+    Joining lines is only safe through the token stream: a newline ends a
+    ``--`` comment, and the contents of a long string are line-sensitive, so
+    the raw text is rebuilt token by token (comments dropped, one space
+    between tokens) instead of with a regular expression.  A program that
+    contains a multi-line string cannot be collapsed and keeps its newlines,
+    which the caller checks for.
+    """
+    from core.formatter import tokenize
+
+    pieces = [source[token.start:token.end] for token in tokenize(source) if token.kind != "comment"]
+    return " ".join(pieces).strip()
+
+
+def _long_bracket_level(text: str) -> str:
+    """A long-bracket level that ``text`` cannot close by accident."""
+    level = 1
+    while True:
+        fence = "=" * level
+        if "]" + fence + "]" not in text and "[" + fence + "[" not in text:
+            return fence
+        level += 1
+
+
+def single_line_chunk_document(body: str, *, one_line: str) -> str:
+    """Delivery form for a loader that refuses to be reformatted.
+
+    WeAreDevs and the Prometheus family compare ``linedefined`` with
+    ``lastlinedefined`` on their own chunk: as soon as the file they run from
+    spans more than one line they raise their "Tamper Detected" guard, which
+    every readable result would trip.  The program therefore travels twice in
+    one file - the readable copy as a block comment, and a one-line copy handed
+    to ``loadstring``, so the chunk that actually runs is a single line long.
+    """
+    fence = _long_bracket_level(body)
+    line_fence = _long_bracket_level(one_line)
+    rule = "-- " + "=" * 76
+    literal = "[" + line_fence + "[" + one_line + "]" + line_fence + "]"
+    return "\n".join((
+        rule,
+        "-- Readable recovered source (the runnable copy is at the end of the file).",
+        "-- This loader verifies that the chunk it runs from is one line long and raises",
+        "-- its tamper guard otherwise, so the copy below is kept as a comment and the",
+        "-- loader is fed a one-line copy of the same program instead.",
+        rule,
+        "--[" + fence + "[",
+        body.rstrip(),
+        "]" + fence + "]",
+        "",
+        rule,
+        "-- Runnable copy: the same program as a single line.",
+        rule,
+        "return (loadstring or load)(" + literal + ', "=protez-recovered")(...)',
+        "",
+    ))
 
 
 def clean_result_header(

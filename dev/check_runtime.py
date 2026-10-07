@@ -37,7 +37,7 @@ def _newest_results(dirs: tuple[Path, ...]) -> list[tuple[str, str, Path]]:
     hand a user (a single ``destroyed_N.lua``), so the checker runs exactly what
     the pipeline produced instead of guessing file names.
     """
-    newest: dict[str, tuple[float, str, str, Path]] = {}
+    newest: dict[str, tuple[float, str, str, Path, dict]] = {}
     for directory in dirs:
         for report in directory.glob("report_*.json"):
             try:
@@ -53,9 +53,36 @@ def _newest_results(dirs: tuple[Path, ...]) -> list[tuple[str, str, Path]]:
             key = str(data.get("source_name") or path.name)
             stamp = report.stat().st_mtime
             if key not in newest or stamp > newest[key][0]:
-                newest[key] = (stamp, key, str(data.get("route") or ""), path)
-    return [(key, route, path) for _, key, route, path in
+                newest[key] = (stamp, key, str(data.get("route") or ""), path, data)
+    return [(key, route, path, data) for _, key, route, path, data in
             sorted(newest.values(), key=lambda item: item[1])]
+
+
+def _signature(error: object) -> str:
+    """First line of an error, whitespace collapsed: its identity, not a traceback."""
+    text = re.sub(r"\s+", " ", str(error or "")).strip()
+    return text.split(" stack traceback:")[0][:120]
+
+
+def _verdict(baseline_status: str, baseline_error: object,
+             status: str, error: object) -> str:
+    """How the result behaves next to its own input.
+
+    ``limit`` is not a failure: several loaders do not finish inside a bounded
+    emulator on their own either.  What matters is that the result is not worse
+    than the file it came from.
+    """
+    rank = {"completed": 0, "ok": 0, "success": 0, "limit": 1, "timeout": 1,
+            "error": 2, "unavailable": 2, "checker-error": 3}
+    left = rank.get(baseline_status, 2)
+    right = rank.get(status, 2)
+    if right > left:
+        return "WORSE"
+    if right < left:
+        return "better"
+    if left >= 1 and _signature(error) != _signature(baseline_error):
+        return "differs"
+    return "same"
 
 
 def main() -> int:
@@ -69,14 +96,14 @@ def main() -> int:
 
     logging.basicConfig(level=logging.ERROR, format="[%(levelname)s] %(message)s")
     directories = tuple(Path(d) for d in args.dir) or DEFAULT_DIRS
-    entries = ([(f, "", Path(f)) for f in args.file]
+    entries = ([(f, "", Path(f), {}) for f in args.file]
                or _newest_results(directories))
     if not entries:
         print("no recovered results found in %s" % ", ".join(str(d) for d in directories))
         return 2
 
     failures = 0
-    for label, route, path in entries:
+    for label, route, path, report in entries:
         source = path.read_text(encoding="utf-8", errors="replace")
         emulator = LuaEmulator(profile=None, timeout_seconds=args.wall)
         started = time.monotonic()
@@ -87,15 +114,19 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001 - a checker reports, never crashes
             status, error, chunks = "checker-error", f"{type(exc).__name__}: {exc}", 0
         elapsed = time.monotonic() - started
-        bad = status not in {"ok", "completed"} or error
+        baseline = report.get("emulator") if isinstance(report, dict) else None
+        baseline = baseline if isinstance(baseline, dict) else {}
+        base_status = str(baseline.get("status") or "unknown")
+        verdict = _verdict(base_status, baseline.get("error"), status, error)
+        bad = verdict == "WORSE"
         failures += 1 if bad else 0
         if args.quiet and not bad:
             continue
         head = re.sub(r"\s+", " ", (error or "")).strip()[: args.show]
-        print("%-26s %-24s %-9s %5.1fs chunks=%d %s%s"
-              % (label[:26], route[:24], status, elapsed, chunks,
+        print("%-26s %-24s input=%-9s result=%-9s %-7s %5.1fs chunks=%d %s%s"
+              % (label[:26], route[:24], base_status, status, verdict, elapsed, chunks,
                  "error=" if head else "", head))
-    print("%d fixture(s): %d with a runtime problem" % (len(entries), failures))
+    print("%d fixture(s): %d worse than its input" % (len(entries), failures))
     return 1 if failures else 0
 
 
