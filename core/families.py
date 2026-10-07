@@ -24,7 +24,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
-from core.lua51 import BytecodeError, Lua51Scanner, decompile, is_lua51_bytecode, read_chunk
+from core.lua51 import (
+    BytecodeError,
+    Lua51Scanner,
+    decompile,
+    is_lua51_bytecode,
+    looks_like_luau_bytecode,
+    read_chunk,
+)
 from core.protection import ProtectionProfile, inspect_protection
 
 __all__ = [
@@ -36,6 +43,7 @@ __all__ = [
     "best_family",
     "family_report",
     "scan_embedded_bytecode",
+    "scan_embedded_source",
     "MAX_EMBEDDED_SCAN_BYTES",
 ]
 
@@ -121,8 +129,39 @@ class FamilyHandler:
         *,
         embedded_bytecode: bytes | None = None,
         captured_source: str | None = None,
+        vm_summary: str | None = None,
     ) -> FamilyOutcome | None:
+        """Try to recover this family's payload.
+
+        ``embedded_bytecode``/``captured_source`` come from the static and
+        dynamic passes.  ``vm_summary`` describes the custom VM surface a
+        running loader exposed (instruction count, opcodes, constants) and is
+        always worth reporting: it is what a partial result can honestly show
+        when no lifter understands the VM.
+        """
+        if vm_summary:
+            return FamilyOutcome(
+                family=self.display_name,
+                method="running-loader VM introspection",
+                notes=(vm_summary,),
+                partial=True,
+                confidence=0.3,
+            )
         return None
+
+    def vm_surface_outcome(self, vm_summary: str) -> FamilyOutcome:
+        """What can be said when the loader ran but its VM was not lifted."""
+        return FamilyOutcome(
+            family=self.display_name,
+            method="running-loader VM introspection",
+            notes=(
+                vm_summary,
+                "the VM ran inside the portable backend, so its tables were read; "
+                "lifting its opcodes to source needs a per-family opcode map",
+            ),
+            partial=True,
+            confidence=0.35,
+        )
 
     # Shared helpers -------------------------------------------------
     @staticmethod
@@ -218,6 +257,90 @@ def scan_embedded_bytecode(data: str | bytes, *, minimum: int = 64) -> bytes | N
     return None
 
 
+_CHAR_CALL = re.compile(r"string\.char\s*\(\s*((?:0[xX][0-9a-fA-F]+|\d+)(?:\s*,\s*(?:0[xX][0-9a-fA-F]+|\d+)){11,})\s*\)")
+_ESCAPE_RUN = re.compile(r"((?:\\[0-9]{1,3}){12,})")
+
+
+def _decode_char_calls(text: str, *, limit: int = 512) -> list[bytes]:
+    """Decode ``string.char(...)`` runs a loader uses to build a payload."""
+    decoded: list[bytes] = []
+    for match in _CHAR_CALL.finditer(text[: MAX_EMBEDDED_SCAN_BYTES * 2]):
+        entries = re.findall(r"0[xX][0-9a-fA-F]+|\d+", match.group(1))
+        values: list[int] = []
+        for entry in entries:
+            try:
+                value = int(entry, 16) if entry[:2].lower() == "0x" else int(entry)
+            except ValueError:
+                values = []
+                break
+            if not 0 <= value <= 255:
+                values = []
+                break
+            values.append(value)
+        if len(values) >= 12:
+            decoded.append(bytes(values))
+        if len(decoded) >= limit:
+            break
+    return decoded
+
+
+def _decode_escape_runs(text: str, *, limit: int = 256) -> list[bytes]:
+    """Decode Lua string escapes: ``"\\104\\101\\108..."`` spells source."""
+    decoded: list[bytes] = []
+    for match in _ESCAPE_RUN.finditer(text[: MAX_EMBEDDED_SCAN_BYTES * 2]):
+        parts = re.findall(r"\\([0-9]{1,3})", match.group(1))
+        try:
+            values = bytes(int(part) for part in parts)
+        except ValueError:
+            continue
+        decoded.append(values)
+        if len(decoded) >= limit:
+            break
+    return decoded
+
+
+def scan_embedded_source(data: str | bytes, *, minimum: int = 48) -> str | None:
+    """Find Lua **source** hidden in escapes, hex/base64 or numeric arrays.
+
+    Several families (PSU, Nexus, WeAreDevs variants, home-made packers) never
+    store bytecode: they store the original script as numbers, escape runs or
+    ``string.char`` calls and rebuild it at run time.  That payload is readable
+    source, so it is worth looking for directly instead of only for a chunk.
+    """
+    from core.executor_api import looks_like_lua_source
+
+    if isinstance(data, bytes):
+        candidates: list[bytes] = [data]
+    else:
+        candidates = []
+        candidates.extend(_decode_text_layers(data))
+        candidates.extend(_decode_number_arrays(data))
+        candidates.extend(_decode_char_calls(data))
+        candidates.extend(_decode_escape_runs(data))
+    best: str | None = None
+    fallback: str | None = None
+    for candidate in candidates:
+        text = candidate.decode("utf-8", "replace")
+        if is_lua51_bytecode(candidate) or looks_like_luau_bytecode(candidate):
+            continue
+        if len(text.strip()) < minimum:
+            continue
+        if looks_like_lua_source(text):
+            if best is None or len(text) > len(best):
+                best = text
+        elif fallback is None:
+            fallback = text
+    if best is not None:
+        return best
+    # No Lua keyword found, but a decoded blob that is plain printable text and
+    # much larger than a single string is still a candidate worth reporting.
+    if fallback is not None:
+        printable = sum(1 for character in fallback[:2000] if character.isprintable() or character in "\n\r\t")
+        if printable >= len(fallback[:2000]) * 0.95 and len(fallback.strip()) >= max(minimum, 96):
+            return fallback
+    return None
+
+
 def _decode_text_layers(text: str) -> list[bytes]:
     """Decode string escapes, hex blobs and base64 blobs from text."""
     decoded: list[bytes] = []
@@ -226,13 +349,13 @@ def _decode_text_layers(text: str) -> list[bytes]:
     if escaped is not None:
         decoded.append(text.encode("latin-1", "ignore").replace(b"\\27Lua", b"\x1bLua"))
 
-    for match in re.finditer(r"(?i)\b((?:\\x[0-9a-f]{2}){16,})", text):
+    for match in re.finditer(r"(?i)((?:\\x[0-9a-f]{2}){16,})", text):
         try:
             decoded.append(bytes.fromhex(match.group(1).replace("\\x", "")))
         except ValueError:
             continue
 
-    for match in re.finditer(r"(?i)\b((?:\\[0-9]{1,3}){16,})", text):
+    for match in re.finditer(r"(?i)((?:\\[0-9]{1,3}){16,})", text):
         parts = re.findall(r"\\([0-9]{1,3})", match.group(1))
         try:
             values = bytes(int(part) for part in parts)
@@ -263,7 +386,14 @@ class LuraphHandler(FamilyHandler):
         evidence = self.evidence(source)
         return 0.6 if evidence else 0.0
 
-    def recover(self, source, *, embedded_bytecode=None, captured_source=None):
+    def recover(
+        self,
+        source,
+        *,
+        embedded_bytecode=None,
+        captured_source=None,
+        vm_summary=None,
+    ):
         if captured_source:
             return FamilyOutcome(
                 family=self.display_name,
@@ -294,7 +424,14 @@ class MoonSecHandler(FamilyHandler):
             return 0.95
         return 0.55 if self.evidence(source) else 0.0
 
-    def recover(self, source, *, embedded_bytecode=None, captured_source=None):
+    def recover(
+        self,
+        source,
+        *,
+        embedded_bytecode=None,
+        captured_source=None,
+        vm_summary=None,
+    ):
         if embedded_bytecode is not None:
             return self.outcome_from_bytecode(
                 embedded_bytecode, family=self.display_name, method="static handler mapping"
@@ -307,6 +444,8 @@ class MoonSecHandler(FamilyHandler):
                 partial=False,
                 confidence=0.8,
             )
+        if vm_summary:
+            return self.vm_surface_outcome(vm_summary)
         return None
 
 
@@ -324,7 +463,14 @@ class WeAreDevsHandler(FamilyHandler):
             return 0.5
         return 0.0
 
-    def recover(self, source, *, embedded_bytecode=None, captured_source=None):
+    def recover(
+        self,
+        source,
+        *,
+        embedded_bytecode=None,
+        captured_source=None,
+        vm_summary=None,
+    ):
         if captured_source:
             recovered = scan_embedded_bytecode(captured_source)
             if recovered is not None:
@@ -342,6 +488,8 @@ class WeAreDevsHandler(FamilyHandler):
             return self.outcome_from_bytecode(
                 embedded_bytecode, family=self.display_name, method="static array decoding"
             )
+        if vm_summary:
+            return self.vm_surface_outcome(vm_summary)
         return None
 
 
@@ -358,7 +506,14 @@ class IronBrewHandler(FamilyHandler):
             return 0.45
         return 0.0
 
-    def recover(self, source, *, embedded_bytecode=None, captured_source=None):
+    def recover(
+        self,
+        source,
+        *,
+        embedded_bytecode=None,
+        captured_source=None,
+        vm_summary=None,
+    ):
         if captured_source:
             recovered = scan_embedded_bytecode(captured_source) or (
                 captured_source.encode("latin-1", "ignore")
@@ -380,6 +535,8 @@ class IronBrewHandler(FamilyHandler):
             return self.outcome_from_bytecode(
                 embedded_bytecode, family=self.display_name, method="static extraction"
             )
+        if vm_summary:
+            return self.vm_surface_outcome(vm_summary)
         return None
 
 

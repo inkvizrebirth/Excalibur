@@ -66,6 +66,7 @@ from core.runtime_paths import SOURCE_ROOT, LOGS_DIR, OUTPUT_DIR, TOOLS_DIR
 from core.sandbox import Sandbox, SandboxError, SandboxResult
 from core.tracer import TraceError, TraceResult, Tracer
 from core.version import VERSION
+from core.vm_recover import render_analysis, summary_line
 
 DEFAULT_OUTPUT_DIR = OUTPUT_DIR
 DEFAULT_TOOLS_DIR = TOOLS_DIR
@@ -357,10 +358,14 @@ class DeobfuscationPipeline:
     def _engine_was_inconclusive(self, result: RecoveryResult) -> bool:
         """True when the engine only echoed the input back.
 
-        A lifted bytecode listing or any decoded layer is real work even when
-        no text layer was appended, so those results are never discarded.
+        A lifted bytecode listing, a decoded layer or a snapshot of the
+        loader's own VM is real work even when no text layer was appended, so
+        those results are never discarded.
         """
         if result.layers or result.strong or result.bytecode_source:
+            return False
+        if result.vm_analysis is not None:
+            # The VM surface is a result: keep it in the report.
             return False
         return result.direct
 
@@ -475,6 +480,7 @@ class DeobfuscationPipeline:
             ],
             "notes": list(result.notes),
             "remote_fetches": list(result.fetches),
+            "vm": result.vm_analysis.as_dict() if result.vm_analysis is not None else None,
             "emulator": (
                 {
                     "runtime": result.emulator.runtime,
@@ -524,6 +530,21 @@ class DeobfuscationPipeline:
             write_report(report_file, report)
         except OSError as exc:
             self.logger.warning("Could not write the analysis report: %s", exc)
+        vm_notice: str | None = None
+        if result.vm_analysis is not None:
+            # The VM dump is an artifact, not clutter: it lives next to the
+            # report so output/ still holds exactly one destroyed_N.lua.
+            disassembly_path = report_file.with_name(f"vm_surface_{report_file.stem}.txt")
+            try:
+                write_text_atomic(disassembly_path, render_analysis(result.vm_analysis) + "\n")
+                self.logger.info("Custom VM surface written to %s", disassembly_path)
+                if not result.strong:
+                    vm_notice = (
+                        f"{summary_line(result.vm_analysis)}; the full dump is in "
+                        f"{disassembly_path.name}"
+                    )
+            except OSError as exc:
+                self.logger.warning("Could not write the VM surface: %s", exc)
         self.logger.info("Recovered source written to %s", script_path)
         self.logger.info("Analysis report written to %s", report_file)
         self._progress(100, "DONE")
@@ -535,6 +556,7 @@ class DeobfuscationPipeline:
             transformations=result.notes,
             sandbox_result=result.sandbox_results[0] if result.sandbox_results else None,
             status="partial" if result.partial else "complete",
+            notice=vm_notice,
             trace_files=(),
             trace_event_count=0,
         )

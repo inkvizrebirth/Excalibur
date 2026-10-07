@@ -38,6 +38,13 @@ from core.executor_api import (
     normalise_workspace_path,
 )
 from core.injector_env import ExecutorProfile, build_lua_prelude, get_profile
+from core.vm_dump import (
+    VM_DUMP_LUA,
+    VmSnapshot,
+    constant_pool,
+    instruction_table,
+    snapshot_from_bridge,
+)
 
 __all__ = [
     "EmulatorCapture",
@@ -48,8 +55,15 @@ __all__ = [
     "classify_chunk",
 ]
 
-MAX_INSTRUCTIONS = 80_000_000
+# The instruction hook fires every HOOK_STEP VM instructions.  A small step
+# keeps VM-table introspection dense enough to catch a loader mid-decode; the
+# VM scanner gates itself (dense early, sparse later) and is budgeted, so the
+# cost stays bounded on long-running payloads (see core.vm_dump).
+HOOK_STEP = 500
+
+MAX_INSTRUCTIONS = 80_000_000 // HOOK_STEP
 MAX_CAPTURES = 200
+MAX_VM_TABLES = 160
 MAX_CAPTURE_BYTES = 8 * 1024 * 1024
 MAX_PRINT_LINES = 400
 
@@ -127,7 +141,16 @@ string.dump = function(fn, strip)
 end
 if debug and __protez_real_sethook then
   debug.sethook = function(...)
-    -- The step budget belongs to Protez; scripts may not clear it.
+    -- The step budget belongs to Protez; scripts may not clear it.  The VM
+    -- dump step rides along so the obfuscator's own tables are snapshotted.
+    local vm_step = rawget(_G, '__protez_vm_step')
+    if type(vm_step) == 'function' then
+      local function __protez_combined_step(event, line)
+        __protez_step_fn(event, line)
+        vm_step(event, line)
+      end
+      return __protez_real_sethook(__protez_combined_step, '', __protez_hook_count())
+    end
     return __protez_real_sethook(__protez_step_fn, '', __protez_hook_count())
   end
 end
@@ -194,6 +217,7 @@ class EmulatorResult:
     fetches: tuple[str, ...] = ()
     requests: tuple[dict[str, Any], ...] = ()
     written_files: tuple[str, ...] = ()
+    vm_tables: tuple[VmSnapshot, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -206,6 +230,16 @@ class EmulatorResult:
     @property
     def bytecode(self) -> tuple[EmulatorCapture, ...]:
         return tuple(item for item in self.captures if item.kind == "bytecode")
+
+    @property
+    def instruction_stream(self) -> VmSnapshot | None:
+        """The most instruction-stream-like table the obfuscator built."""
+        return instruction_table(self.vm_tables)
+
+    @property
+    def constant_table(self) -> VmSnapshot | None:
+        """The most constant-pool-like table the obfuscator built."""
+        return constant_pool(self.vm_tables)
 
     @property
     def downloaded_payloads(self) -> tuple[EmulatorCapture, ...]:
@@ -363,6 +397,7 @@ class LuaEmulator:
             "writes": [],
             "inputs": [],
             "clipboard": "",
+            "vm_tables": [],
         }
         output_bytes = {"value": 0}
 
@@ -447,7 +482,7 @@ class LuaEmulator:
             return time.time()
 
         def hook_count() -> int:
-            return 20000
+            return HOOK_STEP
 
         def record_download(url: Any, body: Any) -> str:
             """Keep a downloaded body when it can be a payload."""
@@ -674,6 +709,17 @@ class LuaEmulator:
             state["inputs"].append(f"{action}:{detail}")
             return True
 
+        def vm_table(kind: Any, label: Any, payload: Any, count: Any = 0, width: Any = 1) -> bool:
+            """Receive a snapshot of a table the obfuscator built for its VM."""
+            if len(state["vm_tables"]) >= MAX_VM_TABLES:
+                return False
+            snapshot = snapshot_from_bridge(kind, label, payload, count, width)
+            if snapshot is None:
+                return False
+            state["vm_tables"].append(snapshot)
+            self.logger.debug("VM snapshot: %s", snapshot.describe())
+            return True
+
         try:
             runtime = lua_module.LuaRuntime(unpack_returned_tuples=True)
         except Exception as exc:  # noqa: BLE001
@@ -688,6 +734,7 @@ class LuaEmulator:
         globals_table["__protez_clock"] = clock
         globals_table["__protez_time"] = wall_time
         globals_table["__protez_hook_count"] = hook_count
+        globals_table["__protez_vm_table"] = vm_table
         globals_table["__protez_http"] = http
         globals_table["__protez_request"] = request
         globals_table["__protez_fs"] = fs_bridge
@@ -701,8 +748,9 @@ class LuaEmulator:
         error: str | None = None
         try:
             runtime.execute((_SAFE_OS + "\n" + _LUA_BOOTSTRAP).encode("utf-8"))
+            runtime.execute(VM_DUMP_LUA.encode("utf-8"))
             # The step budget is installed last so the bootstrap itself runs free.
-            runtime.execute("debug.sethook(__protez_step_fn, '', 20000)")
+            runtime.execute("debug.sethook()")
             script = self._prelude + "\n" + source
             runtime.execute(script.encode("utf-8", "replace"))
         except Exception as exc:  # noqa: BLE001 - LuaError and Python errors alike
@@ -713,6 +761,21 @@ class LuaEmulator:
             if status == "error" and self.logger:
                 self.logger.debug("Portable backend stopped: %s", error)
 
+        try:
+            # A last sweep: tables the loader was still filling when the run
+            # ended are recorded at their final size.
+            runtime.eval("__protez_vm_scan_now and __protez_vm_scan_now()")
+        except Exception:  # noqa: BLE001 - the sweep is best effort
+            pass
+
+        vm_stats: tuple[int, int, int, int] = (0, 0, 0, 0)
+        try:
+            stats = runtime.eval("__protez_vm_stats and __protez_vm_stats() or nil")
+            if stats is not None:
+                vm_stats = tuple(int(value) for value in stats)  # type: ignore[assignment]
+        except Exception:  # noqa: BLE001 - diagnostics only
+            pass
+
         duration = time.monotonic() - started
         notes = [f"portable backend: {runtime_label}", f"executor profile: {self.profile.label}"]
         if state["fetches"]:
@@ -721,11 +784,21 @@ class LuaEmulator:
             notes.append(f"{len(state['writes'])} file(s) written to the executor workspace")
         if state["inputs"]:
             notes.append(f"{len(state['inputs'])} input event(s) recorded, none delivered")
+        if state["vm_tables"]:
+            notes.append(
+                f"{len(state['vm_tables'])} VM table(s) snapshotted from the running loader"
+            )
+        elif vm_stats[1]:
+            self.logger.debug(
+                "VM dumper ran %s scan(s) over %s hook event(s) without a match",
+                vm_stats[1],
+                vm_stats[0],
+            )
         return EmulatorResult(
             status=status,
             captures=tuple(captures),
             error=error,
-            instructions=state["instructions"] * 20000,
+            instructions=state["instructions"] * HOOK_STEP,
             duration_seconds=duration,
             runtime=runtime_label,
             profile=self.profile.key,
@@ -733,4 +806,5 @@ class LuaEmulator:
             fetches=tuple(dict.fromkeys(state["fetches"])),
             requests=tuple(state["requests"]),
             written_files=tuple(state["writes"]),
+            vm_tables=tuple(state["vm_tables"]),
         )

@@ -82,7 +82,7 @@ def looks_like_lua_source(text: str) -> bool:
     head = text[:4000]
     if head.startswith("--"):
         return True
-    if len(text) > 40 and _LUA_KEYWORDS.search(head):
+    if len(text) >= 24 and _LUA_KEYWORDS.search(head):
         return True
     return False
 

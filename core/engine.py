@@ -27,7 +27,14 @@ from typing import Callable, Iterable, Sequence
 
 from core.deobfuscator import deobfuscate_source
 from core.emulator import EmulatorResult, LuaEmulator, emulator_available
-from core.families import best_family, detect_families, handler_for, scan_embedded_bytecode
+from core.families import (
+    FamilyOutcome,
+    best_family,
+    detect_families,
+    handler_for,
+    scan_embedded_bytecode,
+    scan_embedded_source,
+)
 from core.injector_env import (
     ExecutorProfile,
     build_http_stub_prelude,
@@ -39,6 +46,7 @@ from core.lua51 import BytecodeError, decompile, is_lua51_bytecode, looks_like_l
 from core.executor_api import classify_written_file
 from core.protection import inspect_protection
 from core.remote_payloads import PayloadFetcher, RemotePayloadError, extract_script_key, extract_urls, is_luarmor
+from core.vm_recover import VmAnalysis, analyse_vm, summary_line
 from core.sandbox import Sandbox, SandboxError, SandboxResult
 
 __all__ = [
@@ -80,6 +88,7 @@ class RecoveryResult:
     profile: str = "universal"
     direct: bool = False
     strong: bool = False
+    vm_analysis: VmAnalysis | None = None
 
     @property
     def layer_count(self) -> int:
@@ -232,7 +241,30 @@ class RecoveryEngine:
                         improved = True
                         continue
 
-            # 3. embedded Lua 5.1 bytecode inside the current text
+            # 3a. Lua source hidden in an array, escape run or `string.char`
+            if not static_bytecode_found:
+                hidden_source = scan_embedded_source(current)
+                if (
+                    hidden_source is not None
+                    and self._digest(hidden_source) not in seen
+                    and self._candidate_is_better(hidden_source, current)
+                ):
+                    current = hidden_source
+                    seen.add(self._digest(current))
+                    layers.append(
+                        self._record(
+                            len(layers) + 1,
+                            "static",
+                            "source recovered from an encoded blob in the loader",
+                            current,
+                        )
+                    )
+                    notes.append(f"layer {depth}: source recovered from an encoded blob")
+                    strong = True
+                    improved = True
+                    continue
+
+            # 3b. embedded Lua 5.1 bytecode inside the current text
             embedded = scan_embedded_bytecode(current)
             if embedded is not None:
                 bytecode = embedded
@@ -301,6 +333,25 @@ class RecoveryEngine:
             if not improved:
                 break
 
+        # A custom VM that never handed its payload to `loadstring` still
+        # exposes its instruction stream and constant pool while it runs: keep
+        # the analysis so a partial result says what the VM actually contained.
+        analysis = None
+        if emulator_result is not None and emulator_result.vm_tables:
+            analysis = analyse_vm(emulator_result.vm_tables)
+            if analysis is not None:
+                notes.append(summary_line(analysis))
+                if not strong:
+                    # Nothing lifted this VM's semantics, but its surface is
+                    # known: let the family handler say so in its own words.
+                    handler_outcome = self._family_vm_outcome(
+                        family_match, current, bytecode, summary_line(analysis)
+                    )
+                    if handler_outcome is not None:
+                        for note in handler_outcome.notes:
+                            if note not in notes:
+                                notes.append(note)
+
         # Choose the final body: the recovered bytecode source wins when it is
         # richer than the current candidate, otherwise keep the current text.
         final_source = current
@@ -365,7 +416,31 @@ class RecoveryEngine:
             profile=self.profile.key,
             direct=not layers,
             strong=strong or (from_bytecode and static_bytecode_found),
+            vm_analysis=analysis,
         )
+
+    def _family_vm_outcome(
+        self,
+        family_match: Any,
+        current: str,
+        bytecode: bytes | None,
+        vm_summary: str,
+    ) -> FamilyOutcome | None:
+        """Ask the detected family to describe the VM surface we observed."""
+        if family_match is None:
+            return None
+        handler = handler_for(family_match.key)
+        if handler is None:
+            return None
+        try:
+            return handler.recover(
+                current,
+                embedded_bytecode=bytecode,
+                vm_summary=vm_summary,
+            )
+        except Exception as exc:  # noqa: BLE001 - reporting must never break a run
+            self.logger.debug("Family handler failed: %s", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Layer helpers
