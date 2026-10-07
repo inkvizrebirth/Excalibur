@@ -976,6 +976,20 @@ def _expand_multi_returns(arguments: list[Any]) -> list[Any]:
     return expanded
 
 
+def _concrete(value: Any) -> Any:
+    """The value the pass may fold with, or `_UNKNOWN`.
+
+    `_Path`, `_Namespace`, `_Function`, `_Receiver` and `_Game` are name reads
+    from the text; their values exist only at run time.  They must never reach
+    a fold as objects: `not k` (k is the loader's own register) was evaluated as
+    `not <object>` and became the literal `false`, which turned a state machine
+    branch into a constant and sent the lifted script down the wrong path.
+    """
+    if isinstance(value, (_Namespace, _Path, _Function, _Receiver, _Game)):
+        return _UNKNOWN
+    return value
+
+
 class _ExpressionParser:
     def __init__(self, tokens: list[Token], start: int, environment: dict[str, Any] | None = None):
         self.tokens = tokens
@@ -1011,10 +1025,8 @@ class _ExpressionParser:
             right, next_cursor = self._expression(cursor + 1, right_minimum)
             if next_cursor <= cursor + 1:
                 break
-            if isinstance(left, (_Namespace, _Path, _Function, _Receiver, _Game)):
-                left = _UNKNOWN
-            if isinstance(right, (_Namespace, _Path, _Function, _Receiver, _Game)):
-                right = _UNKNOWN
+            left = _concrete(left)
+            right = _concrete(right)
             if operator in {"and", "or"}:
                 left = _apply_binary(operator, left, right)
             elif left is not _UNKNOWN and right is not _UNKNOWN:
@@ -1032,6 +1044,7 @@ class _ExpressionParser:
         text = token.text
         if text in {"-", "+", "not", "~", "#"}:
             value, end = self._expression(index + 1, 3 if text == "not" else 11)
+            value = _concrete(value)
             if value is _UNKNOWN:
                 return _UNKNOWN, end
             try:
@@ -1782,6 +1795,52 @@ def _is_prefix_expression(rendered: str) -> bool:
     return first in _WORD_CHARS and not first.isdigit() or first in {"(", "{"}
 
 
+def _fold_fits_context(tokens: list[Token], index: int, end: int) -> bool:
+    """Can this constant span be replaced without changing how the surrounding
+    operators bind?
+
+    The scanner walks token by token, so when the left operand of a chain is
+    not a constant it starts again in the middle of the expression.  Taking
+    that middle for a whole expression is wrong for Lua's `and`/`or` value
+    semantics: in `m = m and A or B` (A, B constants, A truthy) the span
+    `A or B` folds to `A`, and the statement becomes `m and A` -- which yields
+    nil where the original yielded B whenever `m` is falsy.  A lifted loader
+    then takes the wrong branch and dies in its own dispatcher.  So a span
+    that starts right after a binary operator is folded only when it cannot
+    bind differently: a single token, or a complete parenthesised expression.
+    """
+    if end <= index + 1:
+        return True
+    first, last = tokens[index], tokens[end - 1]
+    if first.text == "(" and _matching_paren_is(tokens, index, end - 1):
+        return True
+    previous = _previous_code_index(tokens, index)
+    if previous < 0:
+        return True
+    before = tokens[previous]
+    # keywords tokenise as identifiers here, so the operator is recognised by
+    # its text (`and`, `or`, arithmetic, comparisons), not by the token kind.
+    if before.text not in _PRECEDENCE:
+        return True
+    return False
+
+
+def _matching_paren_is(tokens: list[Token], opening: int, closing: int) -> bool:
+    """`closing` is the `)` that matches the `(` at `opening`."""
+    depth = 0
+    for position in range(opening, closing + 1):
+        text = tokens[position].text
+        if tokens[position].kind == "comment":
+            continue
+        if text in {"(", "{", "["}:
+            depth += 1
+        elif text in {")", "}", "]"}:
+            depth -= 1
+            if depth == 0:
+                return position == closing
+    return False
+
+
 def _span_is_complete_expression(tokens: list[Token], start: int, end: int) -> bool:
     """Whether ``tokens[start:end]`` can be a whole expression on its own.
 
@@ -1891,7 +1950,7 @@ def _rewrite_once(source: str) -> tuple[str, int, int, dict[str, int]]:
                 continue
         parser = _ExpressionParser(tokens, index, active_environment)
         value, end = parser.parse()
-        if value is not _UNKNOWN and end > index and _span_is_complete_expression(tokens, index, end):
+        if value is not _UNKNOWN and end > index and _span_is_complete_expression(tokens, index, end)                 and _fold_fits_context(tokens, index, end):
             rendered = _render_value(value)
             if rendered is not None:
                 first = tokens[index]
