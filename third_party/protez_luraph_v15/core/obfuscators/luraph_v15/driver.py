@@ -96,7 +96,17 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None, devir
     cache = devirt.WalkCache()
     t0 = time.time()
     last_errors = None
-    for rnd in range(1, rounds + 1):
+    # The best listing the lifter has produced so far.  A later round asks the
+    # loader for the constants the previous one could not decode, and that round
+    # is where a large program spends its budget; the listing from the round that
+    # did finish is still worth far more than the behaviour trace the caller
+    # falls back to when nothing is returned.
+    best_text = None
+    best_pending = set()
+    best_round = 0
+    rnd = 0
+    try:
+      for rnd in range(1, rounds + 1):
         t1 = time.time()
 
         if quick and last_errors == 0:
@@ -132,6 +142,8 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None, devir
                                  "(no closure makers / dispatchers found; likely a method-based "
                                  "state-machine VM). Only the behaviour trace is available; run "
                                  "with --no-devirt to skip the lift attempt.")
+            if text:
+                best_text, best_pending, best_round = text, set(new), rnd
             if (not new and devirt.same_patches(last_bufs, bufs)) or rnd == rounds:
                 break
             if quick:
@@ -174,6 +186,18 @@ def devirtualize(job, ppath, dpath, cfg, rerun, chunk_paths=(), live=None, devir
         else:
             with open(ppath, "w", encoding="utf-8", newline="\n") as f:
                 f.write(new_dump)
+    except TimeoutError:
+        if best_text is None:
+            raise
+        print("[!] the analysis deadline stopped round %d: delivering the listing from round %d "
+              "(%d constant request(s) still unresolved)"
+              % (rnd, best_round, len(best_pending)), file=sys.stderr)
+        note = ("-- NOTE: this program is a partial lift. Protez's analysis deadline stopped the\n"
+                "-- constant-request loop after round %d; %d constant request(s) are still\n"
+                "-- unresolved, and the functions that would use them are lifted as placeholders.\n"
+                "-- Everything else in this file was lifted from the VM."
+                % (best_round, len(best_pending)))
+        text = note + "\n\n" + best_text
     header = job.credit_header()
     prefix = (header + "\n") if header else ""
     job.write(dpath, prefix + devirt.finish_text(text) + "\n")
