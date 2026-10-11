@@ -50,6 +50,7 @@ def run_cli(args: argparse.Namespace) -> int:
         prefer_static=not args.no_static,
         run_dynamic=not args.no_dynamic,
         trace_on_failure=not args.no_trace,
+        lift=not args.no_lift,
     )
     result = deobfuscate_file(path, config=config, progress=progress)
 
@@ -69,6 +70,14 @@ def run_cli(args: argparse.Namespace) -> int:
             return 1
     elif result.output_path:
         _print(f"output : {result.output_path}")
+    if args.lift and result.pseudocode:
+        from core.sourceio import write_source
+
+        target = Path(args.lift)
+        write_source(target, result.pseudocode, encoding="utf-8")
+        _print(f"pseudo : {target}")
+    elif result.pseudocode_path:
+        _print(f"pseudo : {result.pseudocode_path}")
     return 0 if result.success else 1
 
 
@@ -102,6 +111,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-static", action="store_true", help="skip the static constant layer stage")
     parser.add_argument("--no-dynamic", action="store_true", help="skip the sandbox stage")
     parser.add_argument("--no-trace", action="store_true", help="skip the trace fallback")
+    parser.add_argument("--lift", metavar="FILE", help="write the partial lift (pseudo source) to FILE")
+    parser.add_argument("--no-lift", action="store_true", help="skip the partial lift stage")
     parser.add_argument("--boot", action="store_true", help="run the first-run setup and exit")
     parser.add_argument("--offline", action="store_true", help="never allow the bootstrap to use the network")
     parser.add_argument("--skip-bootstrap", action="store_true", help="do not run the first-run setup")

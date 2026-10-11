@@ -69,6 +69,25 @@ def _loop_score(mask: str, body_start: int) -> int:
 
 def instrument_dispatch(source: str, *, max_loops: int = 3, window: int = 40) -> TracePlan:
     """Insert state tracing calls into the most dispatch-like ``while`` loops."""
+    # Prefer the loop the lift will analyse (the one whose body is the state
+    # dispatch tree); fall back to the "most if statements" heuristic.
+    try:
+        from .lift import find_dispatcher
+
+        found = find_dispatcher(source)
+    except Exception:  # pragma: no cover - lift is optional
+        found = None
+    if found is not None:
+        position = found["body_char_span"][0]
+        return TracePlan(
+            instrumented=source[:position] + f" {TRACE_CALL}({found['variable']}) " + source[position:],
+            loops=1,
+            injections=1,
+            variables=[found["variable"]],
+            notes=[f"instrumented the state dispatch loop on '{found['variable']}' "
+                   f"({found['pivots']} state pivots) at offset {position}"],
+        )
+
     mask = mask_lua(source)
     candidates: List[Tuple[int, int, str]] = []
     for match in WHILE_RE.finditer(mask):

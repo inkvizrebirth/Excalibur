@@ -69,6 +69,10 @@ class PipelineConfig:
     trace_on_failure: bool = True
     """Instrument dispatch loops and re-run when nothing else produced a payload."""
 
+    lift: bool = True
+    """Produce a partial source listing (state blocks, renamed registers, jumps)
+    for payloads that stay virtualised after the static layer."""
+
     min_payload_chars: int = 80
     """Candidates shorter than this are ignored."""
 

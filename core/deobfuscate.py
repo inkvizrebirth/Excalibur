@@ -33,6 +33,7 @@ from typing import Callable, List, Optional
 from . import paths
 from .config import PipelineConfig
 from .errors import ExcaliburError
+from .lift import find_dispatcher, lift
 from .pick_payload import PayloadPick, pick_payload, rank_payloads, score_text
 from .registry import detect_and_route
 from .sandbox import Attempt, Sandbox, SandboxResult
@@ -70,6 +71,8 @@ class DeobfuscationResult:
     output: Optional[str] = None
     output_path: Optional[Path] = None
     decoded_path: Optional[Path] = None
+    pseudocode_path: Optional[Path] = None
+    pseudocode: Optional[str] = None
     report_path: Optional[Path] = None
     summary_path: Optional[Path] = None
     workdir: Optional[Path] = None
@@ -80,6 +83,9 @@ class DeobfuscationResult:
     validation: Optional[dict] = None
     chosen: Optional[dict] = None
     static: Optional[dict] = None
+    lift: Optional[dict] = None
+    trace_states: List[str] = field(default_factory=list)
+    """Raw state values recorded by the trace fallback (used by the lift)."""
     sandbox: Optional[dict] = None
     trace: Optional[dict] = None
     runtime_used: Optional[str] = None
@@ -104,8 +110,10 @@ class DeobfuscationResult:
             "runtime_used": self.runtime_used,
             "notes": self.notes,
             "elapsed_ms": self.elapsed_ms,
+            "lift": self.lift,
             "output_path": str(self.output_path) if self.output_path else None,
             "decoded_path": str(self.decoded_path) if self.decoded_path else None,
+            "pseudocode_path": str(self.pseudocode_path) if self.pseudocode_path else None,
             "workdir": str(self.workdir) if self.workdir else None,
         }
 
@@ -129,6 +137,8 @@ class DeobfuscationResult:
             lines.append(f"output          : {self.output_path}")
         if self.decoded_path:
             lines.append(f"decoded layer   : {self.decoded_path}")
+        if self.pseudocode_path:
+            lines.append(f"pseudo source   : {self.pseudocode_path}")
         lines.append("")
         lines.append("stages:")
         for stage in self.stages:
@@ -157,6 +167,15 @@ class DeobfuscationResult:
         if self.validation:
             lines.append(f"validation      : {'valid' if self.validation.get('valid') else 'invalid'} - "
                          f"{self.validation.get('reason', '')[:160]}")
+        if self.lift:
+            stats = self.lift.get("stats") or {}
+            lines.append("")
+            lines.append(
+                f"partial lift    : {stats.get('states', 0)} state block(s), "
+                f"{stats.get('registers', 0)} register(s), "
+                f"{stats.get('helpers', 0)} VM function(s), "
+                f"{stats.get('dynamic_jumps', 0)} dynamic jump(s)"
+            )
         if self.trace:
             lines.append("")
             lines.append(f"trace fallback  : {self.trace.get('states', 0)} states, "
@@ -352,16 +371,27 @@ def deobfuscate(
         result.validation = validation.as_dict()
 
     # ----------------------------------------------------------------- trace
-    if not result.success and config.trace_on_failure and sandbox_result is not None and sandbox_result.best:
+    if (not result.success or result.partial) and config.trace_on_failure \
+            and sandbox_result is not None and sandbox_result.best:
         stage_started = time.time()
         _log(progress, "trace", "instrumenting dispatch loop")
         plan = instrument_dispatch(source)
         if plan.injections:
-            trace_attempt = Sandbox(config.sandbox).trace_run(
+            # The trace is cheap (one integer per iteration) and the more of the
+            # state graph it walks, the better the lift can resolve dynamic jumps.
+            from dataclasses import replace as _replace
+
+            trace_config = _replace(
+                config.sandbox,
+                max_instructions=max(config.sandbox.max_instructions, 2_000_000),
+                timeout=config.sandbox.timeout * 2,
+            )
+            trace_attempt = Sandbox(trace_config).trace_run(
                 source, plan.instrumented, sandbox_result.best, source_name=source_name, encoding=encoding
             )
             trace_path = trace_attempt.trace
             states = read_trace(trace_path) if trace_path else []
+            result.trace_states = states
             summary = summarize_trace(states)
             result.trace = {**plan.as_dict(), **summary}
             if states:
@@ -379,6 +409,66 @@ def deobfuscate(
                             int((time.time() - stage_started) * 1000))
             )
 
+    # ------------------------------------------------------------------- lift
+    # When the payload stayed virtualised, the static rewrite is still the
+    # *machine*: lifting it produces the partial source (states, registers,
+    # logic, jumps) the user can actually read.
+    lift_result = None
+    if config.lift and static_result is not None and static_result.ok and static_result.output:
+        # Which text is the machine?  Usually the rewrite, but when the payload
+        # *is* a flattened script (WRD embeds it as a string) the rewrite only
+        # carries it as a literal while the captured payload holds the loop.
+        lift_source: Optional[str] = None
+        lift_label = "constant layer"
+        candidates = [(result.output, "payload" if result.method == "dynamic" else "constant layer"),
+                      (static_result.output, "constant layer")]
+        for candidate_text, label in candidates:
+            if candidate_text and find_dispatcher(candidate_text) is not None:
+                lift_source, lift_label = candidate_text, label
+                break
+        if lift_source is None:
+            lift_source = static_result.output  # let lift() report the reason
+        if lift_source is not None:
+            stage_started = time.time()
+            _log(progress, "lift", "recovering state blocks and registers")
+            observed: List[str] = list(result.trace_states)
+            if not observed:
+                try:
+                    root = Path(sandbox_result.workdir) if sandbox_result else None
+                    if root is not None and root.is_dir():
+                        for candidate in sorted(root.rglob("trace.txt")):
+                            observed.extend(read_trace(candidate))
+                    if not observed and sandbox_result is not None:
+                        for attempt in sandbox_result.attempts:
+                            if attempt.trace:
+                                observed.extend(read_trace(attempt.trace))
+                except Exception:
+                    observed = []
+            try:
+                lift_result = lift(lift_source, observed=observed)
+            except Exception as exc:  # a broken input must never break the run
+                lift_result = None
+                result.notes.append(f"lift failed: {type(exc).__name__}: {exc}")
+            duration = int((time.time() - stage_started) * 1000)
+            if lift_result is not None and lift_result.ok:
+                stats = lift_result.stats()
+                result.lift = lift_result.as_dict()
+                result.pseudocode = lift_result.pseudocode
+                detail = (f"{stats['states']} state(s), {stats['registers']} register(s), "
+                          f"{stats['helpers']} VM function(s) in the {lift_label}")
+                result.lift["source"] = lift_label
+                result.stages.append(StageResult("lift", True, detail, duration, result.lift))
+                _log(progress, "lift", detail)
+                if lift_label == "payload" and result.success:
+                    result.notes.append(
+                        "the recovered payload is itself a flattened script: pseudocode.lua "
+                        "holds the readable form (registers renamed to v1, v2, v3, ...)."
+                    )
+            else:
+                reason = lift_result.reason if lift_result is not None else "not attempted"
+                result.stages.append(StageResult("lift", False, reason, duration))
+                _log(progress, "lift", f"skipped: {reason}")
+
     # --------------------------------------------------------------- artefacts
     run_dir = Path(workdir) if workdir else (sandbox_result.workdir if sandbox_result else config.resolved_workdir())
     paths.ensure_dir(run_dir)
@@ -388,6 +478,11 @@ def deobfuscate(
         decoded_path = run_dir / "decoded.lua"
         write_source(decoded_path, static_result.output, encoding=encoding)
         result.decoded_path = decoded_path
+
+    if result.pseudocode:
+        pseudocode_path = run_dir / "pseudocode.lua"
+        write_source(pseudocode_path, result.pseudocode, encoding=encoding)
+        result.pseudocode_path = pseudocode_path
 
     if result.success and result.output:
         output_path = run_dir / "output.lua"
@@ -403,6 +498,11 @@ def deobfuscate(
     summary_path.write_text(result.summary_text(), encoding="utf-8")
     result.summary_path = summary_path
 
+    if (not result.success or result.partial) and result.pseudocode_path:
+        result.notes.append(
+            f"partial source written to {result.pseudocode_path} "
+            "(state blocks with renamed registers; see docs/ROADMAP.md for the devirtualisation gap)"
+        )
     if not result.success:
         hint = "no validated payload was produced"
         if not candidates:

@@ -376,6 +376,11 @@ local function main()
   end
 
   if mode ~= "compile" then
+    -- LuaJIT starves instruction-count hooks inside compiled traces, so a
+    -- runaway payload would never reach the watchdog.  Interpreting the chunk
+    -- is plenty fast for a sandbox run and keeps the abort reliable.
+    local jit_lib = rawget(_G, "jit")
+    if type(jit_lib) == "table" and type(jit_lib.off) == "function" then pcall(jit_lib.off) end
     if debug and debug.sethook then debug.sethook(watchdog, "", instr_period) end
     ran_ok, run_err = xpcall(chunk, function(e)
       local trace = debug and debug.traceback and debug.traceback("", 2) or ""

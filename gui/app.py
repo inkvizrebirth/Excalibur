@@ -145,9 +145,11 @@ class ExcaliburApp:
         self.var_deep = tk.BooleanVar(value=bool(self.settings.get("deep", True)))
         self.var_dynamic = tk.BooleanVar(value=bool(self.settings.get("dynamic", True)))
         self.var_trace = tk.BooleanVar(value=bool(self.settings.get("trace", True)))
+        self.var_lift = tk.BooleanVar(value=bool(self.settings.get("lift", True)))
         ttk.Checkbutton(controls, text="static layer", variable=self.var_deep).pack(side="left", padx=(18, 0))
         ttk.Checkbutton(controls, text="sandbox run", variable=self.var_dynamic).pack(side="left", padx=(10, 0))
         ttk.Checkbutton(controls, text="trace fallback", variable=self.var_trace).pack(side="left", padx=(10, 0))
+        ttk.Checkbutton(controls, text="partial lift", variable=self.var_lift).pack(side="left", padx=(10, 0))
 
         self.btn_run = ttk.Button(controls, text="deobfuscate", style="Accent.TButton", command=self.on_run)
         self.btn_run.pack(side="right")
@@ -168,10 +170,13 @@ class ExcaliburApp:
         notebook.add(output_tab, text=" output ")
         log_tab = ttk.Frame(notebook)
         notebook.add(log_tab, text=" log ")
+        pseudo_tab = ttk.Frame(notebook)
+        notebook.add(pseudo_tab, text=" pseudo ")
         report_tab = ttk.Frame(notebook)
         notebook.add(report_tab, text=" report ")
 
         self.output_text = self._make_text(output_tab)
+        self.pseudo_text = self._make_text(pseudo_tab)
         self.log_text = self._make_text(log_tab)
         self.report_text = self._make_text(report_tab)
 
@@ -318,6 +323,7 @@ class ExcaliburApp:
     def on_clear(self) -> None:
         self._text_set(self.input_text, "")
         self._text_set(self.output_text, "")
+        self._text_set(self.pseudo_text, "")
         self._text_set(self.report_text, "")
         self.last_output = None
         self.btn_save.state(["disabled"])
@@ -340,6 +346,7 @@ class ExcaliburApp:
             "prefer_static": bool(self.var_deep.get()),
             "run_dynamic": bool(self.var_dynamic.get()),
             "trace_on_failure": bool(self.var_trace.get()),
+            "lift": bool(self.var_lift.get()),
         }
         self.output_text.configure(state="normal")
         self.output_text.delete("1.0", "end")
@@ -413,6 +420,7 @@ class ExcaliburApp:
             self.settings["deep"] = bool(self.var_deep.get())
             self.settings["dynamic"] = bool(self.var_dynamic.get())
             self.settings["trace"] = bool(self.var_trace.get())
+            self.settings["lift"] = bool(self.var_lift.get())
             self._save_settings()
         except Exception:
             pass
@@ -501,6 +509,7 @@ class ExcaliburApp:
                 prefer_static=bool(options.get("prefer_static", True)),
                 run_dynamic=bool(options.get("run_dynamic", True)),
                 trace_on_failure=bool(options.get("trace_on_failure", True)),
+                lift=bool(options.get("lift", True)),
             )
             result = deobfuscate(source, config=config, progress=self._progress)
             self.events.put(("done", result))
@@ -533,7 +542,7 @@ class ExcaliburApp:
             return
         if kind == "detect":
             self._text_set(self.report_text, payload)
-            self.notebook.select(2)
+            self.notebook.select(3)
             self.log("detection finished", GLYPH_OK)
             self.set_status("detection finished", GLYPH_OK)
             return
@@ -555,7 +564,7 @@ class ExcaliburApp:
             self._write_gui_log(payload)
             self._set_running(False)
             self._text_set(self.report_text, payload)
-            self.notebook.select(2)
+            self.notebook.select(3)
             self.log("run failed - see the report tab (details in logs/gui.log)", GLYPH_ERROR)
             self.set_status("failed", GLYPH_ERROR)
             return
@@ -578,6 +587,15 @@ class ExcaliburApp:
             self.btn_save.state(["disabled"])
             self.btn_copy.state(["disabled"])
 
+        if result.pseudocode:
+            preview = result.pseudocode
+            limit = 400_000
+            if len(preview) > limit:
+                preview = preview[:limit] + f"\n-- ... {len(result.pseudocode) - limit} more characters in {result.pseudocode_path}\n"
+            self._text_set(self.pseudo_text, preview)
+        else:
+            self._text_set(self.pseudo_text, "")
+
         report_lines = [result.summary_text()]
         if result.trace:
             report_lines.append("")
@@ -595,6 +613,12 @@ class ExcaliburApp:
             self.log("no validated payload - see the report tab", GLYPH_ERROR)
             self.set_status("no payload", GLYPH_ERROR)
 
+        if result.lift and result.lift.get("ok"):
+            stats = result.lift.get("stats") or {}
+            self.log(f"partial lift: {stats.get('states')} state(s), {stats.get('registers')} register(s)",
+                     GLYPH_OK)
+        if result.pseudocode_path:
+            self.log(f"pseudo source: {result.pseudocode_path}", GLYPH_OK)
         if result.output_path:
             self.log(f"artefacts: {result.output_path.parent}", GLYPH_OK)
 

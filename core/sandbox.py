@@ -237,8 +237,9 @@ class Sandbox:
         source_override: Optional[str] = None,
         mode: str = "run",
         encoding: str = "utf-8",
+        attempt_name: Optional[str] = None,
     ) -> Attempt:
-        attempt_dir = paths.ensure_dir(run_dir / f"{runtime_spec.name}_{policy}")
+        attempt_dir = paths.ensure_dir(run_dir / (attempt_name or f"{runtime_spec.name}_{policy}"))
         source_path = attempt_dir / "input.lua"
         payload = source_override if source_override is not None else source
         source_path.write_bytes(payload.encode(encoding, "replace"))
@@ -287,7 +288,7 @@ class Sandbox:
         encoding: str = "utf-8",
     ) -> Attempt:
         """Re-run an instrumented source with the runtime/policy of ``attempt``."""
-        run_dir = attempt.workdir.parent / f"trace_{attempt.workdir.name}"
+        run_dir = attempt.workdir.parent
         paths.ensure_dir(run_dir)
         return self._run_single(
             source,
@@ -298,6 +299,7 @@ class Sandbox:
             source_override=instrumented,
             mode=mode,
             encoding=encoding,
+            attempt_name=f"trace_{attempt.workdir.name}",
         )
 
 
