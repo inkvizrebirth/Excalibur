@@ -33,6 +33,7 @@ jobs:
         run: |
           python tools/make_wrd_fixture.py --check
           python tools/make_icon.py --check
+          python tools/build_lua.py --check
 
       - name: fetch real-world samples (best effort)
         continue-on-error: true
@@ -52,6 +53,35 @@ jobs:
       - name: unit and integration tests
         run: python -m unittest discover -s tests -v
 
+  lua51:
+    name: vendored Lua 5.1 (reproducible build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: the committed interpreter is the pinned one
+        run: python tools/build_lua.py --check
+
+      - name: it rebuilds bit for bit from the pinned sources
+        run: python tools/build_lua.py --build
+
+      - name: the exe runtime path works (native twin of the same sources)
+        run: |
+          python tools/build_lua.py --native lua/lua51
+          lua/lua51 -v
+          EXCALIBUR_RUNTIME=exe python main.py --skip-bootstrap --cli tests/wrd_v1_0_0.lua --out native_out.lua --quiet
+          python -c "import pathlib,sys; a=pathlib.Path('tests/wrd_v1_0_0_clean.lua').read_bytes(); b=pathlib.Path('native_out.lua').read_bytes(); print('standalone interpreter, byte identical:', a == b); sys.exit(0 if a == b else 1)"
+          python -m unittest tests.test_lua_runtime -v
+
   windows-exe:
     name: windows EXE
     runs-on: windows-latest
@@ -68,6 +98,19 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: the vendored Lua 5.1 interpreter runs
+        run: |
+          lua\lua51.exe -v
+          lua\lua51.exe -e "print(_VERSION, type(loadstring), type(setfenv))"
+
+      - name: acceptance through the interpreter (exe runtime)
+        run: |
+          python main.py --skip-bootstrap --cli tests/wrd_v1_0_0.lua --out exe_out.lua --runtime exe --quiet
+          python -c "import pathlib,sys; a=pathlib.Path('tests/wrd_v1_0_0_clean.lua').read_bytes(); b=pathlib.Path('exe_out.lua').read_bytes(); print('exe runtime, identical:', a==b); sys.exit(0 if a==b else 1)"
+
+      - name: unit and integration tests
+        run: python -m unittest discover -s tests -v
+
       - name: build the one-file EXE
         run: python build.py exe
 
@@ -77,6 +120,8 @@ jobs:
           dist/Excalibur.exe --offline --detect tests/wrd_v1_0_0.lua
           dist/Excalibur.exe --offline --cli tests/wrd_v1_0_0.lua --out recovered.lua --quiet
           python -c "import pathlib,sys; a=pathlib.Path('tests/wrd_v1_0_0_clean.lua').read_bytes(); b=pathlib.Path('recovered.lua').read_bytes(); print('identical:', a==b); sys.exit(0 if a==b else 1)"
+          dist/Excalibur.exe --offline --runtime exe --cli tests/wrd_v1_0_0.lua --out recovered_exe.lua --quiet
+          python -c "import pathlib,sys; a=pathlib.Path('tests/wrd_v1_0_0_clean.lua').read_bytes(); b=pathlib.Path('recovered_exe.lua').read_bytes(); print('identical through the packaged lua51.exe:', a==b); sys.exit(0 if a==b else 1)"
 
       - name: report the size against the 80 MB budget
         run: python -c "import pathlib; p=pathlib.Path('dist/Excalibur.exe'); print(f'{p.stat().st_size/1048576:.1f} MB')"

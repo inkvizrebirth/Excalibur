@@ -46,7 +46,10 @@ def run_cli(args: argparse.Namespace) -> int:
             _print(f"[{stage}] {message}")
 
     config = PipelineConfig(
-        sandbox=SandboxConfig(timeout=args.timeout),
+        sandbox=SandboxConfig(
+            timeout=args.timeout,
+            prefer_exe={"auto": None, "exe": True, "lupa": False}[args.runtime],
+        ),
         prefer_static=not args.no_static,
         run_dynamic=not args.no_dynamic,
         trace_on_failure=not args.no_trace,
@@ -111,6 +114,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-static", action="store_true", help="skip the static constant layer stage")
     parser.add_argument("--no-dynamic", action="store_true", help="skip the sandbox stage")
     parser.add_argument("--no-trace", action="store_true", help="skip the trace fallback")
+    parser.add_argument("--runtime", choices=("auto", "exe", "lupa"), default="auto",
+                        help="which Lua runtime the sandbox uses (default: auto - the bundled "
+                             "lua/lua51.exe on Windows, lupa elsewhere)")
     parser.add_argument("--lift", metavar="FILE", help="write the partial lift (pseudo source) to FILE")
     parser.add_argument("--no-lift", action="store_true", help="skip the partial lift stage")
     parser.add_argument("--boot", action="store_true", help="run the first-run setup and exit")

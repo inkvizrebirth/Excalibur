@@ -5,7 +5,7 @@ Commands::
     python build.py doctor          show what this machine can build
     python build.py dev             run the GUI from source through uv (fast loop)
     python build.py wheels          collect wheels into wheels/ for an offline first run
-    python build.py fetch-lua       place a Lua 5.1 interpreter into lua/ (optional)
+    python build.py fetch-lua       verify lua/lua51.exe (or --build to rebuild it)
     python build.py exe             PyInstaller --onefile --windowed build
     python build.py all             wheels + exe
 
@@ -90,6 +90,15 @@ def doctor() -> int:
     log(f"pyinstaller : {(tool('pyinstaller') or 'module ' + str(have('pyinstaller')))}")
     for module in ("lupa", "luaparser", "darkdetect", "tkinter", "PIL"):
         log(f"{module:<11} : {'yes' if have(module) else 'no'}")
+    try:
+        sys.path.insert(0, str(ROOT))
+        from tools.build_lua import verify as verify_lua
+
+        report = verify_lua()
+        log(f"{'lua51.exe':<11} : {'ok' if report['ok'] else 'MISSING/CHANGED'} "
+            f"({report['size']} bytes, sha256 {report['sha256'][:12] or '-'})")
+    except Exception as exc:  # never let a doctor run fail on this
+        log(f"{'lua51.exe':<11} : unknown ({type(exc).__name__})")
     for directory in DATA_TREES:
         path = ROOT / directory
         files = list(path.rglob("*")) if path.exists() else []
@@ -124,25 +133,32 @@ def wheels() -> int:
 LUA_SOURCES = {
     "lua51": "https://www.lua.org/ftp/lua-5.1.5.tar.gz",
 }
+LUA_TOOL = ROOT / "tools" / "build_lua.py"
 
 
-def fetch_lua() -> int:
-    """Explain how to vendor a Lua 5.1 interpreter (optional, lupa is the default)."""
-    log("the sandbox prefers an external Lua 5.1 because that is the interpreter")
-    log("Roblox-era scripts target; without it the bundled lupa runtime is used")
-    target = ROOT / "lua"
-    target.mkdir(exist_ok=True)
-    existing = [p.name for p in target.glob("lua*")]
-    if existing:
-        log(f"already present: {', '.join(existing)}")
+def fetch_lua(build: bool = False) -> int:
+    """Verify the vendored Lua 5.1 interpreter, or rebuild it from source.
+
+    ``lua/lua51.exe`` is committed to the repository (built from the official
+    5.1.5 sources, see ``lua/README.md``), so the common case is a hash check.
+    ``--build`` downloads the pinned sources and compiler wheel and reproduces
+    the binary bit for bit.
+    """
+    if not LUA_TOOL.is_file():
+        log(f"{LUA_TOOL} is missing from the checkout")
+        return 1
+    arguments = [sys.executable, str(LUA_TOOL), "--build" if build else "--check"]
+    log("lua      : " + ("rebuilding lua/lua51.exe from source" if build
+                         else "checking the vendored lua/lua51.exe"))
+    code = run(arguments, check=False)
+    if code == 0:
         return 0
     log("")
-    log("option A (recommended, reproducible): build Lua 5.1 from source")
-    log(f"  1) download {LUA_SOURCES['lua51']}")
-    log("  2) build it with MSVC/mingw (Windows) or cc (linux) and copy the binary to lua/lua51.exe")
-    log("option B: copy an existing interpreter (lua5.1 / lua51 / luajit) into ./lua/")
-    log("option C: do nothing - lupa (pip wheel, ships Lua 5.1 + 5.4 + LuaJIT) is used instead")
-    return 0
+    log("the interpreter is optional: without lua/lua51.exe the sandbox falls back to")
+    log("lupa (pip wheel, ships Lua 5.1/5.4/LuaJIT) - builds keep working")
+    log(f"sources: {LUA_SOURCES['lua51']} (the pinned mirror/hash is in tools/build_lua.py)")
+    log("option: copy any Lua 5.1 interpreter (lua5.1 / lua51 / luajit) into ./lua/")
+    return code
 
 
 # --------------------------------------------------------------------------- exe
@@ -222,7 +238,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     dev_parser = sub.add_parser("dev", help="run the GUI from source")
     dev_parser.add_argument("args", nargs="*", help="extra arguments for main.py")
     sub.add_parser("wheels", help="collect wheels for an offline first run")
-    sub.add_parser("fetch-lua", help="instructions for vendoring Lua 5.1")
+    lua_parser = sub.add_parser("fetch-lua", help="verify or rebuild lua/lua51.exe")
+    lua_parser.add_argument("--build", action="store_true",
+                            help="rebuild the interpreter bit for bit instead of checking it")
     exe_parser = sub.add_parser("exe", help="build the one-file EXE")
     exe_parser.add_argument("--no-clean", action="store_true", help="keep previous build output")
     exe_parser.add_argument("--console", action="store_true", help="keep the console for debugging")
@@ -236,7 +254,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "wheels":
         return wheels()
     if args.command == "fetch-lua":
-        return fetch_lua()
+        return fetch_lua(build=args.build)
     if args.command == "exe":
         return build_exe(clean=not args.no_clean, console=args.console)
     if args.command == "all":

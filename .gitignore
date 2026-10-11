@@ -28,6 +28,14 @@ samples/downloaded/
 samples/real/
 tests/samples/downloaded/
 
+# --- Vendored interpreter ---
+# lua/lua51.exe is committed; native builds made for local exe-runtime checks
+# (python tools/build_lua.py --native lua/lua51) are not.
+lua/lua51
+lua/*.so
+lua/*.dylib
+.cache/
+
 # --- Packaging ---
 *.spec
 .pyinstaller/

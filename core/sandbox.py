@@ -168,7 +168,7 @@ class Sandbox:
         *,
         stop_when: Optional[Callable[[Attempt], bool]] = None,
         max_attempts: Optional[int] = None,
-        prefer_exe: bool = False,
+        prefer_exe: Optional[bool] = None,
         workdir: Optional[Path] = None,
         encoding: str = "utf-8",
     ) -> SandboxResult:
@@ -187,6 +187,8 @@ class Sandbox:
 
         result = SandboxResult(source_hash=source_hash, source_path=input_path, workdir=run_dir)
 
+        if prefer_exe is None:
+            prefer_exe = self.config.prefer_exe
         try:
             usable, rejected = runtime_ladder(self.config.runtimes, source, prefer_exe=prefer_exe)
         except Exception as exc:  # RuntimeUnavailable and friends

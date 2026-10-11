@@ -13,35 +13,48 @@ Ordered by value per unit of work. Everything in "done" is covered by tests.
   wall-clock watchdog, per-attempt artefact directories.
 * Payload scoring, two validation profiles, honest `partial` verdict.
 * Dispatch-loop tracing with a readable summary.
+* **Partial lift**: the flattened state machine is rendered as readable
+  `pseudocode.lua` (state blocks, registers renamed to `v1, v2, v3, ...`,
+  constant/conditional/literal/dynamic successors, helper inventory). Dynamic
+  jumps are resolved from the recorded trace values. Verified statement for
+  statement against a luaparser oracle on three wild samples (255/255 blocks)
+  and unit tested on a miniature flattened payload.
+* **Vendored `lua/lua51.exe`** (official Lua 5.1.5, built reproducibly with a
+  pinned zig toolchain - see `lua/README.md`), preferred by the sandbox on
+  Windows, with lupa as the always-available fallback.
 * Monochrome Tkinter GUI, thread-safe, worker-based.
 * First-run bootstrap with an offline-capable dependency cache.
 * PyInstaller packaging helper with an 80 MB budget check; CI for Linux tests
   and a Windows EXE build.
 * Acceptance fixture pair (`tests/wrd_v1_0_0*.lua`) with byte-exact recovery.
 
-## Next: devirtualisation of flattened builds
+## Next: devirtualisation, part two
 
-The remaining hard problem for WRD v1.0.0 (and every wild sample measured so
-far): the payload is interpreted inside the obfuscator's own state machine, so
-there is no text to capture. The trace stage already records the visited states
-and register writes; the next steps are:
+The dispatch table is already recovered (see the partial lift above): states,
+bodies, registers and successors are readable, and the trace resolves most
+computed jumps. What is still missing is *structured* code, i.e. turning the
+state graph back into `if`/`while`/function calls that run without the
+dispatcher. Measured on the wild samples: aspect 72 states / 38 dynamic jumps
+(28 resolved by trace), fog 77 / 45 (36), ka 106 / 61 (39).
 
-1. **Lift the dispatch table.** Each `if <state> == <constant> ... end` branch is
-   a basic block; the constants are folded pool values, so the branch table can
-   be recovered statically once the constant layer is rewritten.
-2. **Recover the register model.** The VM stores its state in a table (locals +
-   pool entries). Instrument reads and writes per state to rebuild the data flow
-   for one state at a time.
-3. **Emit structured code.** Translate each basic block into Lua, then run the
-   existing validation chain (`validate_payload`) plus an *equivalence* check:
-   run the original and the reconstruction under the same stubs and compare the
-   observable trace (instruction counts, char calls, missed globals) - the
-   harness for that comparison already exists in `tests/test_pipeline.py`.
-4. **Loop reconstruction.** Trace cycles become `while`/`for`; the trace summary
-   already reports repeated short cycles and transition counts.
+1. **Register data flow.** The lift renames variables but does not yet track
+   types or lifetimes; the appendix lists the VM's helper closures, whose input
+   conventions (`h( v49 )` -> `return v20[v49-(63015)]`) have to be folded into
+   the call sites.
+2. **Emulate the states offline.** Run the machine *without* the obfuscator by
+   interpreting the rendered blocks in Python (the state bodies are plain Lua),
+   then compare the observable behaviour with the original under the same stubs -
+   the harness for that comparison already exists in `tests/test_pipeline.py`.
+3. **Loop and branch reconstruction.** Cycles become `while`/`for`, the binary
+   search over state numbers becomes real conditions. A useful intermediate
+   artefact would be a single-block-decision listing (`state -> condition ->
+   next`), which the trace already provides for the visited path.
+4. **String/table reconstruction.** Pool tables are numbered registers; naming
+   them after the constants they hold would remove most of the remaining noise.
 
 Until that lands, Excalibur stays honest: those files are reported as partial,
-with `decoded.lua` (runnable, constant layer removed) plus the trace.
+with `decoded.lua` (runnable, constant layer removed), `pseudocode.lua` (the
+lifted states) and `trace_summary.txt`.
 
 ## Next: more obfuscators
 

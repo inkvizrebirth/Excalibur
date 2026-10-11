@@ -153,6 +153,26 @@ def _lupa_available() -> bool:
     return importlib.util.find_spec("lupa") is not None
 
 
+def resolve_prefer_exe(prefer_exe: Optional[bool] = None) -> bool:
+    """Should the standalone interpreters be used instead of the lupa wheels?
+
+    ``None`` means *auto*: the bundled ``lua/`` interpreter wins on Windows (that
+    is the binary the packaged EXE ships and the one WRD-era scripts were written
+    for), while lupa stays the default elsewhere, where a Windows ``lua51.exe``
+    cannot run.  ``EXCALIBUR_RUNTIME=exe|lupa`` overrides both.
+    """
+    override = os.environ.get("EXCALIBUR_RUNTIME", "").strip().lower()
+    if override in {"exe", "lua", "native", "1"}:
+        return True
+    if override in {"lupa", "embedded", "python", "0"}:
+        return False
+    if prefer_exe is not None:
+        return bool(prefer_exe)
+    if os.name != "nt":
+        return False
+    return any(Path(paths.lua_dir()).glob("lua*.exe"))
+
+
 def discover_runtimes(
     wanted: Sequence[str],
     *,
@@ -167,37 +187,53 @@ def discover_runtimes(
     specs: List[RuntimeSpec] = []
     search_dirs = [paths.lua_dir(), *(exe_dirs or [])]
 
-    exe_candidates: Dict[str, Path] = {}
+    # every file that *looks* like an interpreter, grouped by name: the same
+    # name can be a Windows binary next to a native one, and only the first
+    # candidate that actually runs is kept.
+    exe_candidates: Dict[str, List[Path]] = {}
     for directory in search_dirs:
         if not directory or not Path(directory).is_dir():
             continue
         for name in EXE_NAMES:
             candidate = Path(directory) / name
             if candidate.is_file():
-                exe_candidates.setdefault(candidate.stem.lower(), candidate)
+                bucket = exe_candidates.setdefault(candidate.stem.lower(), [])
+                if candidate not in bucket:
+                    bucket.append(candidate)
     for name in EXE_NAMES:
         found = shutil.which(name)
         if found:
-            exe_candidates.setdefault(Path(found).stem.lower(), Path(found))
+            bucket = exe_candidates.setdefault(Path(found).stem.lower(), [])
+            if Path(found) not in bucket:
+                bucket.append(Path(found))
 
     for name in wanted:
         if name in exe_candidates and (prefer_exe or name not in LUPA_MODULES):
-            specs.append(RuntimeSpec(name=name, kind="exe", detail=str(exe_candidates[name])))
+            specs.extend(
+                RuntimeSpec(name=name, kind="exe", detail=str(path))
+                for path in exe_candidates[name]
+            )
         if name in LUPA_MODULES and _lupa_available() and not prefer_exe:
             module_name = LUPA_MODULES[name][0]
             specs.append(RuntimeSpec(name=name, kind="lupa", detail=module_name))
 
     # anything else the user dropped in lua/ (still useful)
     if not prefer_exe:
-        for exe_name, path in exe_candidates.items():
-            if not any(s.kind == "exe" and s.detail == str(path) for s in specs):
-                specs.append(RuntimeSpec(name=exe_name, kind="exe", detail=str(path)))
+        for exe_name, paths_for_name in exe_candidates.items():
+            for path in paths_for_name:
+                if not any(s.kind == "exe" and s.detail == str(path) for s in specs):
+                    specs.append(RuntimeSpec(name=exe_name, kind="exe", detail=str(path)))
 
     probed: List[RuntimeSpec] = []
+    seen: set = set()
     for spec in specs:
         result = probe_runtime(spec)
-        if result is not None:
-            probed.append(result)
+        if result is None:
+            continue
+        if (spec.name, spec.kind) in seen:
+            continue  # a lower priority interpreter with the same name
+        seen.add((spec.name, spec.kind))
+        probed.append(result)
     return probed
 
 
@@ -287,12 +323,18 @@ class LuaRuntime:
 
         script = tempfile.NamedTemporaryFile("w", suffix=".lua", delete=False, encoding="utf-8")
         try:
+            # A standalone interpreter does not print the value of the chunk
+            # (only lupa returns it), so the probe result must be printed by the
+            # wrapper itself - the exe path silently reported "compilation
+            # failed" for every input before this was fixed.
             script.write(
                 'local p = os.getenv("EXCALIBUR_CHECK_SRC")\n'
                 'local f = io.open(p, "rb")\n'
                 "if not f then print('ERR:cannot open source') return end\n"
                 "local SRC = f:read('*a')\n"
-                "f:close()\n" + COMPILE_CHECK_LUA + "\n"
+                "f:close()\n"
+                "local function __check()\n" + COMPILE_CHECK_LUA + "\nend\n"
+                "print(__check())\n"
             )
             script.close()
             env = dict(os.environ)
@@ -408,7 +450,7 @@ def runtime_ladder(
     wanted: Sequence[str],
     source: Optional[str] = None,
     *,
-    prefer_exe: bool = False,
+    prefer_exe: Optional[bool] = None,
 ) -> Tuple[List[RuntimeSpec], List[Tuple[RuntimeSpec, str]]]:
     """Split available runtimes into those that compile ``source`` and the rest.
 
@@ -416,6 +458,7 @@ def runtime_ladder(
     which is surfaced in the report so the user learns *why* a runtime was
     skipped (e.g. "control structure too long").
     """
+    prefer_exe = resolve_prefer_exe(prefer_exe)
     specs = discover_runtimes(wanted, prefer_exe=prefer_exe)
     if not specs:
         raise RuntimeUnavailable(

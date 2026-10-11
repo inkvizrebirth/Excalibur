@@ -35,6 +35,10 @@ class SandboxConfig:
 
     policies: tuple[str, ...] = DEFAULT_POLICIES
     runtimes: tuple[str, ...] = DEFAULT_RUNTIMES
+    prefer_exe: Optional[bool] = None
+    """Run the standalone interpreters instead of lupa.  ``None`` = auto (the
+    bundled ``lua/lua51.exe`` on Windows, lupa everywhere else); the
+    ``EXCALIBUR_RUNTIME`` environment variable wins over both."""
     allow_unsafe: bool = False
     """When True the sandbox exposes real io/os/require (never for untrusted input)."""
 

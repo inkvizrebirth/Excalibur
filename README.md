@@ -32,6 +32,7 @@ Everything is written under `logs/run_<timestamp>_<hash>/`:
 ```
 output.lua        recovered source (only when a payload was validated)
 decoded.lua       the rewritten constant layer (always, when the static stage ran)
+pseudocode.lua    partial lift: state blocks, renamed registers, resolved jumps
 report.json       every stage, candidate, validation check and note
 summary.txt       the same, human readable
 trace_summary.txt visited VM states (trace fallback)
@@ -44,11 +45,28 @@ lua51_codex/      per-attempt artefacts: input.lua, report.json, hook_log.txt,
 | Input | Result |
 |---|---|
 | WRD builds that rebuild the payload with `loadstring`/`table.concat` | **full recovery**: the original source is captured, validated byte-for-byte |
-| WRD v1.0.0 "flattened" builds (the payload is interpreted inside the obfuscator's own state machine) | **partial**: the constant layer is decoded and rewritten, the state machine is traced, but the original text is not reconstructed (see `docs/ROADMAP.md`) |
+| WRD v1.0.0 "flattened" builds (the payload is interpreted inside the obfuscator's own state machine) | **partial + lift**: the constant layer is decoded and rewritten, the state machine is traced, and `pseudocode.lua` renders every state block with registers renamed to `v1, v2, v3, ...` and the jumps resolved (see below) |
 | Luraph / Moonsec / IronBrew | recognised and routed, implementation is a documented placeholder (`core/registry.py`) |
 
 Excalibur never invents output: if nothing validates, it says so and leaves the
 diagnostics it produced in `logs/`.
+
+### Partial lift (flattened builds)
+
+When the payload stays virtualised, the lift stage writes `pseudocode.lua` next
+to the other artefacts: one block per state of the dispatch loop, the original
+logic inside it, a register legend (`v1 = b`, `state = d`, ...) and one comment
+per successor - `goto S12345`, `if v3 then ... end`, or
+`goto v7["name"] (dynamic; trace: S_900000_2100000 in 1 visit(s))`. The values
+recorded by the trace fallback are what resolve the computed jumps, so the file
+is usually more complete than a purely static view. It is *not* recompilable
+source: the dispatch tree and the state numbers are kept on purpose so the
+result can be checked against the original.
+
+```bat
+python main.py --cli script.lua --out clean.lua --lift pseudo.lua
+python main.py --cli script.lua --no-lift        :: skip the stage
+```
 
 ## Build
 
@@ -56,6 +74,7 @@ diagnostics it produced in `logs/`.
 python build.py doctor          :: what this machine can build
 python build.py dev             :: run the GUI from source (uv, if installed)
 python build.py wheels          :: collect wheels so the first run works offline
+python build.py fetch-lua       :: verify lua/lua51.exe (--build rebuilds it)
 python build.py exe             :: PyInstaller --onefile --windowed
 python build.py all             :: wheels + exe
 ```
@@ -84,7 +103,7 @@ main.py              entry point (GUI default, --cli/--detect/--boot modes)
 bootstrap.py         first-run setup, dependency cache, offline policy
 build.py             PyInstaller + uv development helpers
 core/
-  deobfuscate.py     the pipeline (detect -> static -> dynamic -> trace)
+  deobfuscate.py     the pipeline (detect -> static -> dynamic -> trace -> lift)
   registry.py        obfuscator registry (WRD now, Luraph/Moonside placeholders)
   wrd_detect.py      structural detection, masking helpers
   wrd_static.py      pool/alphabet/shuffle decoding, resolver inlining, folding
@@ -93,12 +112,15 @@ core/
   pick_payload.py    candidate scoring (explainable, no hard-coded names)
   validate.py        compile + structural validation, dynamic vs static modes
   vm_trace.py        dispatch-loop instrumentation and trace summarisation
+  lift.py            partial lift: state blocks, register renaming, jump recovery
   lua/               Lua side: runner, hooks (load/loadstring capture),
                      Roblox stubs (the spec's core/roblox_stubs.lua),
                      Lua 5.1 compatibility shims
+lua/lua51.exe        vendored Windows Lua 5.1.5 interpreter (see lua/README.md)
 gui/                 monochrome Tkinter UI (theme + app)
 tests/               unit + end-to-end tests, acceptance fixture pair
-tools/               fixture generator, sample fetcher, icon generator
+tools/               fixture generator, sample fetcher, icon generator,
+                     reproducible lua51.exe builder (build_lua.py)
 docs/                architecture, real-world notes, roadmap
 ```
 

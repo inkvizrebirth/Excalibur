@@ -84,12 +84,49 @@ disable the watchdog` is enforced by shadowing `debug.sethook`.
 
 **4. Trace fallback** (`core/vm_trace.py`)
 
-When no payload validated, the most dispatch-like `while` loop(s) get
-`__sandbox_trace_state(<state>)` injected at the top of the body and the
-instrumented source is re-run. The visited states are summarised (distinct
-count, hottest states, most frequent transitions, repeated cycles) and written
-to `trace_summary.txt`. This is the input a devirtualiser needs; the module does
-not claim to reconstruct the source.
+When no payload validated, the dispatch loop returned by
+`core.lift.find_dispatcher()` gets `__sandbox_trace_state(<state>)` injected at
+the top of the body and the instrumented source is re-run (the heuristic
+"most `if` statements" scan is only the fallback when no dispatcher is found).
+The visited states are summarised (distinct count, hottest states, most frequent
+transitions, repeated cycles) and written to `trace_summary.txt`.
+
+**5. Partial lift** (`core/lift.py`)
+
+The trace values feed the lift, which is a hand-written O(n) scanner - no ANTLR
+in the production path (luaparser is 2-4 s per 13 KB and is used only as an
+oracle during development). It tokenises the text once, finds the dispatch loop
+(`while <state> do if <state> < <pivot> ...`), walks the pivot tree into state
+blocks, and for each block:
+
+* renders the body with every register renamed to `vN` (the state variable keeps
+  the name `state`), using one shared map built from the whole file because the
+  VM's helper closures share the dispatcher's scope;
+* classifies the successors: constant (`state = 12345`), conditional
+  (`state = state and A or B` and friends), literal (`true`/`false`/`nil`) and
+  dynamic (`goto v7["name"]`, `state = v3[...]`);
+* resolves the dynamic ones against the observed trace values, reporting the
+  target block, the visit count and the confidence;
+* inventories the VM's own helper functions, which are printed as an appendix.
+
+The result is `logs/run_*/pseudocode.lua` plus `result.lift` (stats, states,
+registers, successors) in `report.json`. The stage runs whenever a dispatch loop
+is found in the chosen payload or in the constant-layer rewrite, including for
+successful runs whose payload is itself flattened. `--no-lift` turns it off.
+
+**6. Runtime ladder details**
+
+`runtime.discover_runtimes()` groups candidate interpreters by name (`lua51.exe`,
+`lua51`, `luajit`, ...) from `lua/` and `PATH`, probes each one, and keeps the
+first that actually runs - so a Windows binary sitting next to a native one in
+`lua/` never shadows a usable interpreter. `resolve_prefer_exe()` then decides
+between the standalone interpreter and the lupa wheels: *auto* (the default)
+prefers `lua/lua51.exe` on Windows and lupa elsewhere, and the
+`EXCALIBUR_RUNTIME=exe|lupa` environment variable overrides both, as does
+`main.py --runtime exe|lupa|auto`. A standalone interpreter is a different code
+path from lupa (it prints values instead of returning them and enforces the
+watchdog in a separate process), so `tests/test_lua_runtime.py` runs the
+acceptance fixture through it wherever such an interpreter can run.
 
 ## Selection and validation
 

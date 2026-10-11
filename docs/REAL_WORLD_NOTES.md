@@ -133,3 +133,36 @@ folder/decoder fails the suite.
   types, so no metatable can paper over it.  The flattened VM keeps its
   registers in the environment; seeding them would mean guessing the register
   values, i.e. doing the devirtualisation first.
+
+## The exe runtime path (measured)
+
+Until the vendored `lua/lua51.exe` landed, every measurement was taken through
+lupa, so the standalone-interpreter path was never exercised. Two bugs were
+hiding there; both are fixed and covered by `tests/test_lua_runtime.py`:
+
+* **the compile probe printed nothing.** `COMPILE_CHECK_LUA` *returns* its
+  verdict, which lupa hands back to Python but a standalone interpreter silently
+  discards (`lua -e`/script chunks are not echoed). Every input was reported as
+  "rejected: unknown compile failure", which also disabled the sandbox ladder.
+  The probe now wraps the check and `print()`s the result.
+* **LuaJIT starved the watchdog.** `debug.sethook` count hooks are not reliable
+  inside JIT-compiled traces: `while true do end` ran forever instead of hitting
+  the instruction budget (the wall-clock check never fired because the hook was
+  never called). `runner.lua` now switches the JIT off (`jit.off()`) before
+  installing the hook - interpreted Lua is fast enough for a sandboxed run and
+  the abort is reliable again. Measured: infinite loop killed after 0.9 s at a
+  3 s budget on every runtime (`lua51`, `luajit21`, `lua54`).
+
+With the native twin of the interpreter (`python tools/build_lua.py --native
+lua/lua51`) the whole pipeline was re-measured through a *standalone* Lua 5.1.5
+and agrees with lupa:
+
+| sample | runtime | time | states | dynamic jumps | resolved by trace |
+|---|---|---|---|---|---|
+| aspect | lua51.exe (twin) | 188 ms | 72 | 38 | 28 |
+| fog | lua51.exe (twin) | 247 ms | 77 | 45 | 36 |
+| ka | lua51.exe (twin) | 289 ms | 106 | 61 | 39 |
+
+The acceptance fixture is byte identical through both paths, and the exe runtime
+uses one attempt instead of three (the ladder stops as soon as a chunk is
+captured).
