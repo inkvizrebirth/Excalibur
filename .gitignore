@@ -1,0 +1,40 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Build artefacts ---
+*.spec.bak
+Excalibur.spec
+
+# --- Runtime artefacts (dumps, traces, embedded runtime) ---
+logs/*
+!logs/.gitkeep
+!logs/README.md
+runtime/
+vendor/lua/*.exe
+assets/*.exe
+*.log
+
+# --- Samples: real samples are fetched, only declared fixtures are tracked ---
+samples/downloaded/
+samples/real/
+tests/samples/downloaded/
+
+# --- Packaging ---
+*.spec
+.pyinstaller/
+wheels/
+uv.lock
+
+# --- OS ---
+Thumbs.db
+Desktop.ini
+.DS_Store
