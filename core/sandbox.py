@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from . import paths
-from .config import DEFAULT_RUNTIMES, SandboxConfig
+from .config import SandboxConfig
 from .errors import SandboxError
 from .runtime import LuaRuntime, RunOutcome, RuntimeSpec, runtime_ladder
 

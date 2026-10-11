@@ -25,7 +25,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .theme import (
-    DARK,
     GLYPH_ERROR,
     GLYPH_OK,
     GLYPH_WARN,

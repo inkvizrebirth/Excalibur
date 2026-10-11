@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
-from .pick_payload import ARITH_RUN_RE, ESCAPED_RUN_RE, printable_ratio, score_text
+from .pick_payload import ARITH_RUN_RE, printable_ratio, score_text
 from .wrd_detect import ESCAPED_DECIMAL_STRING_RE, WRD_RETURN_WRAPPER_RE, mask_lua
 
 LUA_KEYWORDS_PRESENT_RE = re.compile(r"\b(local|function|if|for|while|return|repeat|do)\b")

@@ -28,7 +28,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, List, Optional
 
 from . import paths
 from .config import PipelineConfig

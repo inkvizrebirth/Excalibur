@@ -328,9 +328,6 @@ def ensure_environment(
 
     download_allowed = allow_download if allow_download is not None else (not state.get("installed_once", False))
     requirements = [d.requirement for d in missing]
-    if missing and not lua_executables:
-        # without an external interpreter, lupa stops being optional
-        pass
 
     if requirements and (force or download_allowed):
         offline = wheels_available()

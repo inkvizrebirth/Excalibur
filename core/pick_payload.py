@@ -35,11 +35,6 @@ OBFUSCATION_SIGNALS: Tuple[Tuple[str, int], ...] = (
     ("return(function(...)", 25),
 )
 
-#: Signals of the constant-virtualised/flattened shape (folding candidates).
-MACHINE_SIGNALS: Tuple[Tuple[str, int], ...] = (
-    ("while ", 1), ("elseif", 1), ("if ", 1),
-)
-
 ESCAPED_RUN_RE = re.compile(r'(?:\\\d{1,3}){6,}')
 ARITH_RUN_RE = re.compile(r"\d+\s*[-+]\s*\d+")
 BINARY_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")

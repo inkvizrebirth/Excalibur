@@ -18,7 +18,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Type
 
-from .errors import ExcaliburError
 from .wrd_detect import DetectionResult, detect
 
 
