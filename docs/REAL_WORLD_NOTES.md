@@ -112,3 +112,24 @@ folder/decoder fails the suite.
   patches to a buffer that was rendered earlier.
 * **`analyze()` returns `output = None` when `ok = False`**, so callers must
   read `reason` before touching the text.
+* **Pre-seeding the payload's "missing globals" does not work** (measured, then
+  reverted).  The obvious idea - hand the sandbox the pool entries the script
+  reads and stub them - makes things *worse*:
+
+  | sample | run | instructions | `string.char` calls | reads | misses | outcome |
+  |---|---|---|---|---|---|---|
+  | aspect | no seeds | 800,000 | 399 | 23 | 5 | ran |
+  | aspect | seeded | 800,000 | 399 | 20 | 2 | `attempt to compare table with number` |
+  | fog | no seeds | 800,000 | 432 | 76 | 6 | ran |
+  | fog | seeded | 800,000 | 432 | 19 | 1 | `attempt to compare table with number` |
+  | ka | no seeds | 1,200,000 | 733 | 249 | 8 | ran |
+  | ka | seeded | 0 | 477 | 0 | 0 | `attempt to perform arithmetic on local 'P'` |
+
+  Two reasons: (a) the names are not ordinary globals - several start with a
+  digit (`4AU4rzT4DNdDKo`), so they can only be reached through a string-keyed
+  environment lookup, and (b) the values are used as *numbers* (comparisons and
+  arithmetic), so a table stub turns a benign `nil` read into a type error.  Lua
+  5.1 does not even consult `__lt`/`__le` when the operands have different
+  types, so no metatable can paper over it.  The flattened VM keeps its
+  registers in the environment; seeding them would mean guessing the register
+  values, i.e. doing the devirtualisation first.
