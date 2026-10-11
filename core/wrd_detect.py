@@ -230,9 +230,15 @@ def _ast_statistics(source: str) -> Tuple[Optional[dict], Optional[str]]:
         return None, "luaparser not installed (optional)"
 
     try:  # pragma: no cover - depends on optional dependency
+        import contextlib
+        import io
+
         from luaparser import ast as lua_ast  # type: ignore
 
-        tree = lua_ast.parse(source)
+        # ANTLR reports lexer noise (the escaped-decimal string pool) straight to
+        # stderr; the caller only wants the statistics, not the parser's chatter.
+        with contextlib.redirect_stderr(io.StringIO()):
+            tree = lua_ast.parse(source)
     except RecursionError:
         return None, "parser recursion limit reached (very large one-liner)"
     except Exception as exc:
@@ -314,6 +320,7 @@ def detect(source: str, *, deep: bool = True) -> DetectionResult:
         stats, error = _ast_statistics(source)
         if stats:
             features["ast"] = stats
+            features["ast_error"] = None  # always present: callers read it unconditionally
             if stats.get("WhileStatement"):
                 score += 0.05
                 reasons.append(f"AST: {stats['WhileStatement']} while statements")
@@ -351,7 +358,7 @@ def detect(source: str, *, deep: bool = True) -> DetectionResult:
     reason = "no known obfuscator signature"
     if len(pool_literals) < 8 and not header:
         reason = "missing string pool / header"
-    if features["ast_error"]:
+    if features.get("ast_error"):
         warnings.append(f"AST analysis unavailable: {features['ast_error']}")
 
     return DetectionResult(
