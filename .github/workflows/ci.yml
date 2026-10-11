@@ -76,10 +76,8 @@ jobs:
 
       - name: the exe runtime path works (native twin of the same sources)
         run: |
-          python tools/build_lua.py --native lua/lua51
+          python tools/ci_exe_runtime.py --runtime exe --native lua/lua51 --out native_out.lua
           lua/lua51 -v
-          EXCALIBUR_RUNTIME=exe python main.py --skip-bootstrap --cli tests/wrd_v1_0_0.lua --out native_out.lua --quiet
-          python -c "import pathlib,sys; a=pathlib.Path('tests/wrd_v1_0_0_clean.lua').read_bytes(); b=pathlib.Path('native_out.lua').read_bytes(); print('standalone interpreter, byte identical:', a == b); sys.exit(0 if a == b else 1)"
           python -m unittest tests.test_lua_runtime -v
 
   windows-exe:
@@ -104,9 +102,7 @@ jobs:
           lua\lua51.exe -e "print(_VERSION, type(loadstring), type(setfenv))"
 
       - name: acceptance through the interpreter (exe runtime)
-        run: |
-          python main.py --skip-bootstrap --cli tests/wrd_v1_0_0.lua --out exe_out.lua --runtime exe --quiet
-          python -c "import pathlib,sys; a=pathlib.Path('tests/wrd_v1_0_0_clean.lua').read_bytes(); b=pathlib.Path('exe_out.lua').read_bytes(); print('exe runtime, identical:', a==b); sys.exit(0 if a==b else 1)"
+        run: python tools/ci_exe_runtime.py --runtime exe --out exe_out.lua
 
       - name: unit and integration tests
         run: python -m unittest discover -s tests -v

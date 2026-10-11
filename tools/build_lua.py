@@ -246,6 +246,8 @@ def unpack_source(tarball: Path, workdir: Path) -> Path:
 
 # ----------------------------------------------------------------------- build
 def compile_lua(zig: Path, source_dir: Path, out: Path, *, target: Optional[str]) -> Path:
+    # the compiler runs with cwd=<source dir>, so the output path must be absolute
+    out = Path(out).resolve()
     command = [str(zig), "cc", "-O2", "-static", "-s", *DEFINES]
     if target:
         command += ["-target", target]

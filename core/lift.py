@@ -543,6 +543,8 @@ class LiftResult:
     states: List[StateBlock] = field(default_factory=list)
     helpers: List[dict] = field(default_factory=list)
     pseudocode: str = ""
+    closures: int = 0
+    """``function`` headers in the analysed source (the VM's own handlers)."""
     notes: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
@@ -551,7 +553,7 @@ class LiftResult:
         resolved = sum(1 for s in self.states for x in s.successors if x.resolved)
         literals = sum(1 for s in self.states for x in s.successors if x.kind == "literal")
         conditional = sum(1 for s in self.states for x in s.successors if x.kind == "conditional")
-        closures = sum(len(s.closures) for s in self.states)
+        closures = self.closures or sum(len(s.closures) for s in self.states)
         return {
             "states": len(self.states),
             "registers": len(self.registers),
@@ -1143,6 +1145,7 @@ def lift(
         )
 
     result.states = blocks
+    result.closures = sum(1 for token in tokens if token.kind == "keyword" and token.text == "function")
 
     # ---- helpers (the VM's own functions) --------------------------------
     result.helpers = _helper_inventory(tokens, source, mask, rename)
