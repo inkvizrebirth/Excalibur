@@ -1,0 +1,6 @@
+# Development / build dependencies.
+-r requirements.txt
+
+pyinstaller>=6.0
+pytest>=7.0        # the suite also runs with `python -m unittest`
+uv                 # fast source iteration + wheel collection (build.py)

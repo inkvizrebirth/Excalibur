@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: committed artefacts are up to date
+        run: |
+          python tools/make_wrd_fixture.py --check
+          python tools/make_icon.py --check
+          python tools/build_lua.py --check
+
+      - name: fetch real-world samples (best effort)
+        continue-on-error: true
+        run: python tools/fetch_samples.py
+
+      - name: bootstrap self-check
+        run: python bootstrap.py --check
+
+      - name: acceptance criterion (obfuscated -> clean)
+        run: |
+          python main.py --skip-bootstrap --cli tests/wrd_v1_0_0.lua --out /tmp/excalibur_out.lua
+          python -c "import pathlib,sys; a=pathlib.Path('tests/wrd_v1_0_0_clean.lua').read_bytes(); b=pathlib.Path('/tmp/excalibur_out.lua').read_bytes(); print('recovered bytes:', len(b), 'identical:', a == b); sys.exit(0 if a == b else 1)"
+
+      - name: detection report
+        run: python main.py --skip-bootstrap --detect tests/wrd_v1_0_0.lua
+
+      - name: unit and integration tests
+        run: python -m unittest discover -s tests -v
+
+  lua51:
+    name: vendored Lua 5.1 (reproducible build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: the committed interpreter is the pinned one
+        run: python tools/build_lua.py --check
+
+      - name: it rebuilds bit for bit from the pinned sources
+        run: python tools/build_lua.py --build
+
+      - name: the exe runtime path works (native twin of the same sources)
+        run: |
+          python tools/ci_exe_runtime.py --runtime exe --native lua/lua51 --out native_out.lua
+          lua/lua51 -v
+          python -m unittest tests.test_lua_runtime -v
+
+  windows-exe:
+    name: windows EXE
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: the vendored Lua 5.1 interpreter runs
+        run: |
+          lua\lua51.exe -v
+          lua\lua51.exe -e "print(_VERSION, type(loadstring), type(setfenv))"
+
+      - name: acceptance through the interpreter (exe runtime)
+        run: python tools/ci_exe_runtime.py --runtime exe --out exe_out.lua
+
+      - name: unit and integration tests
+        run: python -m unittest discover -s tests -v
+
+      - name: build the one-file EXE
+        # two builds of the same sources: the deliverable is windowed (no console
+        # flash), the twin keeps its console so the smoke test below can show what
+        # a failure looks like.  The twin is built second and without --clean,
+        # because --clean wipes dist/ and would delete the deliverable again.
+        run: |
+          python build.py exe
+          python build.py exe --console --tag CLI --no-clean
+
+      - name: EXE smoke test (offline, bundles everything)
+        # the helper also emits ::error annotations with the exit codes, the output
+        # tails and the app log, because the Actions job log is not readable from a
+        # script (`gh api .../logs` needs the blob storage host)
+        run: python tools/ci_exe_smoke.py --exe dist/ExcaliburCLI.exe --windowed dist/Excalibur.exe
+
+      - name: report the size against the 80 MB budget
+        # the budget is an acceptance criterion, so it fails the job, not just prints
+        run: |
+          python -c "import pathlib,sys; p=pathlib.Path('dist/Excalibur.exe'); mb=p.stat().st_size/1048576; print(f'{mb:.1f} MB of the 80 MB budget'); sys.exit(0 if mb < 80 else 1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Excalibur-windows
+          path: dist/Excalibur.exe
+          if-no-files-found: error

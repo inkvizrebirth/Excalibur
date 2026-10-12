@@ -1,0 +1,13 @@
+# Runtime dependencies (installed by bootstrap.py on the first run when they are
+# not already bundled - see docs/ARCHITECTURE.md).
+#
+# lupa is the in-process Lua runtime: the pip wheel ships Lua 5.1, 5.4 and
+# LuaJIT, so the sandbox works without any external interpreter.  An external
+# lua/lua51.exe is preferred when present (see core/runtime.py).
+lupa>=2.0
+
+# Optional: AST statistics in the detection report (pure Python).
+luaparser>=3.0
+
+# Optional: follow the OS light/dark preference (the GUI works without it).
+darkdetect>=0.8

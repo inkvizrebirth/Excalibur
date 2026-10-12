@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "excalibur"
+version = "1.0.0"
+description = "Autonomous WeAreDevs (WRD) Lua deobfuscator with a monochrome GUI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+dependencies = [
+    "lupa>=2.0",
+    "luaparser>=3.0",
+    "darkdetect>=0.8",
+]
+
+[project.optional-dependencies]
+dev = ["pyinstaller>=6.0", "pytest>=7.0"]
+
+[project.gui-scripts]
+excalibur = "main:main"
+
+[tool.setuptools]
+packages = ["core", "gui", "tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
