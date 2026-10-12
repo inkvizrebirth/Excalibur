@@ -123,7 +123,9 @@ jobs:
         run: python tools/ci_exe_smoke.py --exe dist/ExcaliburCLI.exe --windowed dist/Excalibur.exe
 
       - name: report the size against the 80 MB budget
-        run: python -c "import pathlib; p=pathlib.Path('dist/Excalibur.exe'); print(f'{p.stat().st_size/1048576:.1f} MB')"
+        # the budget is an acceptance criterion, so it fails the job, not just prints
+        run: |
+          python -c "import pathlib,sys; p=pathlib.Path('dist/Excalibur.exe'); mb=p.stat().st_size/1048576; print(f'{mb:.1f} MB of the 80 MB budget'); sys.exit(0 if mb < 80 else 1)"
 
       - uses: actions/upload-artifact@v4
         with:

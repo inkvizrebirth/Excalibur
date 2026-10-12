@@ -166,3 +166,44 @@ and agrees with lupa:
 The acceptance fixture is byte identical through both paths, and the exe runtime
 uses one attempt instead of three (the ladder stops as soon as a chunk is
 captured).
+
+## The packaged EXE (measured)
+
+The one-file Windows build was the last red job, and a `--windowed` EXE has no
+console, so its failure produced nothing to read. Three things fixed that, and
+they are worth keeping:
+
+* **the console went somewhere.** `main.py::_setup_stdio` mirrors a windowed
+  build's `stdout`/`stderr` into `%LOCALAPPDATA%/Excalibur/logs/exe.log` (and
+  `dup2`s both descriptors, so the Lua child processes log there too), and an
+  unexpected exception is written there with its traceback before the process
+  exits with code 70 instead of vanishing;
+* **`--doctor` answers "did the bundle find its interpreter?"** It prints the
+  resource root (`_MEIPASS` when frozen), the `lua/` contents, the bootstrap
+  report and every discovered runtime with its probe result. Measured on the
+  Windows runner, inside the bundle:
+
+  ```
+  frozen      : True
+  resources   : C:\Users\RUNNER~1\AppData\Local\Temp\_MEI0000143c2
+  lua dir     : ...\_MEI0000143c2\lua      (lua51.exe: yes, 297472 bytes)
+  prefer exe  : True
+  runtime     : lua51 (exe) -> ...\lua51.exe   Lua 5.1.5  (C) 1994-2012 PUC-Rio
+  ```
+
+  so the frozen path finds and probes the vendored interpreter exactly like the
+  source checkout does;
+* **the failure was not the bundle at all.** `tools/ci_exe_smoke.py` compares the
+  recovered source with the fixture *byte for byte* and reported
+  `1228 bytes vs 1273 expected ... 45 CRLF in the expected one`: the Windows
+  runner checks the repository out with `core.autocrlf=true`, so the fixture
+  arrived with CRLF while the pipeline (and the payload inside the obfuscator's
+  string pool) is LF. The unit tests never noticed because `Path.read_text()`
+  translates newlines; the byte comparison did. `.gitattributes` now pins
+  `text=auto eol=lf` for the whole tree.
+
+With that, the Windows job is green end to end: vendored interpreter probe,
+acceptance through the standalone interpreter, unit tests, PyInstaller build,
+offline smoke test through both the bundled runtime and `--runtime exe`, the
+partial-lift listing, the windowed build starting, and the size report (the
+artifact is ~13.7 MB, well inside the 80 MB budget).

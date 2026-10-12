@@ -71,6 +71,13 @@ reused as-is.
 
 ## Smaller items
 
+* Readability of the lift: the observed transitions are followed for 87-98% of
+  the jumps (see `docs/REAL_WORLD_NOTES.md`), the rest point at values computed
+  from registers the static pass cannot see. A second trace pass that dumps the
+  *operands* of every dynamic jump (`u[expr]`) would close most of the gap.
+* Lift output as runnable source: the listing is annotated pseudo-source, not a
+  program. Emitting `goto`-based Lua 5.2 code (or a `while`+`if` chain) would let
+  the user run the recovered logic.
 * Lua 5.1 vendoring: `build.py fetch-lua` currently prints the recipe. Building
   Lua 5.1 from source on the CI runner and shipping `lua/lua51.exe` would remove
   the `lupa` dependency for the sandbox path and make the semantics exact.
