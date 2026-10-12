@@ -142,8 +142,26 @@ class Smoke:
             return False
         want = expected.read_bytes()
         ok = got == want
-        record.update(ok=ok, bytes=len(got),
-                      detail="identical" if ok else f"{len(got)} bytes vs {len(want)} expected")
+        detail = "identical" if ok else f"{len(got)} bytes vs {len(want)} expected"
+        if not ok:
+            # the classic false alarm: a checkout that converted the fixtures to
+            # CRLF (git's core.autocrlf is true on the Windows runners) - call it
+            # out by name instead of leaving a byte count to guess from
+            crlf = b"\r\n"
+            got_crlf, want_crlf = got.count(crlf), want.count(crlf)
+            if got.replace(crlf, b"\n") == want.replace(crlf, b"\n"):
+                detail += ("; the two differ only by line endings - "
+                           + str(got_crlf) + " CRLF in the produced file, "
+                           + str(want_crlf) + " in the expected one "
+                           "(check .gitattributes / core.autocrlf)")
+            else:
+                shared = 0
+                for left, right in zip(got, want):
+                    if left != right:
+                        break
+                    shared += 1
+                detail += f"; first difference at byte {shared}: {got[shared:shared + 32]!r} vs {want[shared:shared + 32]!r}"
+        record.update(ok=ok, bytes=len(got), detail=detail)
         self.results.append(record)
         if not ok:
             self.failures.append(record)

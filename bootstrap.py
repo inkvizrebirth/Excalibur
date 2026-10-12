@@ -377,7 +377,12 @@ def ensure_environment(
         from core.runtime import discover_runtimes
 
         specs = discover_runtimes(DEFAULT_RUNTIMES)
-        report.detail["runtimes"] = ", ".join(s.name for s in specs) or "none"
+        # the same name can appear twice (the lupa wheel *and* a bundled .exe):
+        # show the kind as well, otherwise the list reads like a duplicate
+        report.detail["runtimes"] = ", ".join(
+            s.name if len({x.name for x in specs}) == len(specs) else f"{s.name} ({s.kind})"
+            for s in specs
+        ) or "none"
         if not specs:
             report.ok = False
             report.notes.append("no Lua runtime could be discovered (bundled lua/*.exe or lupa)")

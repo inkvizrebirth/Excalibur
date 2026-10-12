@@ -1,0 +1,17 @@
+# Line endings are part of the acceptance criteria here: the fixture pair
+# tests/wrd_v1_0_0.lua -> tests/wrd_v1_0_0_clean.lua is compared byte for byte, and
+# the obfuscator's string pool holds the payload's exact bytes.  A checkout that
+# rewrites newlines (git's core.autocrlf is true on the Windows runners) would make
+# the comparison fail for a reason that has nothing to do with the pipeline, so
+# every text file is checked out with LF on every platform.
+* text=auto eol=lf
+
+# ...except the files whose bytes really are binary.
+*.exe binary
+*.dll binary
+*.ico binary
+*.png binary
+*.jpg binary
+*.zip binary
+*.whl binary
+*.gz binary

@@ -110,10 +110,11 @@ jobs:
       - name: build the one-file EXE
         # two builds of the same sources: the deliverable is windowed (no console
         # flash), the twin keeps its console so the smoke test below can show what
-        # a failure looks like
+        # a failure looks like.  The twin is built second and without --clean,
+        # because --clean wipes dist/ and would delete the deliverable again.
         run: |
           python build.py exe
-          python build.py exe --console --tag CLI
+          python build.py exe --console --tag CLI --no-clean
 
       - name: EXE smoke test (offline, bundles everything)
         # the helper also emits ::error annotations with the exit codes, the output
