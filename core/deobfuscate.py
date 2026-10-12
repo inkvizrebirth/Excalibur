@@ -414,20 +414,29 @@ def deobfuscate(
     # *machine*: lifting it produces the partial source (states, registers,
     # logic, jumps) the user can actually read.
     lift_result = None
-    if config.lift and static_result is not None and static_result.ok and static_result.output:
+    if config.lift:
         # Which text is the machine?  Usually the rewrite, but when the payload
         # *is* a flattened script (WRD embeds it as a string) the rewrite only
-        # carries it as a literal while the captured payload holds the loop.
+        # carries it as a literal while the captured payload holds the loop.  A
+        # run that stayed virtualised also falls back to the input itself, so a
+        # bare flattened script (no constant layer at all) still gets a listing.
         lift_source: Optional[str] = None
         lift_label = "constant layer"
-        candidates = [(result.output, "payload" if result.method == "dynamic" else "constant layer"),
-                      (static_result.output, "constant layer")]
+        candidates: List[Tuple[Optional[str], str]] = []
+        if result.output:
+            candidates.append((result.output, "payload" if result.method == "dynamic" else "constant layer"))
+        if static_result is not None and static_result.ok and static_result.output:
+            candidates.append((static_result.output, "constant layer"))
+        if not result.success or result.partial:
+            candidates.append((source, "input"))
+        if not candidates:
+            candidates.append((static_result.output if static_result is not None else None, "constant layer"))
         for candidate_text, label in candidates:
             if candidate_text and find_dispatcher(candidate_text) is not None:
                 lift_source, lift_label = candidate_text, label
                 break
         if lift_source is None:
-            lift_source = static_result.output  # let lift() report the reason
+            lift_source = candidates[0][0]  # let lift() report the reason
         if lift_source is not None:
             stage_started = time.time()
             _log(progress, "lift", "recovering state blocks and registers")

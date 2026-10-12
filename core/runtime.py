@@ -27,6 +27,8 @@ See ``docs/REAL_WORLD_NOTES.md`` for the measurements.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import importlib
 import importlib.util
@@ -38,7 +40,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from . import paths
 from .config import SandboxConfig
@@ -298,6 +300,32 @@ def _parse_version(text: str) -> str:
     return (text.strip().splitlines() or [""])[0][:80]
 
 
+@contextlib.contextmanager
+def _capture_descriptor(target) -> "Iterator[None]":
+    """Point fd 1 at ``target`` for the duration of a sandbox run.
+
+    Lua's own ``print``/``io.write`` go straight to the C ``stdout`` descriptor,
+    which ``contextlib.redirect_stdout`` cannot see (happens with the Lua 5.4
+    runtime).  Redirecting the descriptor keeps payload chatter out of the CLI and
+    the GUI console.
+    """
+    try:
+        sys.stdout.flush()
+    except Exception:  # pragma: no cover - windowed builds may not have stdout
+        pass
+    saved = os.dup(1)
+    try:
+        os.dup2(target.fileno(), 1)
+        yield
+    finally:
+        try:
+            sys.stdout.flush()
+        except Exception:  # pragma: no cover
+            pass
+        os.dup2(saved, 1)
+        os.close(saved)
+
+
 def _creationflags() -> int:
     return getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
 
@@ -415,11 +443,17 @@ class LuaRuntime:
         lua.globals()["EXCALIBUR"] = table
         code = Path(self.runner_path).read_text(encoding="utf-8")
         error = ""
+        output = ""
+        sink_path = Path(config["logs_dir"]) / "sandbox_stdout.txt"
         try:
-            lua.execute(code)
+            with open(sink_path, "w+", encoding="utf-8", errors="replace") as sink:
+                with contextlib.redirect_stdout(sink), _capture_descriptor(sink):
+                    lua.execute(code)
+                sink.seek(0)
+                output = sink.read()
         except Exception as exc:
             error = f"{type(exc).__name__}: {str(exc)[:400]}"
-        return True, "", "", error
+        return True, output, "", error
 
     def _run_exe(self, config: Dict[str, str], sandbox_cfg: SandboxConfig) -> Tuple[bool, str, str, str]:
         env = dict(os.environ)

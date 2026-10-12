@@ -24,8 +24,17 @@ Paste (or drop) an obfuscated `*.lua` file, press **deobfuscate**, and Excalibur
 | **GUI** | `Excalibur.exe` (or `python main.py`) |
 | **Console** | `Excalibur.exe --cli script.lua --out clean.lua` |
 | **Detect only** | `Excalibur.exe --detect script.lua` |
+| **Partial lift** | `Excalibur.exe --cli script.lua --lift pseudo.lua` |
 | **First-run setup** | `Excalibur.exe --boot` |
+| **Diagnostics** | `Excalibur.exe --doctor` (paths, runtimes, probe results) |
 | **Tests** | `python -m unittest discover -s tests` |
+
+``--doctor`` is the first thing to run when the packaged EXE behaves differently
+from the source checkout: it prints the resource root (``_MEIPASS`` in a frozen
+build), where the bundled Lua interpreter was found, and why a runtime was
+rejected.  A ``--windowed`` EXE has no console, so its console text is mirrored to
+``%LOCALAPPDATA%/Excalibur/logs/exe.log`` - including a traceback if the process
+would otherwise die silently.
 
 Everything is written under `logs/run_<timestamp>_<hash>/`:
 

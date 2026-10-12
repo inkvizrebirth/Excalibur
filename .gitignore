@@ -42,6 +42,9 @@ lua/*.dylib
 wheels/
 uv.lock
 
+# --- CI helpers ---
+.exe-smoke/
+
 # --- OS ---
 Thumbs.db
 Desktop.ini

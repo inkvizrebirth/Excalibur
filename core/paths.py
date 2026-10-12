@@ -78,6 +78,8 @@ def logs_dir() -> Path:
     return app_data_dir() / "logs"
 
 
-def ensure_dir(path: Path) -> Path:
+def ensure_dir(path: Path | str) -> Path:
+    """``mkdir -p`` a directory (accepting ``str`` so callers may pass either)."""
+    path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     return path

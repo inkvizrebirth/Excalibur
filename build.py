@@ -176,7 +176,7 @@ def _data_args() -> List[str]:
     return args
 
 
-def build_exe(*, clean: bool = False, console: bool = False) -> int:
+def build_exe(*, clean: bool = False, console: bool = False, tag: str = "") -> int:
     if not have("PyInstaller") and not have("pyinstaller"):
         log("PyInstaller is not installed: python -m pip install pyinstaller")
         return 2
@@ -189,7 +189,7 @@ def build_exe(*, clean: bool = False, console: bool = False) -> int:
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean",
         "--onefile",
-        "--name", APP_NAME,
+        "--name", APP_NAME + tag,
         "--distpath", str(DIST),
         "--workpath", str(BUILD),
         "--specpath", str(WORK_DIR),
@@ -211,7 +211,7 @@ def build_exe(*, clean: bool = False, console: bool = False) -> int:
         log(f"PyInstaller failed with exit code {code}")
         return code
 
-    exe = DIST / (APP_NAME + (".exe" if os.name == "nt" else ""))
+    exe = DIST / (APP_NAME + tag + (".exe" if os.name == "nt" else ""))
     if not exe.exists():
         log(f"expected {exe} to exist")
         return 3
@@ -244,6 +244,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     exe_parser = sub.add_parser("exe", help="build the one-file EXE")
     exe_parser.add_argument("--no-clean", action="store_true", help="keep previous build output")
     exe_parser.add_argument("--console", action="store_true", help="keep the console for debugging")
+    exe_parser.add_argument("--tag", default="", metavar="NAME",
+                            help="suffix for the output name (e.g. a console twin: ExcaliburCLI.exe)")
     sub.add_parser("all", help="wheels + EXE")
     args = parser.parse_args(argv)
 
@@ -256,7 +258,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "fetch-lua":
         return fetch_lua(build=args.build)
     if args.command == "exe":
-        return build_exe(clean=not args.no_clean, console=args.console)
+        return build_exe(clean=not args.no_clean, console=args.console, tag=args.tag)
     if args.command == "all":
         return build_all()
     parser.print_help()

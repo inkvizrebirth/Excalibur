@@ -484,6 +484,22 @@ class Successor:
             return f"state = {self.target}  (loop keeps running while state is truthy)"
         return f"goto {self.raw or self.target}  (computed target)"
 
+    def short(self) -> str:
+        """One-liner for the control-flow table at the top of the listing."""
+        if self.kind == "constant":
+            return self.target
+        if self.kind == "conditional":
+            return f"if {self.condition} then {self.target} else {self.raw}"
+        if self.kind == "register-jump":
+            return f"if {self.condition} then {self.target} else {self.raw} (registers)"
+        if self.kind == "dynamic":
+            if self.resolved:
+                return f"{self.target} (dynamic; trace -> {self.resolved}, {self.visits} visit(s))"
+            return f"{self.target} (dynamic)"
+        if self.kind == "literal":
+            return f"exit (state = {self.target})"
+        return f"{self.raw or self.target} (computed)"
+
 
 @dataclass
 class StateBlock:
@@ -756,15 +772,95 @@ def _walk_dispatch(
 
 
 # -------------------------------------------------------------------- renaming
-def _collect_names(tokens: Sequence[Token], spans: Iterable[Tuple[int, int]]) -> List[str]:
-    """Identifier names in the given spans, in first-appearance order."""
+def _declared_names(tokens: Sequence[Token], start: int = 0, end: Optional[int] = None) -> List[str]:
+    """Locals of the analysed chunk: ``local`` targets, parameters, loop variables.
+
+    Registers are locals; ``setmetatable`` is not.  Only locals are renamed, so the
+    listing never invents an alias for a standard library function that a payload
+    happens to call by name.
+    """
+    if end is None:
+        end = len(tokens)
+    out: List[str] = []
+    index = start
+    while index < end:
+        token = tokens[index]
+        if token.kind == "keyword" and token.text == "local":
+            following = index + 1
+            if following < end and tokens[following].kind == "keyword" and tokens[following].text == "function":
+                if following + 1 < end and tokens[following + 1].kind == "name":
+                    out.append(tokens[following + 1].text)
+                cursor = following + 2
+                while cursor < end and not (tokens[cursor].kind == "punct" and tokens[cursor].text == "("):
+                    cursor += 1
+                if cursor < end:
+                    close = match_balanced(tokens, cursor, end)
+                    out.extend(t.text for t in tokens[cursor + 1:close] if t.kind == "name")
+                    index = close
+                    continue
+                index = following + 2
+                continue
+            while following < end and tokens[following].kind == "name":
+                out.append(tokens[following].text)
+                following += 1
+                if following < end and tokens[following].kind == "punct" and tokens[following].text == ",":
+                    following += 1
+                    continue
+                break
+            index = following
+            continue
+        if token.kind == "keyword" and token.text == "function":
+            cursor = index + 1
+            if cursor < end and tokens[cursor].kind == "name":
+                cursor += 1
+            while cursor < end and not (tokens[cursor].kind == "punct" and tokens[cursor].text == "("):
+                cursor += 1
+            if cursor < end:
+                close = match_balanced(tokens, cursor, end)
+                out.extend(t.text for t in tokens[cursor + 1:close] if t.kind == "name")
+                index = close
+                continue
+        if token.kind == "keyword" and token.text == "for":
+            cursor = index + 1
+            while cursor < end and tokens[cursor].kind == "name":
+                out.append(tokens[cursor].text)
+                cursor += 1
+                if cursor < end and tokens[cursor].kind == "punct" and tokens[cursor].text == ",":
+                    cursor += 1
+                    continue
+                break
+            index = cursor
+            continue
+        index += 1
+    return out
+
+
+def _collect_names(
+    tokens: Sequence[Token],
+    spans: Iterable[Tuple[int, int]],
+    *,
+    locals_only: Sequence[str] = (),
+    always: Sequence[str] = (),
+) -> List[str]:
+    """Identifier names in the given spans, in first-appearance order.
+
+    With ``locals_only`` the result is restricted to names declared as locals
+    somewhere in the chunk (plus ``always`` - the state variable, which the
+    dispatcher may reuse from an enclosing scope).
+    """
+    allowed = set(locals_only) if locals_only else None
+    if allowed is not None:
+        allowed.update(always)
     seen: List[str] = []
     known = set()
     for start, end in spans:
         for token in tokens[start:end]:
-            if token.kind == "name" and token.text not in known:
-                known.add(token.text)
-                seen.append(token.text)
+            if token.kind != "name" or token.text in known:
+                continue
+            if allowed is not None and token.text not in allowed:
+                continue
+            known.add(token.text)
+            seen.append(token.text)
     return seen
 
 
@@ -812,6 +908,255 @@ def _rewrite_text(source: str, mask: str, start: int, end: int, mapping: Dict[st
 
 
 # ------------------------------------------------------------------- lift core
+@dataclass
+class _Assignment:
+    """One ``<name> = <expression>`` statement inside a state block."""
+
+    target: str
+    expression: Tuple[int, int]  # token range of the right hand side
+    order: int
+
+
+def _compact(text: str) -> str:
+    """Tidy an expression composed from token texts (``u [ "k" ]`` -> ``u["k"]``)."""
+    return re.sub(r"\s*([\[\]\.\(\)])\s*", r"\1", text)
+
+
+def _parse_int(text: str) -> Optional[int]:
+    try:
+        if text[:2].lower() == "0x":
+            return int(text, 16)
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _split_commas(tokens: Sequence[Token], start: int, end: int) -> List[Tuple[int, int]]:
+    """Split ``tokens[start:end]`` on top-level commas (``f(a,b),c`` -> 2 spans)."""
+    spans: List[Tuple[int, int]] = []
+    depth = 0
+    piece = start
+    index = start
+    while index < end:
+        token = tokens[index]
+        if token.kind == "punct":
+            if token.text in ("(", "[", "{"):
+                depth += 1
+            elif token.text in (")", "]", "}"):
+                depth -= 1
+            elif token.text == "," and depth == 0:
+                spans.append((piece, index))
+                piece = index + 1
+        index += 1
+    if piece < end:
+        spans.append((piece, end))
+    return spans
+
+
+def _assignments(tokens: Sequence[Token], start: int, end: int) -> List[_Assignment]:
+    """Every simple assignment in ``tokens[start:end]`` (``local`` declarations too).
+
+    Register reads are resolved from these, and a flattened payload declares its
+    registers both ways: ``local v1 = 4711`` inside a state and ``v1 = 4711`` in the
+    dispatcher's prologue.
+    """
+    found: List[_Assignment] = []
+    for position, (first, last) in enumerate(split_statements(tokens, start, end)):
+        cursor = first
+        if tokens[cursor].kind == "keyword" and tokens[cursor].text in ("local", "varargs"):
+            cursor += 1
+            if cursor < last and tokens[cursor].kind == "keyword" and tokens[cursor].text == "function":
+                continue  # `local function f() ... end`: no simple assignment
+        names: List[str] = []
+        while cursor < last and tokens[cursor].kind == "name":
+            names.append(tokens[cursor].text)
+            cursor += 1
+            if cursor < last and tokens[cursor].kind == "punct" and tokens[cursor].text == ",":
+                cursor += 1
+                continue
+            break
+        if not names or cursor >= last:
+            continue
+        if not (tokens[cursor].kind == "punct" and tokens[cursor].text == "="):
+            continue
+        values = _split_commas(tokens, cursor + 1, last)
+        if len(values) != len(names):
+            if len(names) == 1:
+                values = [(cursor + 1, last)]
+            else:
+                continue
+        for name, span in zip(names, values):
+            found.append(_Assignment(name, span, position))
+    return found
+
+
+def _register_values(tokens: Sequence[Token], assignments: Sequence[_Assignment],
+                     variable: str) -> Dict[str, List[Tuple[int, int]]]:
+    """Where each register gets a *number* inside the block (used to resolve jumps).
+
+    WRD fills scratch registers with pool constants a statement or two before the
+    jump that consumes them, so a register has to be looked up by position: the
+    nearest assignment before the use wins, and an assignment that follows the
+    use is accepted when nothing precedes it.
+    """
+    values: Dict[str, List[Tuple[int, int]]] = {}
+    for item in assignments:
+        if item.target == variable:
+            continue
+        start, end = item.expression
+        if end - start != 1:
+            continue
+        token = tokens[start]
+        value = _parse_int(token.text) if token.kind == "number" else None
+        if value is None and token.kind == "name":
+            candidates = [v for _, v in values.get(token.text, [])]
+            value = candidates[-1] if candidates else None
+        if value is not None:
+            values.setdefault(item.target, []).append((item.order, value))
+    return values
+
+
+def _value_at(register: str, values: Dict[str, List[Tuple[int, int]]], order: int) -> Optional[int]:
+    entries = values.get(register)
+    if not entries:
+        return None
+    before = [value for position, value in entries if position < order]
+    if before:
+        return before[-1]
+    after = [value for position, value in entries if position > order]
+    return after[0] if after else None
+
+
+def _expression_value(tokens: Sequence[Token], span: Tuple[int, int],
+                      values: Dict[str, List[Tuple[int, int]]], order: int) -> Optional[int]:
+    """Fold ``<number>``/``<register>`` to the state value it carries, if known."""
+    start, end = span
+    if end - start != 1:
+        return None
+    token = tokens[start]
+    if token.kind == "number":
+        return _parse_int(token.text)
+    if token.kind == "name":
+        return _value_at(token.text, values, order)
+    return None
+
+
+def _extract_successors(tokens: Sequence[Token], start: int, end: int, variable: str) -> List[Successor]:
+    """Describe how a state block leaves for the next state.
+
+    WRD writes its two-way jumps as *two* statements on the state variable
+    (``state = cond and A`` followed by ``state = state or B``) and the branch
+    targets are scratch registers filled with pool constants earlier in the same
+    block.  Resolving them is what turns a listing full of ``goto v29
+    (dynamic)`` into ``if v12 then goto <A> else <B>``.
+
+    Returns one successor per branch; the caller cannot see which statements were
+    merged, so the description is a list, not a "last assignment wins" value.
+    """
+    assignments = _assignments(tokens, start, end)
+    registers = _register_values(tokens, assignments, variable)
+    state_assignments = [item for item in assignments if item.target == variable]
+
+    def expression(item: _Assignment) -> str:
+        return " ".join(token.text for token in tokens[item.expression[0]:item.expression[1]])
+
+    def value_of(span: Tuple[int, int], order: int) -> Optional[int]:
+        return _expression_value(tokens, span, registers, order)
+
+    def branch(span: Tuple[int, int], order: int, fallback: str) -> Tuple[str, bool]:
+        number = value_of(span, order)
+        return (str(number), True) if number is not None else (_compact(fallback), False)
+
+    def described(index: int) -> Tuple[List[Successor], int]:
+        """Successors of statement ``index`` plus how many statements it consumed."""
+        item = state_assignments[index]
+        first, last = item.expression
+        token = tokens[first] if last > first else None
+        text = expression(item)
+
+        # `state = <number>` / `state = <register holding a number>`
+        if last - first == 1 and token is not None:
+            if token.kind == "number":
+                return [Successor("constant", target=token.text, raw=text)], 1
+            if token.kind == "name":
+                number = value_of(item.expression, item.order)
+                if number is not None:
+                    return [Successor("constant", target=str(number), raw=text)], 1
+                return [Successor("dynamic", target=text, raw=text)], 1
+
+        # `state = true` / `false` / `nil`: the loop keeps running while truthy
+        if last - first == 1 and text in ("true", "false", "nil"):
+            return [Successor("literal", target=text, raw=text)], 1
+
+        # table/environment lookup: `state = u["name"]` or `state = z[c[1]]`
+        if last - first >= 2 and token is not None and token.kind == "name" \
+                and tokens[first + 1].kind == "punct" and tokens[first + 1].text in ("[", "."):
+            compact = _compact(text)
+            return [Successor("dynamic", target=compact, raw=compact)], 1
+
+        operator = ""
+        if last - first == 3 and token is not None and token.kind == "name" \
+                and tokens[first + 1].kind == "keyword" and tokens[first + 1].text in ("and", "or"):
+            operator = tokens[first + 1].text
+
+        if operator:
+            own_span = (first + 2, last)
+            # the pair form: the next statement continues *this* jump
+            following = state_assignments[index + 1] if index + 1 < len(state_assignments) else None
+            if following is not None:
+                follow_first, follow_last = following.expression
+                marker = tokens[follow_first + 1] if follow_last - follow_first >= 2 else None
+                if tokens[follow_first].text == variable and marker is not None \
+                        and marker.kind == "keyword" and marker.text in ("and", "or") \
+                        and follow_last - follow_first == 3:
+                    other_span = (follow_first + 2, follow_last)
+                    if operator == "and" and marker.text == "or":
+                        then_span, else_span = own_span, other_span
+                    elif operator == "or" and marker.text == "and":
+                        then_span, else_span = other_span, own_span
+                    else:
+                        then_span = else_span = None
+                    if then_span is not None:
+                        then_value, then_known = branch(then_span, item.order, _slice(tokens, *then_span))
+                        else_value, else_known = branch(else_span, item.order, _slice(tokens, *else_span))
+                        if then_known and else_known:
+                            return [Successor("conditional", target=then_value,
+                                              condition=token.text, raw=else_value)], 2
+                        return [Successor("register-jump", target=then_value, condition=token.text,
+                                          raw=else_value)], 2
+            if operator == "and":
+                # a lone `state = cond and A`: the false branch leaves the state alone
+                target, _known = branch(own_span, item.order, _slice(tokens, *own_span))
+                return [Successor("register-jump", target=target,
+                                  condition=token.text, raw=variable)], 1
+            target, _known = branch(own_span, item.order, _slice(tokens, *own_span))
+            return [Successor("register-jump", target=variable,
+                              condition=variable, raw=target)], 1
+
+        # the single-statement form `state = cond and A or B`
+        if last - first == 5 and token is not None and token.kind == "name" \
+                and tokens[first + 1].text == "and" and tokens[first + 3].text == "or":
+            then_span, else_span = (first + 2, first + 3), (first + 4, last)
+            then_value, then_known = branch(then_span, item.order, _slice(tokens, *then_span))
+            else_value, else_known = branch(else_span, item.order, _slice(tokens, *else_span))
+            if then_known and else_known:
+                return [Successor("conditional", target=then_value,
+                                  condition=token.text, raw=else_value)], 1
+            return [Successor("register-jump", target=then_value, condition=token.text,
+                              raw=else_value)], 1
+
+        compact = _compact(text)
+        return [Successor("unknown", target=compact, raw=compact)], 1
+
+    successors: List[Successor] = []
+    index = 0
+    while index < len(state_assignments):
+        produced, consumed = described(index)
+        successors.extend(produced)
+        index += max(1, consumed)
+    return successors
+
+
 def _parse_successor(tokens: Sequence[Token], start: int, end: int, variable: str) -> List[Successor]:
     """Find ``<variable> = <expr>`` statements and describe them."""
     successors: List[Successor] = []
@@ -972,7 +1317,7 @@ def lift(
     values = set(pivots)
     constant_targets = set()
     for _conditions, start, end in leaves:
-        for successor in _simplify_successors(_parse_successor(tokens, start, end, variable), variable):
+        for successor in _simplify_successors(_extract_successors(tokens, start, end, variable), variable):
             if successor.kind == "constant":
                 constant_targets.add(int(successor.target))
             elif successor.kind == "conditional":
@@ -1008,7 +1353,7 @@ def lift(
             token_span=(start, end),
             span=(tokens[start].start if start < len(tokens) else 0,
                   tokens[end - 1].end if end > start else 0),
-            successors=_simplify_successors(_parse_successor(tokens, start, end, variable), variable),
+            successors=_simplify_successors(_extract_successors(tokens, start, end, variable), variable),
             closures=_closures(tokens, start, end),
         )
         blocks.append(block)
@@ -1018,10 +1363,14 @@ def lift(
     # upvalues), so the rename map is built from the dispatcher first and then
     # extended with whatever the helper bodies use.
     body_spans = [(s_, e_) for _c, s_, e_ in leaves]
-    names = [n for n in _collect_names(tokens, body_spans) if n != variable]
+    declared = _declared_names(tokens)
+    names = [
+        n for n in _collect_names(tokens, body_spans, locals_only=declared, always=[variable])
+        if n != variable
+    ]
     known = set(names)
     for helper in _function_spans(tokens):
-        for name in _collect_names(tokens, [helper["token_span"]]):
+        for name in _collect_names(tokens, [helper["token_span"]], locals_only=declared, always=[variable]):
             if name == variable or name in known:
                 continue
             known.add(name)
@@ -1286,8 +1635,15 @@ def _render(
     lines.append("      if v3 then ... else ... end -- conditional jump (condition kept)")
     lines.append('      goto v7["name"]             -- target read from a register/environment')
     lines.append("")
+    # the listing speaks the new names everywhere: guards included
+    reverse_names = {original: alias for alias, original in legend.items()}
+
+    def alias_text(text: str) -> str:
+        return re.sub(r"\b[A-Za-z_]\w*\b",
+                      lambda match: reverse_names.get(match.group(0), match.group(0)), text)
+
     # the header shows the state variable under its new name as well
-    state_name = dispatcher.get("renamed") or mapping.get(variable, variable)
+    state_name = reverse_names.get(variable) or dispatcher.get("renamed") or variable
     lines.append(f"    dispatcher: while {state_name} do ... end  -  {len(blocks)} states")
     lines.append("]]")
     lines.append("")
@@ -1300,10 +1656,21 @@ def _render(
         lines.append(f"-- {alias:<6} = {name}")
     lines.append("")
 
+    # a compact control-flow table first: the whole machine at a glance, before
+    # the (long) per-state listings
+    lines.append("-- control flow (state -> successor)")
+    for block in blocks:
+        if not block.successors:
+            lines.append(f"-- {block.label:<22} -> (falls through)")
+            continue
+        for successor in block.successors:
+            lines.append(f"-- {block.label:<22} -> {successor.short()}")
+    lines.append("")
+
     for block in blocks:
         lines.append(f"-- ==== state {block.label} (#{block.index}) ====")
         if block.conditions:
-            lines.append("-- guard: " + " & ".join(c.render() for c in block.conditions))
+            lines.append("-- guard: " + " & ".join(alias_text(c.render()) for c in block.conditions))
         if block.reachable_from:
             unique = list(dict.fromkeys(block.reachable_from))
             lines.append("-- reached from: " + ", ".join(unique[:8]))

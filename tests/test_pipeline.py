@@ -41,6 +41,25 @@ REAL_DIR = ROOT / "samples" / "real"
 FAST = PipelineConfig(sandbox=SandboxConfig(timeout=20, sample_runs=2, max_attempts=4))
 
 
+def _runtime_available() -> bool:
+    """Is there a usable Lua runtime (lupa wheel or a vendored interpreter)?"""
+    try:
+        from core.runtime import runtime_ladder
+
+        usable, _rejected = runtime_ladder(("lua51", "luajit21", "lua54"))
+    except Exception:
+        return False
+    return bool(usable)
+
+
+#: Tests that really execute Lua; the rest of the suite runs without a runtime so
+#: a fresh clone (``python -m unittest``) stays green before ``pip install``.
+needs_runtime = unittest.skipUnless(
+    _runtime_available(),
+    "needs a Lua runtime: pip install -r requirements.txt, or build lua/lua51",
+)
+
+
 class AcceptanceFixture(unittest.TestCase):
     """The fixture pair that encodes the TZ acceptance criterion."""
 
@@ -65,6 +84,7 @@ class AcceptanceFixture(unittest.TestCase):
         self.assertGreater(result.folded_expressions, 0)
         self.assertIn("loadstring", result.output)
 
+    @needs_runtime
     def test_recovered_source_matches_clean_file(self) -> None:
         """The acceptance criterion: deobfuscated output == clean source."""
         clean = CLEAN.read_text(encoding="utf-8")
@@ -77,6 +97,7 @@ class AcceptanceFixture(unittest.TestCase):
         # and the round trip has to be exact at the byte level as well
         self.assertEqual(result.output.encode("utf-8"), clean.encode("utf-8"))
 
+    @needs_runtime
     def test_output_artifacts_are_written(self) -> None:
         result = deobfuscate_file(FIXTURE, config=FAST)
         self.assertIsNotNone(result.output_path)
@@ -119,6 +140,7 @@ class FormatHandling(unittest.TestCase):
 
 
 class SandboxSafety(unittest.TestCase):
+    @needs_runtime
     def test_infinite_loop_is_killed(self) -> None:
         from core.sandbox import Sandbox
 
@@ -134,6 +156,7 @@ class SandboxSafety(unittest.TestCase):
         self.assertTrue(attempt.timed_out or "TIMEOUT" in (attempt.error or "").upper(),
                         f"expected a timeout, got: {attempt.error}")
 
+    @needs_runtime
     def test_loadstring_payload_is_captured(self) -> None:
         from core.sandbox import Sandbox
 
@@ -208,6 +231,7 @@ class RealSamples(unittest.TestCase):
                 self.assertGreater(len(decoded), 10, path.name)
                 self.assertIsNotNone(result.output)
 
+    @needs_runtime
     def test_real_sample_behaviour_is_preserved(self) -> None:
         """The rewritten source must behave exactly like the input."""
         from core.sandbox import Sandbox
